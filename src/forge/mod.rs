@@ -170,6 +170,41 @@ pub struct Comment {
     pub body: String,
 }
 
+/// Repository pull-request merge strategy settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoMergeSettings {
+    pub allow_squash_merge: bool,
+    pub allow_merge_commit: bool,
+    pub allow_rebase_merge: bool,
+    /// True when the repository's default squash commit message uses the PR
+    /// title/description (`PR_TITLE` + `PR_BODY`/`BLANK`) rather than
+    /// concatenating branch commit messages (`COMMIT_MESSAGES`).
+    pub squash_uses_pr_description: bool,
+}
+
+impl Default for RepoMergeSettings {
+    fn default() -> Self {
+        Self {
+            allow_squash_merge: true,
+            allow_merge_commit: false,
+            allow_rebase_merge: false,
+            squash_uses_pr_description: true,
+        }
+    }
+}
+
+impl RepoMergeSettings {
+    /// True when the GitHub Web UI defaults exclusively to Squash and Merge
+    /// AND populates the squash commit message from the PR title/description
+    /// rather than concatenating `[nspr]` branch commits.
+    pub fn is_squash_only(&self) -> bool {
+        self.allow_squash_merge
+            && !self.allow_merge_commit
+            && !self.allow_rebase_merge
+            && self.squash_uses_pr_description
+    }
+}
+
 #[async_trait(?Send)]
 pub trait Forge {
     async fn get_pull_request(&self, number: u64) -> Result<PullRequest>;
@@ -189,6 +224,9 @@ pub trait Forge {
         &self,
         branch: &str,
     ) -> Result<Option<Protection>>;
+    async fn repo_merge_settings(&self) -> Result<RepoMergeSettings> {
+        Ok(RepoMergeSettings::default())
+    }
     /// Current tip of a remote branch, or `None` if it does not exist.
     async fn branch_oid(&self, branch: &str) -> Result<Option<Oid>>;
     async fn push(&self, specs: &[PushSpec]) -> Result<()>;

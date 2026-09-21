@@ -35,8 +35,8 @@ use serde::Deserialize;
 
 use super::{
     Comment, CreatePr, Forge, ListedPr, MergeState, Mergeable, PrState,
-    Protection, PullRequest, PullRequestUpdate, PushSpec, ReviewDecision,
-    SquashMerge,
+    Protection, PullRequest, PullRequestUpdate, PushSpec, RepoMergeSettings,
+    ReviewDecision, SquashMerge,
 };
 use crate::git_remote::GitRemote;
 
@@ -71,6 +71,7 @@ pub struct GitHubForge {
     /// comments, and an extra `/user` round trip per `nspr diff` is wasteful
     /// when it never changes within a run.
     login: RefCell<Option<String>>,
+    merge_settings: std::cell::OnceCell<RepoMergeSettings>,
 }
 
 impl GitHubForge {
@@ -107,6 +108,7 @@ impl GitHubForge {
             api,
             remote: GitRemote::new(repo, url, token),
             login: RefCell::new(None),
+            merge_settings: std::cell::OnceCell::new(),
         })
     }
 
@@ -581,6 +583,52 @@ impl Forge for GitHubForge {
         }
 
         Ok(())
+    }
+
+    async fn repo_merge_settings(&self) -> Result<RepoMergeSettings> {
+        if let Some(cached) = self.merge_settings.get() {
+            return Ok(*cached);
+        }
+
+        #[derive(Deserialize)]
+        struct RepoSettingsResponse {
+            #[serde(default = "default_true")]
+            allow_squash_merge: bool,
+            #[serde(default = "default_true")]
+            allow_merge_commit: bool,
+            #[serde(default = "default_true")]
+            allow_rebase_merge: bool,
+            #[serde(default)]
+            squash_merge_commit_title: String,
+            #[serde(default)]
+            squash_merge_commit_message: String,
+        }
+        fn default_true() -> bool {
+            true
+        }
+
+        let route = format!("/repos/{}/{}", self.owner, self.repo);
+        let settings = match self
+            .api
+            .get::<RepoSettingsResponse, _, _>(route, None::<&()>)
+            .await
+        {
+            Ok(resp) => RepoMergeSettings {
+                allow_squash_merge: resp.allow_squash_merge,
+                allow_merge_commit: resp.allow_merge_commit,
+                allow_rebase_merge: resp.allow_rebase_merge,
+                squash_uses_pr_description: resp.squash_merge_commit_title
+                    == "PR_TITLE"
+                    && resp.squash_merge_commit_message != "COMMIT_MESSAGES",
+            },
+            Err(e) => {
+                debug!("could not query repo merge settings: {e}");
+                RepoMergeSettings::default()
+            }
+        };
+
+        let _ = self.merge_settings.set(settings);
+        Ok(settings)
     }
 }
 

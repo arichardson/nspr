@@ -2149,6 +2149,98 @@ fn stacked_layers_keep_clean_descriptions_and_sync_native_stack() {
 }
 
 #[test]
+fn non_squash_only_repo_auto_falls_back_to_single_commit_force_push() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    *w.forge.merge_settings.borrow_mut() = crate::forge::RepoMergeSettings {
+        allow_squash_merge: true,
+        allow_merge_commit: true,
+        allow_rebase_merge: true,
+        squash_uses_pr_description: false,
+    };
+
+    // 1. Default `PreserveCommitHistory::Auto` falls back to single-commit
+    //    force-pushes on updates, keeps PR body clean, and emits a descriptive
+    //    CLI guardrail warning suggesting `git config nspr.preserveCommitHistory`.
+    w.add_layer("Layer one\n\nBody text.", &[("a.txt", "a1")]);
+    w.sync();
+    let pr_num = w.pr_numbers()[0];
+
+    w.amend_layer(0, &[("a.txt", "a2")]);
+    w.sync();
+
+    let pr = block_on(w.forge.get_pull_request(pr_num)).unwrap();
+    assert_eq!(
+        pr.body, "Body text.",
+        "single-commit force-push mode keeps PR body clean"
+    );
+    let revisions =
+        crate::land::branch_revisions(&w.git, pr.head_oid, w.base_oid).unwrap();
+    assert_eq!(
+        revisions.len(),
+        1,
+        "Auto fallback must keep PR branch as a single commit across amends"
+    );
+
+    let stack = w.discover();
+    let prs = block_on(crate::engine::gather(&w.forge, &stack)).unwrap();
+    let g = block_on(guardrails::probe(
+        &w.forge,
+        &w.config,
+        &stack,
+        &prs,
+        &[false],
+    ))
+    .unwrap();
+    assert!(
+        g.warnings
+            .iter()
+            .any(|msg| msg.contains("nspr.preserveCommitHistory")),
+        "expected guardrail warning suggesting nspr.preserveCommitHistory, got: {:?}",
+        g.warnings
+    );
+
+    // 2. Setting `PreserveCommitHistory::False` silences the warning.
+    w.config.preserve_commit_history =
+        crate::config::PreserveCommitHistory::False;
+    let g_false = block_on(guardrails::probe(
+        &w.forge,
+        &w.config,
+        &stack,
+        &prs,
+        &[false],
+    ))
+    .unwrap();
+    assert!(
+        g_false.warnings.is_empty(),
+        "expected no warnings when preserveCommitHistory = false, got: {:?}",
+        g_false.warnings
+    );
+
+    // 3. Setting `PreserveCommitHistory::True` forces incremental `[nspr]`
+    //    commits and appends the footer warning to the PR description.
+    w.config.preserve_commit_history =
+        crate::config::PreserveCommitHistory::True;
+    w.amend_layer(0, &[("a.txt", "a3")]);
+    w.sync();
+    let pr_true = block_on(w.forge.get_pull_request(pr_num)).unwrap();
+    let revisions_true =
+        crate::land::branch_revisions(&w.git, pr_true.head_oid, w.base_oid)
+            .unwrap();
+    assert_eq!(
+        revisions_true.len(),
+        2,
+        "preserveCommitHistory = true must append an [nspr] commit"
+    );
+    assert!(
+        pr_true
+            .body
+            .starts_with("Body text.\n\n<!-- nspr:warning -->\n---"),
+        "preserveCommitHistory = true on a non-squash repo must append footer warning, got:\n{}",
+        pr_true.body
+    );
+}
+
+#[test]
 fn amend_strips_legacy_warning_without_polluting_local_commits() {
     let mut w = World::new(&[("root.txt", "root")]);
     w.add_layer("Layer one", &[("a.txt", "a1")]);

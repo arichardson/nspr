@@ -18,8 +18,8 @@ use git2::{Oid, Repository};
 
 use super::{
     Comment, CreatePr, Forge, ListedPr, MergeState, Mergeable, PrState,
-    Protection, PullRequest, PullRequestUpdate, PushSpec, ReviewDecision,
-    SquashMerge,
+    Protection, PullRequest, PullRequestUpdate, PushSpec, RepoMergeSettings,
+    ReviewDecision, SquashMerge,
 };
 
 #[derive(Debug, Clone)]
@@ -57,6 +57,7 @@ pub struct FakeForge {
     pub comment_updates: RefCell<u64>,
     pub review_decisions: RefCell<HashMap<u64, ReviewDecision>>,
     pub stacks: RefCell<Vec<Vec<u64>>>,
+    pub merge_settings: RefCell<RepoMergeSettings>,
 }
 
 impl FakeForge {
@@ -77,6 +78,7 @@ impl FakeForge {
             comment_updates: RefCell::new(0),
             review_decisions: RefCell::new(HashMap::new()),
             stacks: RefCell::new(Vec::new()),
+            merge_settings: RefCell::new(RepoMergeSettings::default()),
         }
     }
 
@@ -472,5 +474,9 @@ impl Forge for FakeForge {
     async fn sync_stacks(&self, chains: &[Vec<u64>]) -> Result<()> {
         *self.stacks.borrow_mut() = chains.to_vec();
         Ok(())
+    }
+
+    async fn repo_merge_settings(&self) -> Result<RepoMergeSettings> {
+        Ok(*self.merge_settings.borrow())
     }
 }

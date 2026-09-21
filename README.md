@@ -276,8 +276,20 @@ Configuration is optional; `nspr` auto-detects settings from your git remote. Yo
 | `nspr.repository` | Auto-detected from remote | GitHub repository slug (`owner/repo`). |
 | `nspr.trunk` | Auto-detected (`origin/HEAD` or `main`) | Trunk branch name. |
 | `nspr.branchPrefix` | `users/<github-login>/` | Prefix for remote PR branch names. |
+| `nspr.preserveCommitHistory` | `auto` | Controls whether `nspr diff` pushes incremental `[nspr]` update commits (`true`) or force-pushes a single commit per PR branch (`false`). See below. |
 | `nspr.stackComments` | `true` | Post/update stack navigation comments on PRs. |
 | `nspr.githubAuthToken` | — | Fallback GitHub personal access token. |
+
+### Repository Merge Settings & `nspr.preserveCommitHistory`
+
+When `nspr` pushes incremental `[nspr]` update commits to a pull request branch, the branch contains multiple commits (`initial commit` + `[nspr] update` commits). For merging via the GitHub Web UI to produce a single clean commit on trunk, the repository's GitHub settings (**Settings → General → Pull Requests**) must be configured with:
+- Only **Allow squash merging** enabled (`allow_merge_commit = false` and `allow_rebase_merge = false`), and
+- Default squash commit message set to **Pull request title and description** (`PR_TITLE` + `PR_BODY`, rather than GitHub's default `COMMIT_MESSAGES` which concatenates all branch commits).
+
+`nspr.preserveCommitHistory` (`auto` by default) automatically checks these repository settings via the GitHub API:
+- **`auto` (default)**: Uses incremental `[nspr]` commits without force-pushing when the repository is configured for squash-only merging with `PR_TITLE` + `PR_BODY`. If the repository allows merge/rebase commits or uses `COMMIT_MESSAGES`, `nspr` safely falls back to **force-pushing a single commit per PR branch** and prints a CLI warning explaining how to configure the repository or set `nspr.preserveCommitHistory` to `true` or `false`.
+- **`false`**: Always rewrites each PR branch as a single clean commit and force-pushes on updates (silencing the repository settings warning). Because every PR branch has only 1 commit, merging in the GitHub Web UI works cleanly regardless of the repository's merge settings.
+- **`true`**: Always pushes incremental `[nspr]` commits without force-pushing. If the repository is not configured for squash-only + `PR_TITLE`/`PR_BODY`, `nspr` emits a CLI warning and appends a disclaimer at the bottom of the PR description reminding reviewers to select **Squash and merge** and use the PR title and description.
 
 ---
 

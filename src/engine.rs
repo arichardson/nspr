@@ -28,7 +28,7 @@ use crate::trailers::{CommitMessage, DEPENDS_ON, PULL_REQUEST};
 /// Default message for a push that does not change the displayed patch.
 pub const AUTO_UPDATE_MESSAGE: &str = "[nspr] update";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SyncOptions {
     /// Push every layer, even ones whose patch is unchanged.
     pub sync_all: bool,
@@ -44,6 +44,23 @@ pub struct SyncOptions {
     pub refresh_when_behind: bool,
     /// Only sync this specific layer index (used by `nspr diff --cherry-pick`).
     pub only_layer: Option<usize>,
+    /// Whether to push incremental `[nspr]` commits (`true`) or rewrite each
+    /// PR branch as a single commit with force-pushes (`false`).
+    pub preserve_commit_history: bool,
+}
+
+impl Default for SyncOptions {
+    fn default() -> Self {
+        Self {
+            sync_all: false,
+            message: None,
+            update_message: false,
+            draft: false,
+            refresh_when_behind: false,
+            only_layer: None,
+            preserve_commit_history: true,
+        }
+    }
 }
 
 /// Supplies the "what changed?" message shown on update commits.
@@ -100,6 +117,11 @@ pub async fn sync_stack(
 ) -> Result<Vec<LayerOutcome>> {
     resolve_external_deps(forge, stack).await?;
 
+    let merge_settings = forge.repo_merge_settings().await?;
+    let mut opts = opts.clone();
+    opts.preserve_commit_history =
+        config.preserve_commit_history.resolve(merge_settings);
+
     let trees = stack.all_trees(git)?;
 
     let prs = gather(forge, stack).await?;
@@ -111,10 +133,10 @@ pub async fn sync_stack(
         &prs,
         opts.only_layer,
     )?;
-    let decision = decide(git, stack, &prs, &trees, opts)?;
+    let decision = decide(git, stack, &prs, &trees, &opts)?;
 
     execute(
-        git, forge, config, stack, &prs, &trees, &decision, opts, prompter,
+        git, forge, config, stack, &prs, &trees, &decision, &opts, prompter,
     )
     .await
 }
@@ -238,6 +260,10 @@ pub fn decide(
                         message_changed[i] = true;
                         rewrite_history[i] = true;
                     }
+                    if !opts.preserve_commit_history && first_oid != pr.head_oid
+                    {
+                        rewrite_history[i] = true;
+                    }
                 }
 
                 let shown =
@@ -260,6 +286,7 @@ pub fn decide(
 
         push[i] = patch_changed[i]
             || message_changed[i]
+            || rewrite_history[i]
             || needs_conflict_refresh
             || opts.sync_all
             || pr.needs_refresh(opts.refresh_when_behind);
@@ -299,6 +326,8 @@ pub fn decide(
     //   current branch root's parent (`base_moved`), we replay `i`'s 1-parent
     //   revision chain onto the new base tip (`rewrite_history[i] = true`), and
     //   cascade that re-anchoring to any open dependent layers above `i`.
+    // - When `!opts.preserve_commit_history`, any pushed layer rewrites its
+    //   branch as a single clean commit (`rewrite_history[i] = true`).
     for i in 0..n {
         if let Some(only) = opts.only_layer
             && i != only
@@ -323,7 +352,7 @@ pub fn decide(
                     || prs[j].as_ref().map(|p| p.head_oid) != current_anchor[i]
             }
         };
-        if push[i] && base_moved {
+        if push[i] && (!opts.preserve_commit_history || base_moved) {
             rewrite_history[i] = true;
         }
     }
@@ -396,9 +425,7 @@ async fn execute(
     let mut branches: Vec<String> = Vec::with_capacity(n);
     let mut base_branches: Vec<String> = Vec::with_capacity(n);
     let mut new_roots: Vec<Option<Oid>> = vec![None; n];
-    // Working copies of the commit messages. Rewritten in one pass at the end,
-    // once we are done touching the remote, so a network failure never leaves
-    // the local history edited but the pull requests not created.
+
     let mut messages: Vec<CommitMessage> =
         stack.layers.iter().map(|l| l.message.clone()).collect();
 
@@ -406,14 +433,9 @@ async fn execute(
         prs.iter().flatten().map(|p| p.head.clone()).collect();
     let mut push_specs: Vec<PushSpec> = Vec::new();
 
-    // Phase 1: synthesize all branch commits locally and collect PushSpecs so
-    // every branch across the stack can be pushed in a single `git push`
-    // connection (requiring at most one SSH agent / security key touch).
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         let (parent_tip, base_branch) = match stack.layers[i].dep {
-            // Layer 1 merges the *local base*, not the trunk tip: that keeps
-            // unrelated upstream churn out of this pull request's diff.
             Dep::Main | Dep::ExternalPr(_) => {
                 (stack.base, config.trunk.clone())
             }
@@ -450,15 +472,33 @@ async fn execute(
                     layer_commit,
                     &initial_msg,
                 )?;
+                new_roots[i] = Some(tip);
                 push_specs.push(PushSpec::fast_forward(&candidate, tip));
                 tips.push(tip);
                 branches.push(candidate);
             }
-            Some(pr) if !decision.push[i] => {
-                tips.push(pr.head_oid);
-                branches.push(pr.head.clone());
-            }
             Some(pr) => {
+                if !decision.push[i] {
+                    tips.push(pr.head_oid);
+                    branches.push(pr.head.clone());
+                    continue;
+                }
+
+                if !opts.preserve_commit_history {
+                    let clean_msg = stack.layers[i].message.clean_for_branch();
+                    let tip = git.synthesize_initial_commit(
+                        parent_tip,
+                        desired_tree,
+                        layer_commit,
+                        &clean_msg,
+                    )?;
+                    new_roots[i] = Some(tip);
+                    push_specs.push(PushSpec::forced(&pr.head, tip));
+                    tips.push(tip);
+                    branches.push(pr.head.clone());
+                    continue;
+                }
+
                 let mut tip = if decision.rewrite_history[i] {
                     let fallback_base_tip = match stack.layers[i].dep {
                         Dep::Main | Dep::ExternalPr(_) => stack.base,
@@ -536,20 +576,21 @@ async fn execute(
     }
 
     // Phase 3: create/update pull requests on the forge and record local refs.
+    let warn_merge_strategy = opts.preserve_commit_history
+        && !forge.repo_merge_settings().await?.is_squash_only();
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         let base_branch = base_branches[i].clone();
         let tip = tips[i];
         let branch = branches[i].clone();
         let subject = stack.layers[i].subject().to_string();
-        let is_stacked = stack.is_layer_stacked(i);
 
         let outcome = match &prs[i] {
             None if !decision.push[i] => continue,
             None => {
                 let body = crate::pr_body::splice_warning(
                     &stack.layers[i].message.body,
-                    is_stacked,
+                    warn_merge_strategy,
                 );
                 let number = forge
                     .create_pull_request(CreatePr {
@@ -601,14 +642,16 @@ async fn execute(
                     }
                     let body = crate::pr_body::splice_warning(
                         &stack.layers[i].message.body,
-                        is_stacked,
+                        warn_merge_strategy,
                     );
                     if pr.body != body {
                         update.body = Some(body);
                     }
                 } else {
-                    let body =
-                        crate::pr_body::splice_warning(&pr.body, is_stacked);
+                    let body = crate::pr_body::splice_warning(
+                        &pr.body,
+                        warn_merge_strategy,
+                    );
                     if pr.body != body {
                         update.body = Some(body);
                     }

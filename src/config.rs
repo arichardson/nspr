@@ -1,8 +1,47 @@
 //! Repository and user configuration.
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, bail};
 
+use crate::forge::RepoMergeSettings;
 use crate::utils::slugify;
+
+/// Controls whether `nspr` pushes incremental `[nspr]` revision commits
+/// (`true`) or rewrites each PR branch as a single commit with force-pushes
+/// (`false`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreserveCommitHistory {
+    /// Use incremental `[nspr]` commits when the repository is configured for
+    /// squash-only merging with `PR_TITLE` + `PR_BODY`, and fall back to
+    /// single-commit force-pushes (with a CLI warning) otherwise.
+    #[default]
+    Auto,
+    /// Always push incremental `[nspr]` commits without force-pushing.
+    True,
+    /// Always rewrite each PR branch as a single commit and force-push.
+    False,
+}
+
+impl PreserveCommitHistory {
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "true" | "yes" | "1" | "on" => Ok(Self::True),
+            "false" | "no" | "0" | "off" => Ok(Self::False),
+            other => bail!(
+                "invalid value `{other}` for `nspr.preserveCommitHistory`: \
+                 expected `auto`, `true`, or `false`"
+            ),
+        }
+    }
+
+    pub fn resolve(self, merge_settings: RepoMergeSettings) -> bool {
+        match self {
+            Self::Auto => merge_settings.is_squash_only(),
+            Self::True => true,
+            Self::False => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -18,6 +57,8 @@ pub struct Config {
     pub emit_gh_stack_metadata: bool,
     /// Post a stack-table comment on each pull request.
     pub stack_comments: bool,
+    /// `nspr.preserveCommitHistory` (`auto`, `true`, `false`).
+    pub preserve_commit_history: PreserveCommitHistory,
 }
 
 impl Config {
@@ -36,6 +77,7 @@ impl Config {
             branch_prefix,
             emit_gh_stack_metadata: true,
             stack_comments: true,
+            preserve_commit_history: PreserveCommitHistory::Auto,
         }
     }
 
@@ -148,6 +190,9 @@ pub fn detect(
     }
     if let Ok(v) = cfg.get_bool("nspr.stackComments") {
         config.stack_comments = v;
+    }
+    if let Some(raw) = get("nspr.preserveCommitHistory") {
+        config.preserve_commit_history = PreserveCommitHistory::parse(&raw)?;
     }
     Ok(config)
 }
