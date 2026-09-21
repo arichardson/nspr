@@ -81,10 +81,14 @@ pub async fn status(
 ) -> Result<StackStatus> {
     let trees = stack.all_trees(git)?;
     let prs = engine::gather(forge, stack).await?;
-    // Deliberately not `reject_unusable`: a closed or merged pull request is
-    // exactly the thing `status` exists to tell you about.
-    let decision =
-        engine::decide(git, stack, &prs, &trees, &SyncOptions::default())?;
+    let merge_settings = forge.repo_merge_settings().await?;
+    let opts = SyncOptions {
+        preserve_commit_history: config
+            .preserve_commit_history
+            .resolve(merge_settings),
+        ..Default::default()
+    };
+    let decision = engine::decide(git, stack, &prs, &trees, &opts)?;
 
     let mut layers = Vec::with_capacity(stack.layers.len());
     for (i, layer) in stack.layers.iter().enumerate() {

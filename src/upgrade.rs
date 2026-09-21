@@ -228,6 +228,11 @@ pub async fn upgrade_stack(
         forge.push(&head_pushes).await?;
     }
 
+    let merge_settings = forge.repo_merge_settings().await?;
+    let preserve_commit_history =
+        config.preserve_commit_history.resolve(merge_settings);
+    let warn_merge_strategy =
+        preserve_commit_history && !merge_settings.is_squash_only();
     let mut delete_pushes: Vec<PushSpec> = Vec::new();
     for (i, pr) in prs.iter().enumerate() {
         let Some(pr) = pr else {
@@ -236,10 +241,9 @@ pub async fn upgrade_stack(
         let tip = tips[i];
         let base_branch = base_branches[i].clone();
         let subject = stack.layers[i].subject().to_string();
-        let is_stacked = stack.is_layer_stacked(i);
         let body = crate::pr_body::splice_warning(
             &stack.layers[i].message.body,
-            is_stacked,
+            warn_merge_strategy,
         );
         let old_base = pr.base.clone();
 

@@ -7,8 +7,8 @@
 
 use color_eyre::eyre::Result;
 
-use crate::config::Config;
-use crate::forge::{Forge, PullRequest};
+use crate::config::{Config, PreserveCommitHistory};
+use crate::forge::{Forge, PullRequest, RepoMergeSettings};
 use crate::stack::Stack;
 
 #[derive(Debug, Clone, Default)]
@@ -18,6 +18,27 @@ pub struct Guardrails {
     /// "behind" layer really is unmergeable and is worth refreshing even
     /// though its displayed diff is fine.
     pub refresh_when_behind: bool,
+}
+
+fn describe_non_squash_reasons(s: RepoMergeSettings) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if !s.allow_squash_merge {
+        reasons.push(
+            "Squash and Merge is disabled (`allow_squash_merge = false`)",
+        );
+    }
+    if s.allow_merge_commit {
+        reasons.push("merge commits are enabled (`allow_merge_commit = true`)");
+    }
+    if s.allow_rebase_merge {
+        reasons.push("rebase merges are enabled (`allow_rebase_merge = true`)");
+    }
+    if !s.squash_uses_pr_description {
+        reasons.push(
+            "default squash commit message is `COMMIT_MESSAGES` instead of `PR_TITLE` + `PR_BODY`",
+        );
+    }
+    reasons
 }
 
 /// **G2.** Auto-merge on a stacked pull request merges it into the layer
@@ -49,6 +70,31 @@ pub async fn probe(
     pushing: &[bool],
 ) -> Result<Guardrails> {
     let mut warnings = Vec::new();
+
+    let merge_settings = forge.repo_merge_settings().await?;
+    let reasons = describe_non_squash_reasons(merge_settings);
+    if !reasons.is_empty() {
+        let joined = reasons.join("; ");
+        match config.preserve_commit_history {
+            PreserveCommitHistory::Auto => {
+                warnings.push(format!(
+                    "repository settings are not configured for multi-commit squash merging ({joined}).\n\
+                     `nspr.preserveCommitHistory` is `auto`, so nspr is falling back to force-pushing a single commit per PR branch to prevent `[nspr]` revision commits from polluting repository history if merged via the GitHub Web UI.\n\
+                     To configure this behavior or silence this warning:\n\
+                       - Run `git config nspr.preserveCommitHistory false` to always force-push a single commit per PR without this warning.\n\
+                       - Run `git config nspr.preserveCommitHistory true` to push incremental `[nspr]` commits anyway (merge via `nspr land`, or manually select \"Squash and merge\" with the PR title/description in the Web UI).\n\
+                       - Or in GitHub Settings -> General -> Pull Requests, enable only \"Allow squash merging\" with default commit message \"Pull request title and description\"."
+                ));
+            }
+            PreserveCommitHistory::True => {
+                warnings.push(format!(
+                    "`nspr.preserveCommitHistory` is set to `true`, but repository settings are not configured for clean Web UI squash merging ({joined}). \
+                     Merge PRs using `nspr land`, or ensure you select \"Squash and merge\" and use the PR title and description when merging via the GitHub Web UI."
+                ));
+            }
+            PreserveCommitHistory::False => {}
+        }
+    }
 
     let refresh_when_behind = forge
         .branch_protection(&config.trunk)

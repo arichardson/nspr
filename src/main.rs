@@ -315,6 +315,7 @@ impl Session {
             draft: args.draft,
             refresh_when_behind,
             only_layer,
+            ..Default::default()
         };
 
         let fixed = FixedPrompter(AUTO_UPDATE_MESSAGE.to_string());
@@ -354,12 +355,18 @@ impl Session {
     async fn preflight(&self, stack: &Stack) -> Result<bool> {
         let trees = stack.all_trees(&self.git)?;
         let prs = engine::gather(&self.forge, stack).await?;
+        let merge_settings = self.forge.repo_merge_settings().await?;
+        let preserve_commit_history =
+            self.config.preserve_commit_history.resolve(merge_settings);
         let decision = engine::decide(
             &self.git,
             stack,
             &prs,
             &trees,
-            &SyncOptions::default(),
+            &SyncOptions {
+                preserve_commit_history,
+                ..Default::default()
+            },
         )?;
         let rails = guardrails::probe(
             &self.forge,
@@ -421,22 +428,25 @@ impl Session {
                 .await?;
         }
 
+        let merge_settings = self.forge.repo_merge_settings().await?;
+        let preserve_commit_history =
+            self.config.preserve_commit_history.resolve(merge_settings);
+        let warn_merge_strategy =
+            preserve_commit_history && !merge_settings.is_squash_only();
         let prs = engine::gather(&self.forge, &stack).await?;
-        for (i, _layer) in stack.layers.iter().enumerate() {
-            if let Some(pr) = &prs[i] {
-                let is_stacked = stack.is_layer_stacked(i);
-                let body = nspr::pr_body::splice_warning(&pr.body, is_stacked);
-                if pr.body != body {
-                    self.forge
-                        .update_pull_request(
-                            pr.number,
-                            forge::PullRequestUpdate {
-                                body: Some(body),
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
-                }
+        for pr in prs.into_iter().flatten() {
+            let body =
+                nspr::pr_body::splice_warning(&pr.body, warn_merge_strategy);
+            if pr.body != body {
+                self.forge
+                    .update_pull_request(
+                        pr.number,
+                        forge::PullRequestUpdate {
+                            body: Some(body),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
             }
         }
         Ok(())

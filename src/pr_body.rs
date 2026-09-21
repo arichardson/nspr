@@ -1,22 +1,39 @@
-//! Cleaning up legacy `<!-- nspr:warning -->` blocks from pull request
-//! descriptions.
+//! Managing `<!-- nspr:warning -->` blocks in pull request descriptions.
 //!
-//! Previously, before `nspr` registered stacks with GitHub's native Stacks
-//! REST API (`/repos/{owner}/{repo}/stacks`) and switched to 1-parent linear
-//! branch commits, `nspr` injected a `<!-- nspr:warning -->` alert at the top
-//! of stacked PR descriptions. That banner is no longer added; [`strip_warning`]
-//! and [`splice_warning`] strip any legacy block if present so existing PRs
-//! are cleaned up automatically.
+//! When a repository allows merge commits or rebase merges (rather than only
+//! "Squash and merge"), merging an `nspr` branch via the GitHub Web UI with the
+//! wrong merge strategy will include intermediate `[nspr]` revision commits in
+//! trunk history. On such repositories, [`splice_warning`] appends a warning
+//! disclaimer after a `---` separator at the bottom of the PR description.
+//! On squash-only repositories, [`splice_warning`] strips any existing warning
+//! block and leaves the description clean.
 
 pub const WARNING_BEGIN: &str = "<!-- nspr:warning -->";
 pub const WARNING_END: &str = "<!-- /nspr:warning -->";
 
-/// Return `body` with any legacy `<!-- nspr:warning -->` block removed.
-pub fn splice_warning(body: &str, _is_stacked: bool) -> String {
-    strip_warning(body)
+pub const WARNING_BLOCK: &str = "\
+<!-- nspr:warning -->
+---
+
+> [!WARNING]
+> It is recommended that this PR is merged using `nspr land`. If merging via the GitHub Web UI, please make sure to select **Squash and merge** and use the **PR title and description** as the commit message (rather than the default `[nspr]` branch commits).
+<!-- /nspr:warning -->";
+
+/// Ensure `body` ends with [`WARNING_BLOCK`] when `warn_merge_strategy` is
+/// `true`, or has any existing warning block stripped when `false`.
+pub fn splice_warning(body: &str, warn_merge_strategy: bool) -> String {
+    let clean = strip_warning(body);
+    if !warn_merge_strategy {
+        return clean;
+    }
+    if clean.is_empty() {
+        WARNING_BLOCK.to_string()
+    } else {
+        format!("{clean}\n\n{WARNING_BLOCK}")
+    }
 }
 
-/// Strip a legacy warning block from `body`, returning the clean description.
+/// Strip a warning block from `body`, returning the clean description.
 ///
 /// If the body contains a start marker but no end marker, it is treated as having
 /// no valid warning block to avoid eating human-written content.
@@ -45,10 +62,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn splice_warning_leaves_clean_body_untouched() {
+    fn splice_warning_leaves_clean_body_untouched_when_false() {
         let desc = "This adds the widget trait.";
-        assert_eq!(splice_warning(desc, true), desc);
         assert_eq!(splice_warning(desc, false), desc);
+    }
+
+    #[test]
+    fn splice_warning_appends_at_bottom_when_true() {
+        let desc = "This adds the widget trait.";
+        let expected = format!("{desc}\n\n{WARNING_BLOCK}");
+        let result = splice_warning(desc, true);
+        assert_eq!(result, expected);
+        assert_eq!(splice_warning(&result, true), expected);
+        assert_eq!(splice_warning(&result, false), desc);
     }
 
     #[test]
@@ -56,8 +82,11 @@ mod tests {
         let old = format!(
             "{WARNING_BEGIN}\nOld warning\n{WARNING_END}\n\nOriginal text"
         );
-        assert_eq!(splice_warning(&old, true), "Original text");
         assert_eq!(splice_warning(&old, false), "Original text");
+        assert_eq!(
+            splice_warning(&old, true),
+            format!("Original text\n\n{WARNING_BLOCK}")
+        );
     }
 
     #[test]
