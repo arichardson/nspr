@@ -1,0 +1,20 @@
+query PullRequest($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      state
+      title
+      body
+      isDraft
+      baseRefName
+      headRefName
+      baseRefOid
+      headRefOid
+      mergeable
+      mergeStateStatus
+      autoMergeRequest {
+        enabledAt
+      }
+    }
+  }
+}

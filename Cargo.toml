@@ -1,0 +1,40 @@
+[package]
+name = "nspr"
+version = "0.1.0"
+description = "GitHub-native stacked pull requests from linear local commits, without force-pushes"
+license = "Apache-2.0"
+edition = "2024"
+repository = "https://github.com/arichardson/nspr"
+
+[dependencies]
+async-trait = "0.1"
+# `log` is optional and off by default; without it a failed authentication
+# cannot be traced to the method that failed.
+auth-git2 = { version = "0.6", features = ["log"] }
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+color-eyre = "0.6"
+console = "0.16"
+dialoguer = "0.12"
+env_logger = "0.11"
+git2 = { version = "0.21", default-features = false, features = ["https", "ssh"] }
+git2-ext = "2.0"
+indoc = "2.0"
+lazy-regex = "3.4"
+log = "0.4"
+octocrab = { version = "0.54", default-features = false, features = [
+    "opentls",
+    "default-client",
+    "jwt-rust-crypto",
+    "tokio",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+textwrap = "0.16"
+tokio = { version = "1.47", features = ["macros", "rt", "time"] }
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+used-underscore-binding = "deny"

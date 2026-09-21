@@ -1,0 +1,22 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "number": 4242,
+        "state": "OPEN",
+        "title": "Add the widget cache",
+        "body": "Speeds up widget lookups.\n\nPull-Request: https://github.com/o/r/pull/4242\n",
+        "isDraft": false,
+        "baseRefName": "users/someone/add-the-widget-index",
+        "headRefName": "users/someone/add-the-widget-cache",
+        "baseRefOid": "0123456789abcdef0123456789abcdef01234567",
+        "headRefOid": "89abcdef0123456789abcdef0123456789abcdef",
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "BEHIND",
+        "autoMergeRequest": {
+          "enabledAt": "2026-01-02T03:04:05Z"
+        }
+      }
+    }
+  }
+}
