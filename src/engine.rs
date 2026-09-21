@@ -576,7 +576,7 @@ async fn execute(
                 }
             }
             Some(pr) => {
-                let action = if !decision.push[i] {
+                let mut action = if !decision.push[i] {
                     LayerAction::Skipped
                 } else if decision.patch_changed[i]
                     || decision.message_changed[i]
@@ -614,6 +614,9 @@ async fn execute(
                     }
                 }
                 if !update.is_empty() {
+                    if action == LayerAction::Skipped {
+                        action = LayerAction::Updated;
+                    }
                     forge.update_pull_request(pr.number, update).await?;
                 }
 
