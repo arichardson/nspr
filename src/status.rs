@@ -54,8 +54,10 @@ pub struct LayerStatus {
     /// The base branch on the forge right now, which may not be the base the
     /// local stack implies.
     pub base: Option<String>,
-    /// What the base *should* be.
+    /// What the base *should* be (branch name on the forge).
     pub wanted_base: String,
+    /// Short, human-readable label for `wanted_base` (e.g. `#225127` or `main`).
+    pub wanted_base_label: String,
     pub state: LayerState,
     pub draft: bool,
     pub auto_merge: bool,
@@ -92,17 +94,25 @@ pub async fn status(
 
     let mut layers = Vec::with_capacity(stack.layers.len());
     for (i, layer) in stack.layers.iter().enumerate() {
-        let wanted_base = match layer.dep {
-            Dep::Main | Dep::ExternalPr(_) => config.trunk.clone(),
-            Dep::Layer(j) => stack.layers[j]
-                .pr
-                .and_then(|n| {
-                    prs[j]
-                        .as_ref()
-                        .filter(|p| p.number == n)
-                        .map(|p| p.head.clone())
-                })
-                .unwrap_or_else(|| "?".to_string()),
+        let (wanted_base, wanted_base_label) = match layer.dep {
+            Dep::Main => (config.trunk.clone(), config.trunk.clone()),
+            Dep::ExternalPr(n) => (config.trunk.clone(), format!("#{n}")),
+            Dep::Layer(j) => {
+                let branch = stack.layers[j]
+                    .pr
+                    .and_then(|n| {
+                        prs[j]
+                            .as_ref()
+                            .filter(|p| p.number == n)
+                            .map(|p| p.head.clone())
+                    })
+                    .unwrap_or_else(|| "?".to_string());
+                let label = match stack.layers[j].pr {
+                    Some(n) => format!("#{n}"),
+                    None => format!("layer {}", j + 1),
+                };
+                (branch, label)
+            }
         };
 
         let state = match &prs[i] {
@@ -133,6 +143,7 @@ pub async fn status(
             branch: prs[i].as_ref().map(|p| p.head.clone()),
             base: prs[i].as_ref().map(|p| p.base.clone()),
             wanted_base,
+            wanted_base_label,
             state,
             draft: prs[i].as_ref().is_some_and(|p| p.draft),
             auto_merge: prs[i].as_ref().is_some_and(|p| p.auto_merge),
@@ -153,48 +164,360 @@ pub async fn status(
     })
 }
 
+fn supports_unicode() -> bool {
+    if std::env::var("TERM").is_ok_and(|t| t == "dumb") {
+        return false;
+    }
+    for var in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(val) = std::env::var(var)
+            && !val.is_empty()
+        {
+            let upper = val.to_ascii_uppercase();
+            return upper.contains("UTF-8") || upper.contains("UTF8");
+        }
+    }
+    true
+}
+
 impl StackStatus {
     /// Render top-down, the way a stack is usually drawn, with the trunk at
-    /// the bottom.
+    /// the bottom. Automatically uses Unicode glyphs, colors, and terminal
+    /// width truncation when stdout is a smart terminal.
     pub fn render(&self) -> String {
-        let mut out = String::new();
+        let term = console::Term::stdout();
+        let is_tty = term.is_term();
+        let use_color = is_tty && console::colors_enabled();
+        let use_unicode = is_tty && supports_unicode();
+        let term_width = if is_tty {
+            term.size_checked().map(|(_rows, cols)| cols as usize)
+        } else {
+            None
+        };
+        self.render_with_options(use_unicode, use_color, term_width)
+    }
 
+    pub fn render_with_options(
+        &self,
+        use_unicode: bool,
+        use_color: bool,
+        term_width: Option<usize>,
+    ) -> String {
+        use console::{Alignment, measure_text_width, pad_str, style, truncate_str};
+
+        struct RowData<'a> {
+            layer: &'a LayerStatus,
+            num_plain: String,
+            state_styled: String,
+            badges_joined: String,
+        }
+
+        let arrow = if use_unicode { "→" } else { "->" };
+        let dash = if use_unicode { "—" } else { "-" };
+
+        let mut rows = Vec::with_capacity(self.layers.len());
         for layer in self.layers.iter().rev() {
-            let number = match layer.number {
+            let num_plain = match layer.number {
                 Some(n) => format!("#{n}"),
-                None => "—".to_string(),
+                None => dash.to_string(),
+            };
+            let state_plain = layer.state.label();
+            let state_styled = if use_color {
+                match layer.state {
+                    LayerState::Current => style(state_plain).green().to_string(),
+                    LayerState::Modified => {
+                        style(state_plain).yellow().bold().to_string()
+                    }
+                    LayerState::NeedsRestack => {
+                        style(state_plain).cyan().to_string()
+                    }
+                    LayerState::New => {
+                        style(state_plain).green().bold().to_string()
+                    }
+                    LayerState::Merged => {
+                        style(state_plain).magenta().to_string()
+                    }
+                    LayerState::Closed => style(state_plain).red().to_string(),
+                    LayerState::LegacySpr => {
+                        style(state_plain).yellow().bold().to_string()
+                    }
+                }
+            } else {
+                state_plain.to_string()
             };
 
-            let mut notes = vec![layer.state.label().to_string()];
+            let mut badges = Vec::new();
             if layer.draft {
-                notes.push("draft".into());
+                badges.push(if use_color {
+                    style("draft").dim().to_string()
+                } else {
+                    "draft".to_string()
+                });
             }
             if layer.conflicting {
-                notes.push("conflicts".into());
+                badges.push(if use_color {
+                    style("conflicts").red().bold().to_string()
+                } else {
+                    "conflicts".to_string()
+                });
             }
             if layer.behind {
-                notes.push("behind".into());
+                badges.push(if use_color {
+                    style("behind").yellow().to_string()
+                } else {
+                    "behind".to_string()
+                });
             }
             if layer.auto_merge {
-                // Worth shouting about: auto-merge on a stacked pull request
-                // merges it into the layer below, not the trunk.
-                notes.push("AUTO-MERGE".into());
+                badges.push(if use_color {
+                    style("AUTO-MERGE").red().bold().to_string()
+                } else {
+                    "AUTO-MERGE".to_string()
+                });
             }
             if layer.base.as_ref().is_some_and(|b| b != &layer.wanted_base) {
-                notes.push(format!("retarget→{}", layer.wanted_base));
+                let t = format!("retarget {arrow} {}", layer.wanted_base_label);
+                badges.push(if use_color {
+                    style(t).magenta().to_string()
+                } else {
+                    t
+                });
+            } else if layer.index > 0 && layer.dep == Dep::Main {
+                let t = format!("base: {}", self.trunk);
+                badges.push(if use_color {
+                    style(t).blue().to_string()
+                } else {
+                    t
+                });
             }
             if layer.landable {
-                notes.push("landable".into());
+                badges.push(if use_color {
+                    style("landable").green().to_string()
+                } else {
+                    "landable".to_string()
+                });
             }
 
+            rows.push(RowData {
+                layer,
+                num_plain,
+                state_styled,
+                badges_joined: badges.join("  "),
+            });
+        }
+
+        let num_width = rows
+            .iter()
+            .map(|r| measure_text_width(&r.num_plain))
+            .max()
+            .unwrap_or(1)
+            .max(2);
+        let state_width = rows
+            .iter()
+            .map(|r| measure_text_width(&r.state_styled))
+            .max()
+            .unwrap_or(2);
+        let max_badges_width = rows
+            .iter()
+            .map(|r| measure_text_width(&r.badges_joined))
+            .max()
+            .unwrap_or(0);
+
+        let mut out = String::new();
+
+        for row in &rows {
+            let glyph = if use_unicode {
+                let raw = match row.layer.state {
+                    LayerState::Current if row.layer.draft => "◌",
+                    LayerState::Current => "●",
+                    LayerState::Modified => "◉",
+                    LayerState::NeedsRestack => "◎",
+                    LayerState::New => "○",
+                    LayerState::Merged => "✔",
+                    LayerState::Closed => "✕",
+                    LayerState::LegacySpr => "⚠",
+                };
+                if use_color {
+                    match row.layer.state {
+                        LayerState::Current if row.layer.draft => {
+                            style(raw).dim().to_string()
+                        }
+                        LayerState::Current => style(raw).green().to_string(),
+                        LayerState::Modified => style(raw).yellow().to_string(),
+                        LayerState::NeedsRestack => {
+                            style(raw).cyan().to_string()
+                        }
+                        LayerState::New => style(raw).green().bold().to_string(),
+                        LayerState::Merged => style(raw).magenta().to_string(),
+                        LayerState::Closed => style(raw).red().to_string(),
+                        LayerState::LegacySpr => {
+                            style(raw).yellow().bold().to_string()
+                        }
+                    }
+                } else {
+                    raw.to_string()
+                }
+            } else {
+                "*".to_string()
+            };
+
+            let num_pad =
+                num_width.saturating_sub(measure_text_width(&row.num_plain));
+            let styled_num = if use_color {
+                if row.layer.number.is_some() {
+                    let colored = style(&row.num_plain).bold().cyan();
+                    if let Some(url) = &row.layer.url {
+                        format!(
+                            "{}\x1b]8;;{url}\x1b\\{colored}\x1b]8;;\x1b\\",
+                            " ".repeat(num_pad)
+                        )
+                    } else {
+                        format!("{}{colored}", " ".repeat(num_pad))
+                    }
+                } else {
+                    pad_str(
+                        &style(&row.num_plain).dim().to_string(),
+                        num_width,
+                        Alignment::Right,
+                        None,
+                    )
+                    .into_owned()
+                }
+            } else {
+                pad_str(&row.num_plain, num_width, Alignment::Right, None)
+                    .into_owned()
+            };
+
+            let padded_state =
+                pad_str(&row.state_styled, state_width, Alignment::Left, None);
+
+            let (badges_col, prefix_width) = if max_badges_width > 0 {
+                let padded_badges = pad_str(
+                    &row.badges_joined,
+                    max_badges_width,
+                    Alignment::Left,
+                    None,
+                );
+                (
+                    format!("  {padded_badges}"),
+                    2 + 1 + 2 + num_width + 2 + state_width + 2 + max_badges_width + 2,
+                )
+            } else {
+                (
+                    String::new(),
+                    2 + 1 + 2 + num_width + 2 + state_width + 2,
+                )
+            };
+
+            let subject = if let Some(cols) = term_width
+                && cols > prefix_width + 8
+            {
+                let avail = cols - prefix_width;
+                let ellipsis = if use_unicode { "…" } else { "..." };
+                truncate_str(&row.layer.subject, avail, ellipsis).into_owned()
+            } else {
+                row.layer.subject.clone()
+            };
+
+            let styled_subject = if use_color && row.layer.draft {
+                style(&subject).dim().to_string()
+            } else {
+                subject
+            };
+
             out.push_str(&format!(
-                "  {number:>6}  {:<10}  {}\n",
-                notes.join(","),
-                layer.subject,
+                "  {glyph}  {styled_num}  {padded_state}{badges_col}  {styled_subject}\n"
             ));
         }
 
-        out.push_str(&format!("  {:>6}  {:<10}  {}\n", "", "", self.trunk));
+        let trunk_connector = if use_unicode {
+            if use_color {
+                style("┴─").dim().to_string()
+            } else {
+                "┴─".to_string()
+            }
+        } else {
+            "\\-".to_string()
+        };
+        let styled_trunk = if use_color {
+            style(&self.trunk).bold().to_string()
+        } else {
+            self.trunk.clone()
+        };
+        out.push_str(&format!("  {trunk_connector} {styled_trunk}\n"));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_aligns_columns_and_shortens_retarget_labels() {
+        let status = StackStatus {
+            trunk: "main".to_string(),
+            layers: vec![
+                LayerStatus {
+                    index: 0,
+                    subject: "[cross-project-tests] Avoid requiring packaging for GDB/LLDB version checks".into(),
+                    number: Some(225126),
+                    url: Some("https://github.com/llvm/llvm-project/pull/225126".into()),
+                    branch: Some("users/arichardson/nspr/1".into()),
+                    base: Some("main".into()),
+                    wanted_base: "main".into(),
+                    wanted_base_label: "main".into(),
+                    state: LayerState::NeedsRestack,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    landable: true,
+                    dep: Dep::Main,
+                },
+                LayerStatus {
+                    index: 1,
+                    subject: "[cross-project-tests] Derive tool substitutions from CMake".into(),
+                    number: Some(225127),
+                    url: Some("https://github.com/llvm/llvm-project/pull/225127".into()),
+                    branch: Some("users/arichardson/cross-project-tests-derive-tool-substitutions-from-cmake".into()),
+                    base: Some("users/arichardson/nspr/1".into()),
+                    wanted_base: "users/arichardson/nspr/1".into(),
+                    wanted_base_label: "#225126".into(),
+                    state: LayerState::NeedsRestack,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    landable: false,
+                    dep: Dep::Layer(0),
+                },
+                LayerStatus {
+                    index: 2,
+                    subject: "[RISC-V][LTO] Add baseline tests for LTO inline assembly".into(),
+                    number: Some(225129),
+                    url: Some("https://github.com/llvm/llvm-project/pull/225129".into()),
+                    branch: Some("users/arichardson/nspr/3".into()),
+                    base: Some("main".into()),
+                    wanted_base: "users/arichardson/cross-project-tests-derive-tool-substitutions-from-cmake".into(),
+                    wanted_base_label: "#225127".into(),
+                    state: LayerState::Modified,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    landable: false,
+                    dep: Dep::Layer(1),
+                },
+            ],
+        };
+
+        let rendered = status.render_with_options(true, false, None);
+        let expected = concat!(
+            "  ◉  #225129  modified  retarget → #225127  [RISC-V][LTO] Add baseline tests for LTO inline assembly\n",
+            "  ◎  #225127  restack                       [cross-project-tests] Derive tool substitutions from CMake\n",
+            "  ◎  #225126  restack   landable            [cross-project-tests] Avoid requiring packaging for GDB/LLDB version checks\n",
+            "  ┴─ main\n",
+        );
+        assert_eq!(rendered, expected);
     }
 }
