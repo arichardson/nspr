@@ -59,6 +59,14 @@ pub struct Config {
     pub stack_comments: bool,
     /// `nspr.preserveCommitHistory` (`auto`, `true`, `false`).
     pub preserve_commit_history: PreserveCommitHistory,
+    /// Flip a pull request to draft for the moment it is being retargeted.
+    ///
+    /// Off by default. `nspr` already parks a branch so that the diff never
+    /// widens while the base is being changed, and a draft that never gets
+    /// flipped back (because the command was interrupted, say) is its own kind
+    /// of mess. Worth turning on if your repository has a `CODEOWNERS` file big
+    /// enough that a mistake is expensive.
+    pub draft_while_retargeting: bool,
 }
 
 impl Config {
@@ -78,6 +86,7 @@ impl Config {
             emit_gh_stack_metadata: true,
             stack_comments: true,
             preserve_commit_history: PreserveCommitHistory::Auto,
+            draft_while_retargeting: false,
         }
     }
 
@@ -193,6 +202,9 @@ pub fn detect(
     }
     if let Some(raw) = get("nspr.preserveCommitHistory") {
         config.preserve_commit_history = PreserveCommitHistory::parse(&raw)?;
+    }
+    if let Ok(v) = cfg.get_bool("nspr.draftWhileRetargeting") {
+        config.draft_while_retargeting = v;
     }
     Ok(config)
 }

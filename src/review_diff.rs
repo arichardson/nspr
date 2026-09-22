@@ -52,6 +52,34 @@ pub fn displayed_patch(
     )
 }
 
+/// Paths GitHub would list under "Files changed".
+///
+/// This is also exactly the set it hands to `CODEOWNERS` when deciding whom to
+/// request a review from, which makes it the thing to assert on when checking
+/// that an intermediate state of a push never widened a pull request's diff.
+pub fn displayed_paths(
+    repo: &Repository,
+    base_tip: Oid,
+    head_tip: Oid,
+) -> Result<Vec<String>> {
+    let mb = review_base(repo, base_tip, head_tip)?;
+    let from = repo.find_tree(repo.find_commit(mb)?.tree_id())?;
+    let to = repo.find_tree(repo.find_commit(head_tip)?.tree_id())?;
+    let diff = repo.diff_tree_to_tree(Some(&from), Some(&to), None)?;
+
+    let mut out: Vec<String> = Vec::new();
+    for delta in diff.deltas() {
+        for file in [delta.old_file(), delta.new_file()] {
+            if let Some(path) = file.path() {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// Render the diff between two trees as unified patch text.
 pub fn render_tree_diff(
     repo: &Repository,

@@ -422,6 +422,45 @@ impl Forge for GitHubForge {
         Ok(())
     }
 
+    async fn delete_comment(&self, id: u64) -> Result<()> {
+        self.api
+            .issues(&self.owner, &self.repo)
+            .delete_comment(octocrab::models::CommentId(id))
+            .await
+            .wrap_err_with(|| format!("could not delete comment {id}"))?;
+        Ok(())
+    }
+
+    /// REST cannot flip `draft`, so this goes through GraphQL.
+    ///
+    /// Failing to toggle the draft flag must not abort a sync: it is a
+    /// precaution around retargeting, not a step the result depends on.
+    async fn set_draft(&self, node_id: &str, draft: bool) -> Result<()> {
+        if node_id.is_empty() {
+            debug!("no node id available; leaving draft state alone");
+            return Ok(());
+        }
+        let mutation = if draft {
+            "mutation($id: ID!) { convertPullRequestToDraft(input: \
+             {pullRequestId: $id}) { pullRequest { number } } }"
+        } else {
+            "mutation($id: ID!) { markPullRequestReadyForReview(input: \
+             {pullRequestId: $id}) { pullRequest { number } } }"
+        };
+        let body = serde_json::json!({
+            "query": mutation,
+            "variables": { "id": node_id },
+        });
+        if let Err(e) = self
+            .api
+            .post::<_, serde_json::Value>("/graphql", Some(&body))
+            .await
+        {
+            debug!("could not set draft={draft} on {node_id}: {e}");
+        }
+        Ok(())
+    }
+
     async fn list_pull_requests(
         &self,
         author: Option<&str>,
@@ -808,6 +847,11 @@ struct RepositoryNode {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequestNode {
+    /// Absent from the recorded payloads checked in for the tests below, and
+    /// only needed for the draft mutations, so a miss degrades rather than
+    /// failing the whole read.
+    #[serde(default)]
+    id: String,
     number: u64,
     state: String,
     title: String,
@@ -939,6 +983,7 @@ fn error_suffix(errors: &[String]) -> String {
 fn pull_request_from(node: PullRequestNode) -> Result<PullRequest> {
     Ok(PullRequest {
         number: node.number,
+        node_id: node.id,
         state: pr_state_from(&node.state),
         title: node.title,
         body: node.body,

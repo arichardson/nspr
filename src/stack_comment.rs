@@ -57,6 +57,31 @@ pub fn splice(body: &str, block: &str) -> String {
     }
 }
 
+/// Remove the generated block from `body`, leaving anything a human wrote.
+///
+/// The inverse of [`splice`], for when a pull request stops being part of a
+/// stack and the table has to come down.
+pub fn strip(body: &str) -> String {
+    let mut out = body.to_string();
+
+    if let Some(start) = out.find(BEGIN)
+        && let Some(end) = out[start..].find(END)
+    {
+        let end = start + end + END.len();
+        out = format!("{}{}", &out[..start], &out[end..]);
+    }
+
+    if let Some(start) = out.find(LEGACY_SPR_MARKER) {
+        let end = match out[start..].find(LEGACY_SPR_END) {
+            Some(rel_end) => start + rel_end + LEGACY_SPR_END.len(),
+            None => out.len(),
+        };
+        out = format!("{}{}", &out[..start], &out[end..]);
+    }
+
+    out.trim().to_string()
+}
+
 /// Render the stack as a tree, seen from layer `current`.
 ///
 /// A tree rather than a list because the dependency graph is a tree: siblings
@@ -144,26 +169,32 @@ fn render_children(
     }
 }
 
-/// Post or update the stack comment on every layer.
+/// Post or update the stack comment on every layer that is part of a stack, and
+/// take it down from every layer that is not.
 ///
 /// Comments are only rewritten when their content actually changes: every
 /// edit sends a notification, and a tool that re-notifies a dozen reviewers on
 /// every `nspr diff` would be turned off within the week.
+///
+/// Retargeting a pull request at the trunk is the interesting case. Without the
+/// take-down it keeps a table saying it is blocked on work it no longer depends
+/// on, and reviewers have no reason to doubt it.
 pub async fn update_all(
     forge: &dyn Forge,
     config: &Config,
     stack: &Stack,
 ) -> Result<usize> {
-    // A single open pull request is not a stack; the table would be noise.
-    let open_prs = stack.layers.iter().filter(|l| l.pr.is_some()).count();
-    if open_prs < 2 {
-        return Ok(0);
-    }
+    // A pull request on its own is not a stack; the table would be noise.
+    let stacked: std::collections::HashSet<usize> = stack
+        .pr_components()
+        .into_iter()
+        .filter(|component| component.len() >= 2)
+        .flatten()
+        .collect();
 
     let mut updated = 0;
     for (i, layer) in stack.layers.iter().enumerate() {
         let Some(number) = layer.pr else { continue };
-        let block = render(config, stack, i);
 
         let existing =
             forge
@@ -174,6 +205,21 @@ pub async fn update_all(
                     c.body.contains(BEGIN) || c.body.contains(LEGACY_SPR_MARKER)
                 });
 
+        if !stacked.contains(&i) {
+            let Some(comment) = existing else { continue };
+            // Anything a human wrote around the table is worth keeping, so the
+            // comment only goes away entirely when the table was all of it.
+            let body = strip(&comment.body);
+            if body.is_empty() {
+                forge.delete_comment(comment.id).await?;
+            } else {
+                forge.update_comment(comment.id, &body).await?;
+            }
+            updated += 1;
+            continue;
+        }
+
+        let block = render(config, stack, i);
         match existing {
             Some(comment) => {
                 let body = splice(&comment.body, &block);

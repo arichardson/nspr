@@ -135,10 +135,52 @@ pub async fn sync_stack(
     )?;
     let decision = decide(git, stack, &prs, &trees, &opts)?;
 
-    execute(
-        git, forge, config, stack, &prs, &trees, &decision, &opts, prompter,
+    let mut staged = false;
+    let outcomes = execute(
+        git,
+        forge,
+        config,
+        stack,
+        &prs,
+        &trees,
+        &decision,
+        &opts,
+        prompter,
+        &mut staged,
     )
-    .await
+    .await?;
+
+    // A staged layer is deliberately left behind its new base so the retarget
+    // cannot widen the displayed diff. That is harmless unless the repository
+    // insists branches be up to date before merging, in which case the layer
+    // has to catch up. It is safe to do so now: every pull request already
+    // points at the branch it should, so moving a head forward can only shrink
+    // the diff it displays.
+    if staged && opts.refresh_when_behind {
+        let trees = stack.all_trees(git)?;
+        let prs = gather(forge, stack).await?;
+        reject_unusable(&prs)?;
+        let decision = decide(git, stack, &prs, &trees, &opts)?;
+        let mut staged_again = false;
+        let second = execute(
+            git,
+            forge,
+            config,
+            stack,
+            &prs,
+            &trees,
+            &decision,
+            &opts,
+            prompter,
+            &mut staged_again,
+        )
+        .await?;
+        if !second.is_empty() {
+            return Ok(second);
+        }
+    }
+
+    Ok(outcomes)
 }
 
 /// Pass A: fetch the current state of every existing pull request.
@@ -406,6 +448,68 @@ fn would_conflict_or_diverge_on_forge(
     Ok(merged_tree != desired_effective_tree)
 }
 
+/// Where a layer's branch must sit while its pull request is retargeted.
+///
+/// GitHub shows a pull request's diff as `tree(head) - tree(merge_base(base,
+/// head))`, and it hands that file list to `CODEOWNERS` on **every** push, not
+/// only at the end of a run. So re-anchoring a head onto a base branch the pull
+/// request has not been pointed at yet is not a harmless intermediate state: if
+/// the new anchor carries commits the old base lacks, the pull request briefly
+/// displays all of them and GitHub subscribes their owners for good.
+///
+/// Anchoring at the merge base of the old and new base branches avoids that
+/// entirely, because it is an ancestor of both: the displayed diff is the
+/// layer's own patch before the base change and after it. The branch is left
+/// slightly behind its new base, which is the ordinary state of any stack whose
+/// trunk has moved on, and is repaired by the next push that has a reason to
+/// happen.
+///
+/// Returns `None` when no staging is needed.
+fn safe_retarget_anchor(
+    git: &Git,
+    pr: &PullRequest,
+    new_base_branch: &str,
+    old_base_tip: Oid,
+    new_base_tip: Oid,
+) -> Result<Option<Oid>> {
+    if pr.base == new_base_branch {
+        return Ok(None);
+    }
+    // Nothing the new base has is missing from the old one, so the diff cannot
+    // grow no matter which order the two operations happen in.
+    if git.is_ancestor(new_base_tip, old_base_tip)? {
+        return Ok(None);
+    }
+    let anchor = git.merge_base(old_base_tip, new_base_tip)?;
+    Ok((anchor != new_base_tip).then_some(anchor))
+}
+
+/// Express a layer's content on top of `onto` instead of its usual parent.
+///
+/// `desired` is the layer's tree as computed against the base it is *about* to
+/// have; `ancestor_tree` is the tree that base change is relative to. Replaying
+/// the difference between them onto `onto` gives the same patch sitting on the
+/// older anchor.
+///
+/// Returns `None` if the three-way merge conflicts, which is the caller's cue
+/// to give up on staging rather than to fail.
+fn rebase_tree_onto(
+    git: &Git,
+    ancestor_tree: Oid,
+    onto: Oid,
+    desired: Oid,
+) -> Result<Option<Oid>> {
+    let ours = git.tree_of(onto)?;
+    if ours == ancestor_tree {
+        return Ok(Some(desired));
+    }
+    let index = git.merge_trees(ancestor_tree, ours, desired)?;
+    if index.has_conflicts() {
+        return Ok(None);
+    }
+    Ok(Some(git.write_index(index)?))
+}
+
 /// Pass D: push bottom-up, so every layer sees its dependency's *new* tip.
 #[allow(clippy::too_many_arguments)]
 async fn execute(
@@ -418,6 +522,8 @@ async fn execute(
     decision: &Decision,
     opts: &SyncOptions,
     prompter: &dyn Prompter,
+    // Set when a layer was left behind its new base by `safe_retarget_anchor`.
+    staged: &mut bool,
 ) -> Result<Vec<LayerOutcome>> {
     let n = stack.layers.len();
     let mut outcomes: Vec<LayerOutcome> = Vec::new();
@@ -465,6 +571,17 @@ async fn execute(
                 }
                 reserved_branches.insert(candidate.clone());
 
+                // The dependency may be parked behind its own base, in which
+                // case the tree computed against the eventual base does not
+                // belong on top of it.
+                let desired_tree = rebase_tree_onto(
+                    git,
+                    trees.dep[i],
+                    parent_tip,
+                    desired_tree,
+                )?
+                .unwrap_or(desired_tree);
+
                 let initial_msg = stack.layers[i].message.clean_for_branch();
                 let tip = git.synthesize_initial_commit(
                     parent_tip,
@@ -484,10 +601,66 @@ async fn execute(
                     continue;
                 }
 
+                // Where the branch sits today. Also the left-hand side of the
+                // diff the pull request is displaying right now.
+                let fallback_base_tip = match stack.layers[i].dep {
+                    Dep::Main | Dep::ExternalPr(_) => stack.base,
+                    Dep::Layer(j) => prs[j]
+                        .as_ref()
+                        .map(|p| p.head_oid)
+                        .unwrap_or(stack.base),
+                };
+                let old_base_tip =
+                    match find_root_commit(git, pr, fallback_base_tip) {
+                        Some(root_oid) => git.parent_of(root_oid)?,
+                        None => fallback_base_tip,
+                    };
+
+                // Re-anchoring and retargeting cannot be done atomically, so
+                // when they disagree the branch is parked at their merge base
+                // until the pull request points somewhere that makes the
+                // forward move safe.
+                let anchor = safe_retarget_anchor(
+                    git,
+                    pr,
+                    &base_branches[i],
+                    old_base_tip,
+                    parent_tip,
+                )?
+                .unwrap_or(parent_tip);
+
+                // The layer's content is computed against the base it is about
+                // to have, so it has to be replayed whenever the anchor is
+                // something else. That covers this layer being parked and,
+                // because `parent_tip` is already the parked tip in that case,
+                // a layer stacked on a parked dependency as well: without the
+                // replay it would carry content its own base does not have.
+                //
+                // Replaying can conflict where the forward move would not.
+                // Nothing is lost by declining, it just means taking the
+                // ordinary path.
+                let (anchor, desired_tree) = match rebase_tree_onto(
+                    git,
+                    trees.dep[i],
+                    anchor,
+                    desired_tree,
+                )? {
+                    Some(tree) => (anchor, tree),
+                    None => (parent_tip, desired_tree),
+                };
+                if anchor != parent_tip {
+                    *staged = true;
+                }
+                // A parked branch is being moved off its current history, so it
+                // is rewritten whether or not anything else asked for that.
+                let rewrite = decision.rewrite_history[i]
+                    || anchor != parent_tip
+                    || desired_tree != trees.effective[i];
+
                 if !opts.preserve_commit_history {
                     let clean_msg = stack.layers[i].message.clean_for_branch();
                     let tip = git.synthesize_initial_commit(
-                        parent_tip,
+                        anchor,
                         desired_tree,
                         layer_commit,
                         &clean_msg,
@@ -499,19 +672,7 @@ async fn execute(
                     continue;
                 }
 
-                let mut tip = if decision.rewrite_history[i] {
-                    let fallback_base_tip = match stack.layers[i].dep {
-                        Dep::Main | Dep::ExternalPr(_) => stack.base,
-                        Dep::Layer(j) => prs[j]
-                            .as_ref()
-                            .map(|p| p.head_oid)
-                            .unwrap_or(stack.base),
-                    };
-                    let old_base_tip =
-                        match find_root_commit(git, pr, fallback_base_tip) {
-                            Some(root_oid) => git.parent_of(root_oid)?,
-                            None => fallback_base_tip,
-                        };
+                let mut tip = if rewrite {
                     let revisions = crate::land::branch_revisions(
                         git,
                         pr.head_oid,
@@ -519,11 +680,11 @@ async fn execute(
                     )?;
                     let clean_msg = stack.layers[i].message.clean_for_branch();
                     match crate::land::replay(
-                        git, &revisions, parent_tip, &clean_msg,
+                        git, &revisions, anchor, &clean_msg,
                     )? {
                         Some(t) => t,
                         None => git.synthesize_initial_commit(
-                            parent_tip,
+                            anchor,
                             desired_tree,
                             layer_commit,
                             &clean_msg,
@@ -533,9 +694,7 @@ async fn execute(
                     pr.head_oid
                 };
 
-                if !decision.rewrite_history[i]
-                    || git.tree_of(tip)? != desired_tree
-                {
+                if !rewrite || git.tree_of(tip)? != desired_tree {
                     // Prompt only when reviewers will actually see something
                     // different.
                     let message =
@@ -554,9 +713,9 @@ async fn execute(
                     )?;
                 }
 
-                if decision.rewrite_history[i] {
+                if rewrite {
                     new_roots[i] =
-                        crate::land::branch_revisions(git, tip, parent_tip)?
+                        crate::land::branch_revisions(git, tip, anchor)?
                             .first()
                             .copied();
                     push_specs.push(PushSpec::forced(&pr.head, tip));
@@ -567,6 +726,24 @@ async fn execute(
                 tips.push(tip);
                 branches.push(pr.head.clone());
             }
+        }
+    }
+
+    // Drafts are exempt from `CODEOWNERS` auto-assignment, so flipping a pull
+    // request to draft across a retarget is a second line of defence for
+    // anybody who wants one. Off unless asked for: parking the branch already
+    // keeps the displayed diff correct, marking a pull request ready again
+    // re-runs the assignment anyway, and a draft left behind by an interrupted
+    // run is its own kind of mess.
+    let mut undraft: Vec<String> = Vec::new();
+    if config.draft_while_retargeting {
+        for i in 0..n {
+            let Some(pr) = &prs[i] else { continue };
+            if pr.draft || pr.base == base_branches[i] {
+                continue;
+            }
+            forge.set_draft(&pr.node_id, true).await?;
+            undraft.push(pr.node_id.clone());
         }
     }
 
@@ -683,6 +860,12 @@ async fn execute(
 
         crate::refs::update(git, outcome.number, outcome.tip)?;
         outcomes.push(outcome);
+    }
+
+    // Every base now points where it should, so it is safe to be looked at
+    // again.
+    for node_id in undraft {
+        forge.set_draft(&node_id, false).await?;
     }
 
     apply_message_edits(git, stack, &messages)?;

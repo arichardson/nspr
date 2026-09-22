@@ -44,6 +44,9 @@ pub enum MergeState {
 #[derive(Debug, Clone)]
 pub struct PullRequest {
     pub number: u64,
+    /// GraphQL node id. Draft state can only be changed through GraphQL, which
+    /// addresses pull requests by node id rather than number.
+    pub node_id: String,
     pub state: PrState,
     pub title: String,
     pub body: String,
@@ -245,6 +248,16 @@ pub trait Forge {
     async fn list_own_comments(&self, number: u64) -> Result<Vec<Comment>>;
     async fn create_comment(&self, number: u64, body: &str) -> Result<u64>;
     async fn update_comment(&self, id: u64, body: &str) -> Result<()>;
+    async fn delete_comment(&self, id: u64) -> Result<()>;
+    /// Convert a pull request to or from draft.
+    ///
+    /// Draft pull requests are exempt from `CODEOWNERS` auto-assignment, so
+    /// this is used to shield reviewers from a pull request that is about to be
+    /// retargeted. Best-effort: a forge that cannot do it returns `Ok(())`.
+    async fn set_draft(&self, node_id: &str, draft: bool) -> Result<()> {
+        let _ = (node_id, draft);
+        Ok(())
+    }
     /// Open pull requests in the repository, optionally restricted to an author.
     async fn list_pull_requests(
         &self,

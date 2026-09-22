@@ -2678,3 +2678,155 @@ fn linear_revisions_retained_across_amends_and_restacks() {
         "layer three must be cleanly re-anchored on top of layer two's new tip"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Retargeting must never widen the displayed diff, not even for an instant.
+// ---------------------------------------------------------------------------
+
+/// Assert that `number` only ever displayed `expected`, at any point during the
+/// observation window.
+///
+/// The end state being right is not good enough. GitHub recomputes a pull
+/// request's file list on every push and hands it straight to `CODEOWNERS`, and
+/// the review requests that come out of that are never withdrawn when the file
+/// list shrinks again a moment later.
+fn assert_only_ever_displayed(w: &World, number: u64, expected: &[&str]) {
+    let expected: Vec<String> =
+        expected.iter().map(|s| (*s).to_string()).collect();
+    let seen = w.forge.observed_diffs(number);
+    assert!(!seen.is_empty(), "PR #{number} was never observed");
+    for files in seen {
+        assert_eq!(
+            files, expected,
+            "PR #{number} displayed the wrong files at some point during the \
+             command, which is when CODEOWNERS gets consulted"
+        );
+    }
+}
+
+/// Pulling one commit out of a stack and pointing it at a trunk that has moved
+/// on is the case that first surfaced this: the head was re-anchored on the new
+/// trunk while the pull request still pointed at the layer below, so for a
+/// couple of seconds it displayed every upstream commit in between and
+/// subscribed all of their owners.
+#[test]
+fn retargeting_onto_a_moved_trunk_never_displays_the_upstream_commits() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Independent fix", &[("c.txt", "c1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Somebody else lands work on the trunk while the stack is open.
+    w.advance_trunk_and_pull(&[("upstream.txt", "u1")]);
+
+    // The author decides the top layer does not belong in the stack after all,
+    // which is what `nspr diff --cherry-pick` does: point it at the trunk and
+    // sync that layer alone.
+    w.set_trailer(1, crate::trailers::DEPENDS_ON, TRUNK);
+    w.forge.clear_diff_observations();
+    w.sync_with(SyncOptions {
+        only_layer: Some(1),
+        ..Default::default()
+    });
+
+    assert_only_ever_displayed(&w, prs[1], &["c.txt"]);
+    w.assert_invariants();
+}
+
+/// Reordering swaps which branch each pull request is based on, so both ends of
+/// the swap are retargeted at a branch that does not contain their old anchor.
+#[test]
+fn reordering_a_stack_never_displays_the_other_layer() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Unrelated upstream work widens the gap between the trunk the stack was
+    // built on and the trunk it is about to be retargeted at.
+    w.advance_trunk_and_pull(&[("upstream.txt", "u1")]);
+
+    w.swap_layers(0, 1);
+    w.forge.clear_diff_observations();
+    w.sync();
+
+    assert_only_ever_displayed(&w, prs[0], &["a.txt"]);
+    assert_only_ever_displayed(&w, prs[1], &["b.txt"]);
+    w.assert_invariants();
+}
+
+/// A pull request that has been pointed back at the trunk is not part of a
+/// stack any more, and a table still claiming it is blocked on the layer below
+/// is worse than no table at all.
+#[test]
+fn a_pull_request_pulled_out_of_the_stack_loses_its_table() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Independent fix", &[("c.txt", "c1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+    w.update_stack_comments();
+
+    let comment = w.comment_on(prs[1]).expect("stacked PR gets a table");
+    assert!(comment.body.contains(crate::stack_comment::BEGIN));
+    // Somebody replied in the same comment.
+    block_on(w.forge.update_comment(
+        comment.id,
+        &format!("{}\n\nPlease take a look.", comment.body),
+    ))
+    .unwrap();
+
+    w.set_trailer(1, crate::trailers::DEPENDS_ON, TRUNK);
+    w.sync();
+    w.update_stack_comments();
+
+    let comment = w
+        .comment_on(prs[1])
+        .expect("the human's text must not be thrown away with the table");
+    assert!(!comment.body.contains(crate::stack_comment::BEGIN));
+    assert!(comment.body.contains("Please take a look."));
+
+    // Layer one is on its own now too, and its table was the whole comment, so
+    // the comment goes away entirely.
+    assert!(w.comment_on(prs[0]).is_none());
+}
+
+/// `nspr.draftWhileRetargeting` is the belt to the parking braces: the pull
+/// request is invisible to `CODEOWNERS` for the whole push-and-retarget window,
+/// and comes back out in the state it went in.
+#[test]
+fn draft_while_retargeting_flips_the_pull_request_back_afterwards() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Independent fix", &[("c.txt", "c1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    w.config.draft_while_retargeting = true;
+    w.set_trailer(1, crate::trailers::DEPENDS_ON, TRUNK);
+    w.sync();
+
+    assert_eq!(
+        *w.forge.draft_toggles.borrow(),
+        vec![(prs[1], true), (prs[1], false)],
+        "only the retargeted pull request is touched, and it is put back"
+    );
+    let pr = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    assert!(!pr.draft);
+}
+
+/// Nothing happens without the setting, which is the default.
+#[test]
+fn retargeting_does_not_touch_the_draft_flag_by_default() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Independent fix", &[("c.txt", "c1")]);
+    w.sync();
+
+    w.set_trailer(1, crate::trailers::DEPENDS_ON, TRUNK);
+    w.sync();
+
+    assert!(w.forge.draft_toggles.borrow().is_empty());
+}
