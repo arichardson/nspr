@@ -405,6 +405,55 @@ impl Stack {
         chains
     }
 
+    /// Layers grouped into connected components of the dependency graph,
+    /// counting only layers that have a pull request.
+    ///
+    /// Two layers belong to the same component when one depends on the other,
+    /// directly or through a chain of other layers. A component of one is a
+    /// standalone pull request: it shares nothing with its neighbours in the
+    /// local commit order and must not be presented to reviewers as if it did.
+    pub fn pr_components(&self) -> Vec<Vec<usize>> {
+        let n = self.layers.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn find(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            if self.layers[i].pr.is_none() {
+                continue;
+            }
+            if let Dep::Layer(j) = layer.dep
+                && self.layers[j].pr.is_some()
+            {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                parent[a] = b;
+            }
+        }
+
+        let mut components: Vec<Vec<usize>> = Vec::new();
+        let mut root_to_component: HashMap<usize, usize> = HashMap::new();
+        for i in 0..n {
+            if self.layers[i].pr.is_none() {
+                continue;
+            }
+            let root = find(&mut parent, i);
+            match root_to_component.get(&root) {
+                Some(&slot) => components[slot].push(i),
+                None => {
+                    root_to_component.insert(root, components.len());
+                    components.push(vec![i]);
+                }
+            }
+        }
+        components
+    }
+
     /// True if layer `i` either depends on another layer in the stack or has
     /// other layers depending on it. An independent root (`Dep::Main`) with
     /// no dependents is standalone (`false`).

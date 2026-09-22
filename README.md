@@ -277,6 +277,7 @@ Configuration is optional; `nspr` auto-detects settings from your git remote. Yo
 | `nspr.trunk` | Auto-detected (`origin/HEAD` or `main`) | Trunk branch name. |
 | `nspr.branchPrefix` | `users/<github-login>/` | Prefix for remote PR branch names. |
 | `nspr.preserveCommitHistory` | `auto` | Controls whether `nspr diff` pushes incremental `[nspr]` update commits (`true`) or force-pushes a single commit per PR branch (`false`). See below. |
+| `nspr.draftWhileRetargeting` | `false` | Flip a pull request to draft while its base branch is being changed, then flip it back. See below. |
 | `nspr.stackComments` | `true` | Post/update stack navigation comments on PRs. |
 | `nspr.githubAuthToken` | — | Fallback GitHub personal access token. |
 
@@ -290,6 +291,18 @@ When `nspr` pushes incremental `[nspr]` update commits to a pull request branch,
 - **`auto` (default)**: Uses incremental `[nspr]` commits without force-pushing when the repository is configured for squash-only merging with `PR_TITLE` + `PR_BODY`. If the repository allows merge/rebase commits or uses `COMMIT_MESSAGES`, `nspr` safely falls back to **force-pushing a single commit per PR branch** and prints a CLI warning explaining how to configure the repository or set `nspr.preserveCommitHistory` to `true` or `false`.
 - **`false`**: Always rewrites each PR branch as a single clean commit and force-pushes on updates (silencing the repository settings warning). Because every PR branch has only 1 commit, merging in the GitHub Web UI works cleanly regardless of the repository's merge settings.
 - **`true`**: Always pushes incremental `[nspr]` commits without force-pushing. If the repository is not configured for squash-only + `PR_TITLE`/`PR_BODY`, `nspr` emits a CLI warning and appends a disclaimer at the bottom of the PR description reminding reviewers to select **Squash and merge** and use the PR title and description.
+
+### Retargeting a Pull Request & `nspr.draftWhileRetargeting`
+
+Moving a pull request to a different base branch takes two separate GitHub operations: pushing the new head, and changing the base. They cannot be done atomically, and GitHub recomputes the three-dot diff after each one.
+
+The naive order — re-anchor the head onto the new base branch, then change the base — briefly shows the pull request as containing **every commit the new base has and the old one does not**. That file list is handed straight to `CODEOWNERS`, and the resulting review requests are never withdrawn when the diff shrinks again a second later. On a repository like `llvm/llvm-project` that can mean subscribing a dozen unrelated people to your pull request.
+
+`nspr` avoids this by **parking** the branch: when the old and new base branches disagree, the head is re-anchored onto their merge base, which is an ancestor of both, so the displayed diff is the layer's own patch before the base change and after it. The branch is left slightly behind its new base, which is the ordinary state of any stack whose trunk has moved on, and is repaired by the next push that has a reason to happen (or immediately, if the repository requires branches to be up to date before merging).
+
+`nspr.draftWhileRetargeting` (`false` by default) adds a second line of defence: the pull request is flipped to draft before the push and back to ready once the base is correct, and draft pull requests are exempt from `CODEOWNERS` auto-assignment entirely. It is off by default because parking already keeps the diff correct, marking a pull request ready again re-runs the assignment anyway, and a draft left behind by an interrupted run is its own kind of mess. Turn it on if your repository's `CODEOWNERS` file is big enough that a mistake is expensive.
+
+A pull request that is retargeted at the trunk also stops being part of a stack, so `nspr` takes its stack navigation comment down rather than leaving a table claiming it is blocked on work it no longer depends on. Anything a human wrote in the same comment is kept.
 
 ---
 

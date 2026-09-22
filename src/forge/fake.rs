@@ -58,6 +58,10 @@ pub struct FakeForge {
     pub review_decisions: RefCell<HashMap<u64, ReviewDecision>>,
     pub stacks: RefCell<Vec<Vec<u64>>>,
     pub merge_settings: RefCell<RepoMergeSettings>,
+    /// `(pr number, displayed file list)` after every remote mutation.
+    pub diff_observations: RefCell<Vec<(u64, Vec<String>)>>,
+    /// `(pr number, draft)` in call order.
+    pub draft_toggles: RefCell<Vec<(u64, bool)>>,
 }
 
 impl FakeForge {
@@ -79,6 +83,8 @@ impl FakeForge {
             review_decisions: RefCell::new(HashMap::new()),
             stacks: RefCell::new(Vec::new()),
             merge_settings: RefCell::new(RepoMergeSettings::default()),
+            diff_observations: RefCell::new(Vec::new()),
+            draft_toggles: RefCell::new(Vec::new()),
         }
     }
 
@@ -236,6 +242,49 @@ impl FakeForge {
         }
         Ok(out.trim_end().to_string())
     }
+
+    /// Record what every open pull request displays *right now*.
+    ///
+    /// Called after each individual remote mutation, not just at the end of a
+    /// run. A stacked pull request whose diff is briefly wrong is not a
+    /// cosmetic problem: GitHub assigns `CODEOWNERS` from whatever the diff
+    /// happens to contain at that instant, and those assignments are not undone
+    /// when the diff is corrected a second later.
+    fn observe_displayed_diffs(&self) {
+        for pr in self.prs.borrow().iter() {
+            if pr.state != PrState::Open {
+                continue;
+            }
+            let (Some(base), Some(head)) =
+                (self.branch(&pr.base), self.branch(&pr.head))
+            else {
+                continue;
+            };
+            let Ok(paths) =
+                crate::review_diff::displayed_paths(&self.repo, base, head)
+            else {
+                continue;
+            };
+            self.diff_observations.borrow_mut().push((pr.number, paths));
+        }
+    }
+
+    /// Forget everything observed so far, so a test can scope its assertions to
+    /// a single command.
+    pub fn clear_diff_observations(&self) {
+        self.diff_observations.borrow_mut().clear();
+    }
+
+    /// Every distinct file list `number` was ever seen displaying, in order.
+    pub fn observed_diffs(&self, number: u64) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for (pr, paths) in self.diff_observations.borrow().iter() {
+            if *pr == number && out.last() != Some(paths) {
+                out.push(paths.clone());
+            }
+        }
+        out
+    }
 }
 
 #[async_trait(?Send)]
@@ -267,6 +316,7 @@ impl Forge for FakeForge {
 
         Ok(PullRequest {
             number: pr.number,
+            node_id: format!("PR_{}", pr.number),
             state: pr.state,
             title: pr.title,
             body: pr.body,
@@ -303,22 +353,27 @@ impl Forge for FakeForge {
         number: u64,
         update: PullRequestUpdate,
     ) -> Result<()> {
-        let mut prs = self.prs.borrow_mut();
-        let pr = prs
-            .iter_mut()
-            .find(|p| p.number == number)
-            .ok_or_else(|| color_eyre::eyre::eyre!("no such PR #{number}"))?;
-        if let Some(t) = update.title {
-            pr.title = t;
+        let base_changed = update.base.is_some();
+        {
+            let mut prs = self.prs.borrow_mut();
+            let pr = prs.iter_mut().find(|p| p.number == number).ok_or_else(
+                || color_eyre::eyre::eyre!("no such PR #{number}"),
+            )?;
+            if let Some(t) = update.title {
+                pr.title = t;
+            }
+            if let Some(b) = update.body {
+                pr.body = b;
+            }
+            if let Some(b) = update.base {
+                pr.base = b;
+            }
+            if let Some(s) = update.state {
+                pr.state = s;
+            }
         }
-        if let Some(b) = update.body {
-            pr.body = b;
-        }
-        if let Some(b) = update.base {
-            pr.base = b;
-        }
-        if let Some(s) = update.state {
-            pr.state = s;
+        if base_changed {
+            self.observe_displayed_diffs();
         }
         Ok(())
     }
@@ -372,6 +427,7 @@ impl Forge for FakeForge {
                 }
             }
         }
+        self.observe_displayed_diffs();
         Ok(())
     }
 
@@ -430,6 +486,33 @@ impl Forge for FakeForge {
         };
         comment.body = body.to_string();
         *self.comment_updates.borrow_mut() += 1;
+        Ok(())
+    }
+
+    async fn delete_comment(&self, id: u64) -> Result<()> {
+        let mut comments = self.comments.borrow_mut();
+        let before = comments.len();
+        comments.retain(|(_, c)| c.id != id);
+        if comments.len() == before {
+            bail!("no such comment: {id}");
+        }
+        Ok(())
+    }
+
+    async fn set_draft(&self, node_id: &str, draft: bool) -> Result<()> {
+        let number: u64 = node_id
+            .strip_prefix("PR_")
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("bad fake node id: {node_id}")
+            })?;
+        let mut prs = self.prs.borrow_mut();
+        let Some(pr) = prs.iter_mut().find(|p| p.number == number) else {
+            bail!("no such PR #{number}");
+        };
+        pr.draft = draft;
+        drop(prs);
+        self.draft_toggles.borrow_mut().push((number, draft));
         Ok(())
     }
 
