@@ -150,17 +150,20 @@ pub async fn sync_stack(
     )
     .await?;
 
-    // A staged layer is deliberately left behind its new base so the retarget
-    // cannot widen the displayed diff. That is harmless unless the repository
-    // insists branches be up to date before merging, in which case the layer
-    // has to catch up. It is safe to do so now: every pull request already
-    // points at the branch it should, so moving a head forward can only shrink
-    // the diff it displays.
-    if staged && opts.refresh_when_behind {
+    // A staged layer is parked at `merge_base(old_base, new_base)` during the
+    // first pass so the retarget never widens the displayed diff. Once every
+    // pull request points at its new base branch, immediately move parked
+    // branches forward onto their new base tips in the same `nspr diff` run so
+    // the user never has to run `nspr diff` twice.
+    if staged {
+        let mut catchup_opts = opts.clone();
+        catchup_opts.refresh_when_behind = true;
+        // Never re-prompt on the catch-up pass; the patch is already up to date.
+        catchup_opts.message = Some(AUTO_UPDATE_MESSAGE.to_string());
         let trees = stack.all_trees(git)?;
         let prs = gather(forge, stack).await?;
         reject_unusable(&prs)?;
-        let decision = decide(git, stack, &prs, &trees, &opts)?;
+        let decision = decide(git, stack, &prs, &trees, &catchup_opts)?;
         let mut staged_again = false;
         let second = execute(
             git,
@@ -170,14 +173,36 @@ pub async fn sync_stack(
             &prs,
             &trees,
             &decision,
-            &opts,
+            &catchup_opts,
             prompter,
             &mut staged_again,
         )
         .await?;
-        if !second.is_empty() {
-            return Ok(second);
+        let mut merged = outcomes;
+        for next in second {
+            if let Some(prev) =
+                merged.iter_mut().find(|o| o.index == next.index)
+            {
+                let action = match (prev.action, next.action) {
+                    (LayerAction::Created, _) => LayerAction::Created,
+                    (LayerAction::Updated, _) | (_, LayerAction::Updated) => {
+                        LayerAction::Updated
+                    }
+                    (LayerAction::Refreshed, _)
+                    | (_, LayerAction::Refreshed) => LayerAction::Refreshed,
+                    _ => next.action,
+                };
+                let retargeted = prev.retargeted || next.retargeted;
+                *prev = LayerOutcome {
+                    action,
+                    retargeted,
+                    ..next
+                };
+            } else {
+                merged.push(next);
+            }
         }
+        return Ok(merged);
     }
 
     Ok(outcomes)
@@ -199,6 +224,9 @@ pub async fn gather(
             Some(number) => {
                 let pr = forge.get_pull_request(number).await?;
                 forge.fetch_commit(pr.head_oid).await?;
+                if pr.base_oid != Oid::ZERO_SHA1 {
+                    forge.fetch_commit(pr.base_oid).await?;
+                }
                 prs.push(Some(pr));
             }
         }
@@ -326,12 +354,19 @@ pub fn decide(
             }
         };
 
+        let behind_base = opts.refresh_when_behind
+            && remote_base_tip.is_some_and(|base_tip| {
+                current_anchor[i] != Some(base_tip)
+                    || !git.is_ancestor(base_tip, pr.head_oid).unwrap_or(false)
+            });
+
         push[i] = patch_changed[i]
             || message_changed[i]
             || rewrite_history[i]
             || needs_conflict_refresh
             || opts.sync_all
-            || pr.needs_refresh(opts.refresh_when_behind);
+            || pr.needs_refresh(opts.refresh_when_behind)
+            || behind_base;
     }
 
     // Pass C: a push is only safe once its dependency's remote tip already
@@ -531,6 +566,8 @@ async fn execute(
     let mut branches: Vec<String> = Vec::with_capacity(n);
     let mut base_branches: Vec<String> = Vec::with_capacity(n);
     let mut new_roots: Vec<Option<Oid>> = vec![None; n];
+    let mut retargeted_early: Vec<bool> = vec![false; n];
+    let mut undraft: Vec<String> = Vec::new();
 
     let mut messages: Vec<CommitMessage> =
         stack.layers.iter().map(|l| l.message.clone()).collect();
@@ -601,8 +638,7 @@ async fn execute(
                     continue;
                 }
 
-                // Where the branch sits today. Also the left-hand side of the
-                // diff the pull request is displaying right now.
+                // Where the branch's own revision chain starts (for replay).
                 let fallback_base_tip = match stack.layers[i].dep {
                     Dep::Main | Dep::ExternalPr(_) => stack.base,
                     Dep::Layer(j) => prs[j]
@@ -610,24 +646,80 @@ async fn execute(
                         .map(|p| p.head_oid)
                         .unwrap_or(stack.base),
                 };
-                let old_base_tip =
+                let old_root_parent =
                     match find_root_commit(git, pr, fallback_base_tip) {
                         Some(root_oid) => git.parent_of(root_oid)?,
                         None => fallback_base_tip,
                     };
 
+                // What GitHub's three-dot diff is comparing against right now:
+                // if we already retargeted the PR before the push, its base is
+                // `base_branches[i]`; otherwise its base is still `pr.base` at
+                // `pr.base_oid`.
+                let current_pr_base_tip = if pr.base_oid != Oid::ZERO_SHA1 {
+                    pr.base_oid
+                } else {
+                    old_root_parent
+                };
+
+                // If the pull request is being retargeted to a base branch
+                // whose *current* remote tip sits between the PR's current
+                // base tip and the PR's current head (`current_pr_base_tip <=
+                // target_remote_tip <= pr.head_oid` — for example, re-attaching
+                // a PR from `main` onto a parent PR branch that it was
+                // originally stacked on), we can retarget the base *before*
+                // `git push`. That only advances `merge_base(base, head)` from
+                // `current_pr_base_tip` up to `target_remote_tip`, which
+                // shrinks (or preserves) the displayed diff immediately and
+                // makes `pr.base` already match `base_branches[i]` when
+                // `git push` runs, so no parking or second push is needed.
+                let new_base_current_remote_tip = match stack.layers[i].dep {
+                    Dep::Main | Dep::ExternalPr(_) => Some(stack.base),
+                    Dep::Layer(j) => prs[j].as_ref().map(|p| p.head_oid),
+                };
+                let retargeted_before_push = if pr.base != base_branches[i]
+                    && let Some(target_remote_tip) = new_base_current_remote_tip
+                    && git.is_ancestor(target_remote_tip, pr.head_oid)?
+                    && (git
+                        .is_ancestor(current_pr_base_tip, target_remote_tip)?
+                        || git
+                            .is_ancestor(old_root_parent, target_remote_tip)?)
+                {
+                    if config.draft_while_retargeting && !pr.draft {
+                        forge.set_draft(&pr.node_id, true).await?;
+                        undraft.push(pr.node_id.clone());
+                    }
+                    forge
+                        .update_pull_request(
+                            pr.number,
+                            PullRequestUpdate {
+                                base: Some(base_branches[i].clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    true
+                } else {
+                    false
+                };
+                retargeted_early[i] = retargeted_before_push;
+
                 // Re-anchoring and retargeting cannot be done atomically, so
                 // when they disagree the branch is parked at their merge base
                 // until the pull request points somewhere that makes the
                 // forward move safe.
-                let anchor = safe_retarget_anchor(
-                    git,
-                    pr,
-                    &base_branches[i],
-                    old_base_tip,
-                    parent_tip,
-                )?
-                .unwrap_or(parent_tip);
+                let anchor = if retargeted_before_push {
+                    parent_tip
+                } else {
+                    safe_retarget_anchor(
+                        git,
+                        pr,
+                        &base_branches[i],
+                        current_pr_base_tip,
+                        parent_tip,
+                    )?
+                    .unwrap_or(parent_tip)
+                };
 
                 // The layer's content is computed against the base it is about
                 // to have, so it has to be replayed whenever the anchor is
@@ -676,7 +768,7 @@ async fn execute(
                     let revisions = crate::land::branch_revisions(
                         git,
                         pr.head_oid,
-                        old_base_tip,
+                        old_root_parent,
                     )?;
                     let clean_msg = stack.layers[i].message.clean_for_branch();
                     match crate::land::replay(
@@ -735,11 +827,10 @@ async fn execute(
     // keeps the displayed diff correct, marking a pull request ready again
     // re-runs the assignment anyway, and a draft left behind by an interrupted
     // run is its own kind of mess.
-    let mut undraft: Vec<String> = Vec::new();
     if config.draft_while_retargeting {
         for i in 0..n {
             let Some(pr) = &prs[i] else { continue };
-            if pr.draft || pr.base == base_branches[i] {
+            if pr.draft || pr.base == base_branches[i] || retargeted_early[i] {
                 continue;
             }
             forge.set_draft(&pr.node_id, true).await?;
@@ -810,7 +901,7 @@ async fn execute(
 
                 let retargeted = pr.base != base_branch;
                 let mut update = PullRequestUpdate::default();
-                if retargeted {
+                if retargeted && !retargeted_early[i] {
                     update.base = Some(base_branch.clone());
                 }
                 if opts.update_message || decision.message_changed[i] {
