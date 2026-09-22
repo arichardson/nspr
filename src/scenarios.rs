@@ -2731,6 +2731,11 @@ fn retargeting_onto_a_moved_trunk_never_displays_the_upstream_commits() {
     });
 
     assert_only_ever_displayed(&w, prs[1], &["c.txt"]);
+    let pr = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    assert!(
+        w.git.is_ancestor(w.base_oid, pr.head_oid).unwrap(),
+        "single nspr diff run must finish with the retargeted branch on top of the new trunk"
+    );
     w.assert_invariants();
 }
 
@@ -2829,4 +2834,46 @@ fn retargeting_does_not_touch_the_draft_flag_by_default() {
     w.sync();
 
     assert!(w.forge.draft_toggles.borrow().is_empty());
+}
+
+/// Re-attaching a PR whose base was accidentally changed to `main` back onto
+/// its parent PR branch (`#225129` on `llvm/llvm-project`) retargets `base`
+/// before `git push` because `target_remote_tip` is already an ancestor of
+/// `pr.head_oid`. That shrinks the displayed diff immediately and finishes in
+/// a single `git push` (no parking or second pass).
+#[test]
+fn reattaching_pr_from_main_onto_parent_layer_uses_single_push() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Simulate the PR's base on GitHub having been flipped to `main` (while its
+    // head commit still sits on top of Layer one's branch).
+    block_on(w.forge.update_pull_request(
+        prs[1],
+        crate::forge::PullRequestUpdate {
+            base: Some(TRUNK.to_string()),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+
+    // Now trunk advances, the stack is rebased locally, and layer two is
+    // amended (matching `#225129` on `llvm/llvm-project`: `modified,retarget`).
+    w.advance_trunk_and_pull(&[("upstream.txt", "u1")]);
+    w.amend_layer(1, &[("b.txt", "b2")]);
+
+    let pushes_before = w.push_count();
+    w.forge.clear_diff_observations();
+    w.sync();
+
+    assert_eq!(
+        w.push_count() - pushes_before,
+        2,
+        "re-attaching onto a parent layer should update both layers in a single pass (2 branch refspecs, no second pass)"
+    );
+    assert_only_ever_displayed(&w, prs[1], &["b.txt"]);
+    w.assert_invariants();
 }

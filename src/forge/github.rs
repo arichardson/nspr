@@ -576,24 +576,32 @@ impl Forge for GitHubForge {
                         self.owner, self.repo, matched.number
                     );
                     let body = serde_json::json!({ "pull_requests": delta });
-                    if let Ok(updated) = self
+                    match self
                         .api
                         .post::<_, RemoteStack>(route, Some(&body))
                         .await
                     {
-                        eprintln!(
-                            "github stack: updated stack #{} ({} PRs)",
-                            updated.number,
-                            desired.len()
-                        );
-                        if let Some(slot) = remote_stacks
-                            .iter_mut()
-                            .find(|s| s.number == updated.number)
-                        {
-                            *slot = updated;
+                        Ok(updated) => {
+                            eprintln!(
+                                "github stack: updated stack #{} ({} PRs)",
+                                updated.number,
+                                desired.len()
+                            );
+                            if let Some(slot) = remote_stacks
+                                .iter_mut()
+                                .find(|s| s.number == updated.number)
+                            {
+                                *slot = updated;
+                            }
                         }
-                        continue;
+                        Err(e) => {
+                            debug!(
+                                "could not extend github stack #{} with {delta:?}: {e}",
+                                matched.number
+                            );
+                        }
                     }
+                    continue;
                 }
             }
 
