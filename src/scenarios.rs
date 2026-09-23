@@ -2746,6 +2746,7 @@ fn reordering_a_stack_never_displays_the_other_layer() {
     let mut w = World::new(&[("root.txt", "root")]);
     w.add_layer("Layer one", &[("a.txt", "a1")]);
     w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
     w.sync();
     let prs = w.pr_numbers();
 
@@ -2759,6 +2760,7 @@ fn reordering_a_stack_never_displays_the_other_layer() {
 
     assert_only_ever_displayed(&w, prs[0], &["a.txt"]);
     assert_only_ever_displayed(&w, prs[1], &["b.txt"]);
+    assert_only_ever_displayed(&w, prs[2], &["c.txt"]);
     w.assert_invariants();
 }
 

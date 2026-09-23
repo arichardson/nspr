@@ -707,7 +707,18 @@ async fn execute(
                 // Re-anchoring and retargeting cannot be done atomically, so
                 // when they disagree the branch is parked at their merge base
                 // until the pull request points somewhere that makes the
-                // forward move safe.
+                // forward move safe. If `pr.base` is another branch in this
+                // stack that is also being rewritten in the same `git push`
+                // batch, the anchor must be an ancestor of both `pr.base`'s old
+                // tip and its newly pushed tip so the push does not widen this
+                // PR's diff before `update_pull_request` changes `pr.base`.
+                let effective_old_base_tip = if let Some((_, pushed_tip)) =
+                    branches.iter().zip(&tips).find(|(b, _)| *b == &pr.base)
+                {
+                    git.merge_base(current_pr_base_tip, *pushed_tip)?
+                } else {
+                    current_pr_base_tip
+                };
                 let anchor = if retargeted_before_push {
                     parent_tip
                 } else {
@@ -715,7 +726,7 @@ async fn execute(
                         git,
                         pr,
                         &base_branches[i],
-                        current_pr_base_tip,
+                        effective_old_base_tip,
                         parent_tip,
                     )?
                     .unwrap_or(parent_tip)
