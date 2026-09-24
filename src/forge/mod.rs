@@ -129,6 +129,10 @@ pub struct PushSpec {
     pub oid: Option<Oid>,
     /// Only ever true for land-time cleanup, which is diff-neutral.
     pub force: bool,
+    /// Optional short human-readable label for the branch (e.g. `#225127`).
+    pub label: Option<String>,
+    /// Optional context for the push batch (e.g. `1/2, before retargeting #225127 → #225126`).
+    pub context: Option<String>,
 }
 
 impl PushSpec {
@@ -137,6 +141,8 @@ impl PushSpec {
             branch: branch.into(),
             oid: Some(oid),
             force: false,
+            label: None,
+            context: None,
         }
     }
 
@@ -145,6 +151,8 @@ impl PushSpec {
             branch: branch.into(),
             oid: Some(oid),
             force: true,
+            label: None,
+            context: None,
         }
     }
 
@@ -153,7 +161,19 @@ impl PushSpec {
             branch: branch.into(),
             oid: None,
             force: false,
+            label: None,
+            context: None,
         }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        self.context = Some(context.into());
+        self
     }
 }
 

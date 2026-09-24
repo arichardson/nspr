@@ -303,21 +303,19 @@ impl Session {
             None
         };
 
-        // A preflight round of queries, before anything is mutated. It costs a
-        // second pass over the pull requests, but a warning that arrives after
-        // the push that dismissed six approvals is worthless.
-        let refresh_when_behind =
-            self.preflight(&stack, args.update_message).await?;
-
-        let opts = SyncOptions {
+        let mut opts = SyncOptions {
             sync_all: args.all,
             message: args.message.clone(),
             update_message: args.update_message,
             draft: args.draft,
-            refresh_when_behind,
             only_layer,
             ..Default::default()
         };
+
+        // A preflight round of queries, before anything is mutated: renders the
+        // stack plan up-front and emits guardrail warnings before any prompt or
+        // network push runs.
+        self.preflight(&stack, &mut opts).await?;
 
         let fixed = FixedPrompter(AUTO_UPDATE_MESSAGE.to_string());
         let interactive = InteractivePrompter;
@@ -351,42 +349,50 @@ impl Session {
         Ok(())
     }
 
-    /// Emit guardrail warnings and report whether "behind" layers are worth
-    /// refreshing. Read-only.
+    /// Render the pre-push stack plan, emit guardrail warnings, and resolve
+    /// `opts.preserve_commit_history` and `opts.refresh_when_behind`. Read-only.
     async fn preflight(
         &self,
         stack: &Stack,
-        update_message: bool,
-    ) -> Result<bool> {
+        opts: &mut SyncOptions,
+    ) -> Result<()> {
         let trees = stack.all_trees(&self.git)?;
         let prs = engine::gather(&self.forge, stack).await?;
         let merge_settings = self.forge.repo_merge_settings().await?;
-        let preserve_commit_history =
+        opts.preserve_commit_history =
             self.config.preserve_commit_history.resolve(merge_settings);
-        let decision = engine::decide(
-            &self.git,
-            stack,
-            &prs,
-            &trees,
-            &SyncOptions {
-                preserve_commit_history,
-                update_message,
-                ..Default::default()
-            },
-        )?;
+        let initial_decision =
+            engine::decide(&self.git, stack, &prs, &trees, opts)?;
         let rails = guardrails::probe(
             &self.forge,
             &self.config,
             stack,
             &prs,
-            &decision.push,
-            update_message,
+            &initial_decision.push,
+            opts.update_message,
         )
         .await?;
+        opts.refresh_when_behind = rails.refresh_when_behind;
+        let decision = engine::decide(&self.git, stack, &prs, &trees, opts)?;
+        let plan = status::from_parts(
+            &self.git,
+            &self.config,
+            stack,
+            &prs,
+            &decision,
+            opts.update_message,
+        )?;
+        print!("{}", plan.render_plan(opts.update_message));
         for warning in &rails.warnings {
             eprintln!("{} {warning}", style("warning:").yellow().bold());
         }
-        Ok(rails.refresh_when_behind)
+        let any_will_push = decision.push.iter().any(|&p| p)
+            || (opts.update_message
+                && plan.layers.iter().any(|l| l.message_differs));
+        if any_will_push {
+            println!();
+        }
+        Ok(())
     }
 
     async fn report(
@@ -395,17 +401,70 @@ impl Session {
         outcomes: &[LayerOutcome],
         verbose: bool,
     ) -> Result<()> {
-        let any_changed = outcomes
+        let created = outcomes
             .iter()
-            .any(|o| o.action != LayerAction::Skipped || o.retargeted);
-        if !any_changed && !verbose {
-            println!("Everything is already up to date.");
-            return Ok(());
+            .filter(|o| o.action == LayerAction::Created)
+            .count();
+        let updated = outcomes
+            .iter()
+            .filter(|o| o.action == LayerAction::Updated)
+            .count();
+        let refreshed = outcomes
+            .iter()
+            .filter(|o| o.action == LayerAction::Refreshed)
+            .count();
+        let retargeted = outcomes.iter().filter(|o| o.retargeted).count();
+
+        if verbose {
+            let report =
+                status::status(&self.git, &self.forge, &self.config, stack)
+                    .await?;
+            print!("{}", report.render_diff(outcomes));
+        } else {
+            for o in outcomes
+                .iter()
+                .filter(|o| o.action == LayerAction::Created)
+            {
+                let subject = stack
+                    .layers
+                    .get(o.index)
+                    .map(|l| l.subject())
+                    .unwrap_or("");
+                let url = self.config.pull_request_url(o.number);
+                println!(
+                    "  {} {}  {}  {}",
+                    style("○").green().bold(),
+                    style(format!("#{}", o.number)).bold(),
+                    subject,
+                    style(url).dim(),
+                );
+            }
         }
-        let report =
-            status::status(&self.git, &self.forge, &self.config, stack)
-                .await?;
-        print!("{}", report.render_diff(outcomes));
+
+        let mut parts = Vec::new();
+        if created > 0 {
+            parts.push(format!("{created} created"));
+        }
+        if updated > 0 {
+            parts.push(format!("{updated} updated"));
+        }
+        if refreshed > 0 {
+            parts.push(format!("{refreshed} refreshed"));
+        }
+        if retargeted > 0 {
+            parts.push(format!("{retargeted} retargeted"));
+        }
+
+        if parts.is_empty() {
+            let total = stack.layers.len();
+            let noun = if total == 1 { "PR" } else { "PRs" };
+            println!(
+                "{} Done (all {total} {noun} up to date)",
+                style("✓").green().bold()
+            );
+        } else {
+            println!("{} Done ({})", style("✓").green().bold(), parts.join(", "));
+        }
         Ok(())
     }
 
@@ -779,12 +838,17 @@ impl Prompter for FixedPrompter {
 struct InteractivePrompter;
 
 impl Prompter for InteractivePrompter {
-    fn update_message(&self, subject: &str) -> Result<String> {
+    fn update_message(&self, label: &str) -> Result<String> {
         if !console::user_attended() {
             return Ok(AUTO_UPDATE_MESSAGE.to_string());
         }
+        let prompt = if label.starts_with('#') {
+            format!("What changed in {label}?")
+        } else {
+            format!("What changed in \"{label}\"?")
+        };
         let answer: String = dialoguer::Input::new()
-            .with_prompt(format!("What changed in \"{subject}\"?"))
+            .with_prompt(prompt)
             .allow_empty(true)
             .interact_text()?;
         Ok(if answer.trim().is_empty() {

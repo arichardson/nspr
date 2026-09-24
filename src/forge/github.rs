@@ -347,10 +347,27 @@ impl Forge for GitHubForge {
 
     async fn push(&self, specs: &[PushSpec]) -> Result<()> {
         let refspecs: Vec<String> = specs.iter().map(refspec).collect();
-        self.remote.push(&refspecs).wrap_err(
-            "the push was rejected. If this was a fast-forward push, somebody \
-             else has pushed to the branch: run `nspr sync` and try again.",
-        )
+        let has_metadata =
+            specs.iter().any(|s| s.label.is_some() || s.context.is_some());
+        let custom_desc = if has_metadata {
+            let targets = specs
+                .iter()
+                .map(|s| s.label.as_deref().unwrap_or(&s.branch))
+                .collect::<Vec<_>>()
+                .join(", ");
+            match specs.iter().find_map(|s| s.context.as_deref()) {
+                Some(ctx) => Some(format!("push ({ctx}): {targets}")),
+                None => Some(format!("push: {targets}")),
+            }
+        } else {
+            None
+        };
+        self.remote
+            .push_with_desc(&refspecs, custom_desc.as_deref())
+            .wrap_err(
+                "the push was rejected. If this was a fast-forward push, somebody \
+                 else has pushed to the branch: run `nspr sync` and try again.",
+            )
     }
 
     async fn unused_branch_name(&self, preferred: &str) -> Result<String> {
@@ -583,9 +600,13 @@ impl Forge for GitHubForge {
                     {
                         Ok(updated) => {
                             eprintln!(
-                                "github stack: updated stack #{} ({} PRs)",
-                                updated.number,
-                                desired.len()
+                                "{}",
+                                console::style(format!(
+                                    "github stack: updated stack #{} ({} PRs)",
+                                    updated.number,
+                                    desired.len()
+                                ))
+                                .dim()
                             );
                             if let Some(slot) = remote_stacks
                                 .iter_mut()
@@ -615,9 +636,13 @@ impl Forge for GitHubForge {
             match self.api.post::<_, RemoteStack>(route, Some(&body)).await {
                 Ok(created) => {
                     eprintln!(
-                        "github stack: created stack #{} ({} PRs)",
-                        created.number,
-                        desired.len()
+                        "{}",
+                        console::style(format!(
+                            "github stack: created stack #{} ({} PRs)",
+                            created.number,
+                            desired.len()
+                        ))
+                        .dim()
                     );
                     remote_stacks.push(created);
                 }

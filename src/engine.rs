@@ -137,6 +137,22 @@ pub async fn sync_stack(
 
     let mut staged = false;
     let mut prompted_messages = std::collections::HashMap::new();
+    if opts.preserve_commit_history && opts.message.is_none() {
+        for i in 0..stack.layers.len() {
+            if decision.push[i]
+                && decision.patch_changed[i]
+                && let Some(pr) = &prs[i]
+            {
+                let label = format!(
+                    "#{} \"{}\"",
+                    pr.number,
+                    stack.layers[i].subject()
+                );
+                let m = prompter.update_message(&label)?;
+                prompted_messages.insert(i, m);
+            }
+        }
+    }
     let outcomes = execute(
         git,
         forge,
@@ -149,6 +165,7 @@ pub async fn sync_stack(
         prompter,
         &mut prompted_messages,
         &mut staged,
+        false,
     )
     .await?;
 
@@ -177,6 +194,7 @@ pub async fn sync_stack(
             prompter,
             &mut prompted_messages,
             &mut staged_again,
+            true,
         )
         .await?;
         let mut merged = outcomes;
@@ -585,6 +603,17 @@ fn rebase_tree_onto(
     Ok(Some(git.write_index(index)?))
 }
 
+fn wanted_base_label(stack: &Stack, config: &Config, i: usize) -> String {
+    match stack.layers[i].dep {
+        Dep::Main => config.trunk.clone(),
+        Dep::ExternalPr(n) => format!("#{n}"),
+        Dep::Layer(j) => match stack.layers[j].pr {
+            Some(n) => format!("#{n}"),
+            None => format!("layer {}", j + 1),
+        },
+    }
+}
+
 /// Pass D: push bottom-up, so every layer sees its dependency's *new* tip.
 #[allow(clippy::too_many_arguments)]
 async fn execute(
@@ -600,6 +629,7 @@ async fn execute(
     prompted_messages: &mut std::collections::HashMap<usize, String>,
     // Set when a layer was left behind its new base by `safe_retarget_anchor`.
     staged: &mut bool,
+    is_stage2: bool,
 ) -> Result<Vec<LayerOutcome>> {
     let n = stack.layers.len();
     let mut outcomes: Vec<LayerOutcome> = Vec::new();
@@ -669,7 +699,10 @@ async fn execute(
                     &initial_msg,
                 )?;
                 new_roots[i] = Some(tip);
-                push_specs.push(PushSpec::fast_forward(&candidate, tip));
+                push_specs.push(
+                    PushSpec::fast_forward(&candidate, tip)
+                        .with_label(format!("new ({candidate})")),
+                );
                 tips.push(tip);
                 branches.push(candidate);
             }
@@ -848,6 +881,7 @@ async fn execute(
                     || anchor != parent_tip
                     || desired_tree != trees.effective[i];
 
+                let pr_label = format!("#{}", pr.number);
                 if !opts.preserve_commit_history {
                     let clean_msg = stack.layers[i].message.clean_for_branch();
                     let tip = git.synthesize_initial_commit(
@@ -857,7 +891,9 @@ async fn execute(
                         &clean_msg,
                     )?;
                     new_roots[i] = Some(tip);
-                    push_specs.push(PushSpec::forced(&pr.head, tip));
+                    push_specs.push(
+                        PushSpec::forced(&pr.head, tip).with_label(&pr_label),
+                    );
                     tips.push(tip);
                     branches.push(pr.head.clone());
                     continue;
@@ -897,7 +933,9 @@ async fn execute(
                                 {
                                     existing.clone()
                                 } else {
-                                    let m = prompter.update_message(&subject)?;
+                                    let label =
+                                        format!("#{} \"{subject}\"", pr.number);
+                                    let m = prompter.update_message(&label)?;
                                     prompted_messages.insert(i, m.clone());
                                     m
                                 }
@@ -917,9 +955,14 @@ async fn execute(
                         crate::land::branch_revisions(git, tip, anchor)?
                             .first()
                             .copied();
-                    push_specs.push(PushSpec::forced(&pr.head, tip));
+                    push_specs.push(
+                        PushSpec::forced(&pr.head, tip).with_label(&pr_label),
+                    );
                 } else {
-                    push_specs.push(PushSpec::fast_forward(&pr.head, tip));
+                    push_specs.push(
+                        PushSpec::fast_forward(&pr.head, tip)
+                            .with_label(&pr_label),
+                    );
                 }
 
                 tips.push(tip);
@@ -947,12 +990,69 @@ async fn execute(
 
     // Phase 2: push all new and updated branches in a single git push.
     if !push_specs.is_empty() {
+        if *staged && !is_stage2 {
+            let pushed_retargets: Vec<String> = (0..n)
+                .filter_map(|i| {
+                    let pr = prs[i].as_ref()?;
+                    if pr.base != base_branches[i]
+                        && !retargeted_early[i]
+                        && push_specs.iter().any(|s| s.branch == pr.head)
+                    {
+                        Some(format!(
+                            "#{} → {}",
+                            pr.number,
+                            wanted_base_label(stack, config, i)
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let all_retargets: Vec<String> = if !pushed_retargets.is_empty() {
+                pushed_retargets
+            } else {
+                (0..n)
+                    .filter_map(|i| {
+                        let pr = prs[i].as_ref()?;
+                        if pr.base != base_branches[i] && !retargeted_early[i] {
+                            Some(format!(
+                                "#{} → {}",
+                                pr.number,
+                                wanted_base_label(stack, config, i)
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+            let ctx = if all_retargets.is_empty() {
+                "1/2, staging before retarget".to_string()
+            } else {
+                format!("1/2, before retargeting {}", all_retargets.join(", "))
+            };
+            push_specs[0].context = Some(ctx);
+        } else if is_stage2 {
+            let base_label = (0..n)
+                .find(|&i| {
+                    prs[i]
+                        .as_ref()
+                        .is_some_and(|pr| push_specs[0].branch == pr.head)
+                })
+                .map(|i| wanted_base_label(stack, config, i));
+            let ctx = match base_label {
+                Some(b) => format!("2/2, restacking onto {b}"),
+                None => "2/2, restacking after retarget".to_string(),
+            };
+            push_specs[0].context = Some(ctx);
+        }
         forge.push(&push_specs).await?;
     }
 
     // Phase 3: create/update pull requests on the forge and record local refs.
     let warn_merge_strategy = opts.preserve_commit_history
         && !forge.repo_merge_settings().await?.is_squash_only();
+    let mut retargeted_descriptions: Vec<String> = Vec::new();
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         let base_branch = base_branches[i].clone();
@@ -1011,6 +1111,13 @@ async fn execute(
                 if retargeted && !retargeted_early[i] {
                     update.base = Some(base_branch.clone());
                 }
+                if retargeted {
+                    retargeted_descriptions.push(format!(
+                        "#{} → {}",
+                        pr.number,
+                        wanted_base_label(stack, config, i)
+                    ));
+                }
                 if opts.update_message
                     || (decision.message_changed[i]
                         && !decision.github_message_edited[i])
@@ -1061,6 +1168,18 @@ async fn execute(
 
         crate::refs::update(git, outcome.number, outcome.tip)?;
         outcomes.push(outcome);
+    }
+
+    if !retargeted_descriptions.is_empty() && console::Term::stderr().is_term()
+    {
+        eprintln!(
+            "{}",
+            console::style(format!(
+                "retargeted {}",
+                retargeted_descriptions.join(", ")
+            ))
+            .dim()
+        );
     }
 
     // Every base now points where it should, so it is safe to be looked at

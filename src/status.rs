@@ -92,7 +92,17 @@ pub async fn status(
         ..Default::default()
     };
     let decision = engine::decide(git, stack, &prs, &trees, &opts)?;
+    from_parts(git, config, stack, &prs, &decision, false)
+}
 
+pub fn from_parts(
+    git: &Git,
+    config: &Config,
+    stack: &Stack,
+    prs: &[Option<crate::forge::PullRequest>],
+    decision: &engine::Decision,
+    update_message: bool,
+) -> Result<StackStatus> {
     let mut layers = Vec::with_capacity(stack.layers.len());
     for (i, layer) in stack.layers.iter().enumerate() {
         let (wanted_base, wanted_base_label) = match layer.dep {
@@ -116,6 +126,10 @@ pub async fn status(
             }
         };
 
+        let message_differs = prs[i]
+            .as_ref()
+            .is_some_and(|p| engine::pr_message_differs_from(p, &layer.message));
+
         let state = match &prs[i] {
             None => LayerState::New,
             Some(pr) => match pr.state {
@@ -123,7 +137,7 @@ pub async fn status(
                 PrState::Closed => LayerState::Closed,
                 PrState::Open
                     if crate::upgrade::is_spr_layer(
-                        git, stack, i, pr, &prs, config,
+                        git, stack, i, pr, prs, config,
                     )? =>
                 {
                     LayerState::LegacySpr
@@ -131,7 +145,9 @@ pub async fn status(
                 PrState::Open
                     if decision.patch_changed[i]
                         || (decision.message_changed[i]
-                            && !decision.github_message_edited[i]) =>
+                            && (!decision.github_message_edited[i]
+                                || update_message))
+                        || (update_message && message_differs) =>
                 {
                     LayerState::Modified
                 }
@@ -139,10 +155,6 @@ pub async fn status(
                 PrState::Open => LayerState::Current,
             },
         };
-
-        let message_differs = prs[i]
-            .as_ref()
-            .is_some_and(|p| engine::pr_message_differs_from(p, &layer.message));
 
         layers.push(LayerStatus {
             index: i,
@@ -194,6 +206,13 @@ impl StackStatus {
     /// the bottom. Automatically uses Unicode glyphs, colors, and terminal
     /// width truncation when stdout is a smart terminal.
     pub fn render(&self) -> String {
+        self.render_plan(false)
+    }
+
+    /// Render the pre-push stack plan before `nspr diff` runs. When
+    /// `update_message` is true, layers whose PR title/body differ from the
+    /// local commit show `update message` rather than `message differs`.
+    pub fn render_plan(&self, update_message: bool) -> String {
         let term = console::Term::stdout();
         let is_tty = term.is_term();
         let use_color = is_tty && console::colors_enabled();
@@ -203,7 +222,13 @@ impl StackStatus {
         } else {
             None
         };
-        self.render_with_options(use_unicode, use_color, term_width)
+        self.render_table_inner(
+            None,
+            update_message,
+            use_unicode,
+            use_color,
+            term_width,
+        )
     }
 
     /// Render the stack table after `nspr diff`, showing the action taken on
@@ -234,6 +259,23 @@ impl StackStatus {
     pub fn render_table(
         &self,
         outcomes: Option<&[engine::LayerOutcome]>,
+        use_unicode: bool,
+        use_color: bool,
+        term_width: Option<usize>,
+    ) -> String {
+        self.render_table_inner(
+            outcomes,
+            false,
+            use_unicode,
+            use_color,
+            term_width,
+        )
+    }
+
+    fn render_table_inner(
+        &self,
+        outcomes: Option<&[engine::LayerOutcome]>,
+        update_message: bool,
         use_unicode: bool,
         use_color: bool,
         term_width: Option<usize>,
@@ -411,11 +453,19 @@ impl StackStatus {
                 });
             }
             if layer.message_differs {
-                badges.push(if use_color {
-                    style("message differs").yellow().to_string()
+                if update_message {
+                    badges.push(if use_color {
+                        style("update message").cyan().to_string()
+                    } else {
+                        "update message".to_string()
+                    });
                 } else {
-                    "message differs".to_string()
-                });
+                    badges.push(if use_color {
+                        style("message differs").yellow().to_string()
+                    } else {
+                        "message differs".to_string()
+                    });
+                }
             }
             if layer.landable {
                 badges.push(if use_color {
