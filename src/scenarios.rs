@@ -2950,3 +2950,88 @@ fn reordering_conflicting_layers_does_not_auto_merge_lower_pr() {
     }
     w.assert_invariants();
 }
+
+#[test]
+fn stripped_pull_request_trailer_prompts_to_relink_or_open_new_pr() {
+    struct RelinkChoicePrompter {
+        relink: bool,
+        warned_pr: std::cell::Cell<Option<u64>>,
+    }
+    impl crate::engine::Prompter for RelinkChoicePrompter {
+        fn update_message(&self, _subject: &str) -> color_eyre::eyre::Result<String> {
+            Ok("update".to_string())
+        }
+        fn confirm_relink_existing_pr(
+            &self,
+            _subject: &str,
+            existing_pr_number: u64,
+            _existing_pr_title: &str,
+            _branch: &str,
+        ) -> color_eyre::eyre::Result<bool> {
+            self.warned_pr.set(Some(existing_pr_number));
+            Ok(self.relink)
+        }
+    }
+
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+    assert_eq!(prs, vec![101, 102, 103]);
+
+    // Simulate `git commit --amend -m ...` accidentally stripping the
+    // `Pull-Request:` trailer from Layer two while amending its content.
+    w.layers[1].message.remove(crate::trailers::PULL_REQUEST);
+    w.amend_layer(1, &[("b.txt", "b2")]);
+
+    // Case 1: User confirms re-linking (`relink: true`).
+    let prompter = RelinkChoicePrompter {
+        relink: true,
+        warned_pr: std::cell::Cell::new(None),
+    };
+    let mut stack = w.discover();
+    let outcomes = block_on(sync_stack(
+        &w.git,
+        &w.forge,
+        &w.config,
+        &mut stack,
+        &SyncOptions::default(),
+        &prompter,
+    ))
+    .unwrap();
+    w.refresh_specs_from_repo();
+
+    assert_eq!(prompter.warned_pr.get(), Some(102));
+    assert_eq!(outcomes[1].number, 102);
+    assert_eq!(outcomes[1].action, LayerAction::Updated);
+    assert_eq!(w.pr_numbers(), vec![101, 102, 103]);
+    w.assert_invariants();
+
+    // Case 2: Strip the trailer again, and this time user declines (`relink: false`)
+    // to open a new PR instead.
+    w.layers[1].message.remove(crate::trailers::PULL_REQUEST);
+    w.amend_layer(1, &[("b.txt", "b3")]);
+    let prompter_decline = RelinkChoicePrompter {
+        relink: false,
+        warned_pr: std::cell::Cell::new(None),
+    };
+    let mut stack = w.discover();
+    let outcomes = block_on(sync_stack(
+        &w.git,
+        &w.forge,
+        &w.config,
+        &mut stack,
+        &SyncOptions::default(),
+        &prompter_decline,
+    ))
+    .unwrap();
+    w.refresh_specs_from_repo();
+
+    assert_eq!(prompter_decline.warned_pr.get(), Some(102));
+    assert_eq!(outcomes[1].number, 104);
+    assert_eq!(outcomes[1].action, LayerAction::Created);
+    assert_eq!(w.pr_numbers(), vec![101, 104, 103]);
+}
+
