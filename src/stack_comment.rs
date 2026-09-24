@@ -290,6 +290,7 @@ mod tests {
         );
         let oid = git2::Oid::ZERO_SHA1;
         let stack = Stack {
+            trunk: "main".into(),
             base: oid,
             layers: vec![
                 Layer {
@@ -329,6 +330,7 @@ mod tests {
         );
         let oid = git2::Oid::ZERO_SHA1;
         let stack = Stack {
+            trunk: "main".into(),
             base: oid,
             layers: vec![
                 Layer {

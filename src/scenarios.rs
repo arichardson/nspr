@@ -2879,3 +2879,71 @@ fn reattaching_pr_from_main_onto_parent_layer_uses_single_push() {
     assert_only_ever_displayed(&w, prs[1], &["b.txt"]);
     w.assert_invariants();
 }
+
+#[test]
+fn reordering_top_layer_down_pushes_each_branch_at_most_once() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer 1 (225126)", &[("f1.txt", "1")]);
+    w.add_layer("Layer 2 (225129)", &[("f2.txt", "2")]);
+    w.add_layer("Layer 3 (225130)", &[("f3.txt", "3")]);
+    w.add_layer("Layer 4 (225131)", &[("f4.txt", "4")]);
+    w.add_layer("Layer 5 (225140)", &[("f5.txt", "5")]);
+    w.add_layer("Layer 6 (225133)", &[("f6.txt", "6")]);
+    w.add_layer("Layer 7 (225127)", &[("f7.txt", "7")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Move Layer 7 (index 6) down to index 1 (right above Layer 1), matching
+    // the `~/cheri/upstream-llvm-project` stack reorder.
+    let top = w.layers.remove(6);
+    w.layers.insert(1, top);
+    w.rebuild();
+
+    let pushes_before = w.push_count();
+    w.forge.clear_diff_observations();
+    w.sync();
+
+    // Layer 1 is untouched; each of the 6 moved/restacked layers is pushed
+    // exactly once (1 push in Pass 1 for #225127, 5 pushes in Pass 2 for
+    // #225129..#225133), rather than pushing the upper 5 layers twice.
+    assert_eq!(
+        w.push_count() - pushes_before,
+        6,
+        "each of the 6 affected branches should be pushed at most once"
+    );
+    assert_only_ever_displayed(&w, prs[6], &["f7.txt"]);
+    assert_only_ever_displayed(&w, prs[1], &["f2.txt"]);
+    assert_only_ever_displayed(&w, prs[2], &["f3.txt"]);
+    assert_only_ever_displayed(&w, prs[3], &["f4.txt"]);
+    assert_only_ever_displayed(&w, prs[4], &["f5.txt"]);
+    assert_only_ever_displayed(&w, prs[5], &["f6.txt"]);
+    w.assert_invariants();
+}
+
+#[test]
+fn reordering_conflicting_layers_does_not_auto_merge_lower_pr() {
+    let mut w = World::new(&[("shared.txt", "line1\nline2\n")]);
+    w.add_layer("Layer A", &[("a.txt", "a1")]);
+    w.add_layer("Layer B", &[("shared.txt", "line1_b\nline2\n")]);
+    w.add_layer("Layer C", &[("shared.txt", "line1_c\nline2_c\n")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Swap B and C locally so the order is A -> C -> B, and both B and C modify
+    // `shared.txt` on the same lines so `rebase_tree_onto` returns `None`.
+    w.swap_layers(1, 2);
+    w.amend_layer(1, &[("shared.txt", "line1_c\nline2\n")]);
+    w.amend_layer(2, &[("shared.txt", "line1_c\nline2_b\n")]);
+
+    w.sync();
+
+    for &pr_num in &prs {
+        let pr = block_on(w.forge.get_pull_request(pr_num)).unwrap();
+        assert_eq!(
+            pr.state,
+            crate::forge::PrState::Open,
+            "PR #{pr_num} must not be auto-closed as Merged by GitHub"
+        );
+    }
+    w.assert_invariants();
+}
