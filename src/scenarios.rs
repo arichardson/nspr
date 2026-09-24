@@ -318,6 +318,7 @@ impl World {
             &stack,
             &prs,
             &decision.push,
+            false,
         ))
         .unwrap()
     }
@@ -2189,6 +2190,7 @@ fn non_squash_only_repo_auto_falls_back_to_single_commit_force_push() {
         &stack,
         &prs,
         &[false],
+        false,
     ))
     .unwrap();
     assert!(
@@ -2208,6 +2210,7 @@ fn non_squash_only_repo_auto_falls_back_to_single_commit_force_push() {
         &stack,
         &prs,
         &[false],
+        false,
     ))
     .unwrap();
     assert!(
