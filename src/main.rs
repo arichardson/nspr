@@ -312,11 +312,6 @@ impl Session {
             ..Default::default()
         };
 
-        // A preflight round of queries, before anything is mutated: renders the
-        // stack plan up-front and emits guardrail warnings before any prompt or
-        // network push runs.
-        self.preflight(&stack, &mut opts).await?;
-
         let fixed = FixedPrompter(AUTO_UPDATE_MESSAGE.to_string());
         let interactive = InteractivePrompter;
         let prompter: &dyn Prompter =
@@ -325,6 +320,21 @@ impl Session {
             } else {
                 &interactive
             };
+
+        engine::recover_missing_pr_trailers(
+            &self.git,
+            &self.forge,
+            &self.config,
+            &mut stack,
+            &mut opts,
+            prompter,
+        )
+        .await?;
+
+        // A preflight round of queries, before anything is mutated: renders the
+        // stack plan up-front and emits guardrail warnings before any prompt or
+        // network push runs.
+        self.preflight(&stack, &mut opts).await?;
 
         let outcomes = engine::sync_stack(
             &self.git,
@@ -831,6 +841,25 @@ impl Prompter for FixedPrompter {
     fn update_message(&self, _subject: &str) -> Result<String> {
         Ok(self.0.clone())
     }
+
+    fn confirm_relink_existing_pr(
+        &self,
+        subject: &str,
+        existing_pr_number: u64,
+        existing_pr_title: &str,
+        branch: &str,
+    ) -> Result<bool> {
+        eprintln!(
+            "{} commit \"{}\" has no `Pull-Request:` trailer, but open PR #{} (\"{}\") already uses branch `{}`; linking to #{}.",
+            style("warning:").yellow().bold(),
+            subject,
+            existing_pr_number,
+            existing_pr_title,
+            branch,
+            existing_pr_number,
+        );
+        Ok(true)
+    }
 }
 
 /// Asks what changed, but only when the engine has decided the reviewer will
@@ -856,6 +885,33 @@ impl Prompter for InteractivePrompter {
         } else {
             answer
         })
+    }
+
+    fn confirm_relink_existing_pr(
+        &self,
+        subject: &str,
+        existing_pr_number: u64,
+        existing_pr_title: &str,
+        branch: &str,
+    ) -> Result<bool> {
+        eprintln!(
+            "{} commit \"{}\" has no `Pull-Request:` trailer, but open PR #{} (\"{}\") already uses branch `{}`.",
+            style("warning:").yellow().bold(),
+            subject,
+            existing_pr_number,
+            existing_pr_title,
+            branch,
+        );
+        if !console::user_attended() {
+            return Ok(true);
+        }
+        let link = dialoguer::Confirm::new()
+            .with_prompt(format!(
+                "Link this commit to existing PR #{existing_pr_number} instead of opening a new PR?"
+            ))
+            .default(true)
+            .interact()?;
+        Ok(link)
     }
 }
 

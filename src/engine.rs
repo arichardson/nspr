@@ -47,6 +47,9 @@ pub struct SyncOptions {
     /// Whether to push incremental `[nspr]` commits (`true`) or rewrite each
     /// PR branch as a single commit with force-pushes (`false`).
     pub preserve_commit_history: bool,
+    /// Commits for which the user explicitly declined re-linking to an existing
+    /// open pull request during this `nspr diff` invocation.
+    pub declined_relink_commits: std::collections::HashSet<Oid>,
 }
 
 impl Default for SyncOptions {
@@ -59,13 +62,30 @@ impl Default for SyncOptions {
             refresh_when_behind: false,
             only_layer: None,
             preserve_commit_history: true,
+            declined_relink_commits: std::collections::HashSet::new(),
         }
     }
 }
 
-/// Supplies the "what changed?" message shown on update commits.
+/// Supplies the "what changed?" message shown on update commits, and confirms
+/// whether to re-link a commit whose `Pull-Request:` trailer was lost.
 pub trait Prompter {
     fn update_message(&self, subject: &str) -> Result<String>;
+
+    /// Called when a commit without a `Pull-Request:` trailer has a derived
+    /// branch name that already belongs to an open pull request on the forge.
+    /// Returns `true` to link the commit to `existing_pr_number`, or `false` to
+    /// open a brand-new pull request.
+    fn confirm_relink_existing_pr(
+        &self,
+        subject: &str,
+        existing_pr_number: u64,
+        existing_pr_title: &str,
+        branch: &str,
+    ) -> Result<bool> {
+        let _ = (subject, existing_pr_number, existing_pr_title, branch);
+        Ok(true)
+    }
 }
 
 /// Never prompts; always returns the same message. Used by tests and by
@@ -76,6 +96,78 @@ impl Prompter for FixedPrompter {
     fn update_message(&self, _subject: &str) -> Result<String> {
         Ok(self.0.clone())
     }
+}
+
+/// Check whether any local commit lacking a `Pull-Request:` trailer matches an
+/// already-open pull request on the forge whose head branch is
+/// `config.branch_name_for(subject)` (for example after `git commit --amend`
+/// stripped the trailer). When found, warns and asks `prompter` whether to
+/// re-link the commit to that PR or open a new PR.
+pub async fn recover_missing_pr_trailers(
+    git: &Git,
+    forge: &dyn Forge,
+    config: &Config,
+    stack: &mut Stack,
+    opts: &mut SyncOptions,
+    prompter: &dyn Prompter,
+) -> Result<()> {
+    let mut claimed_prs: std::collections::HashSet<u64> =
+        stack.layers.iter().filter_map(|l| l.pr).collect();
+    let mut rewrote_any = false;
+
+    for i in 0..stack.layers.len() {
+        if let Some(only) = opts.only_layer
+            && i != only
+        {
+            continue;
+        }
+        if stack.layers[i].pr.is_some()
+            || opts
+                .declined_relink_commits
+                .contains(&stack.layers[i].commit)
+        {
+            continue;
+        }
+        let subject = stack.layers[i].subject().to_string();
+        let preferred = config.branch_name_for(&subject);
+        if forge.branch_oid(&preferred).await?.is_none() {
+            continue;
+        }
+        let Some(pr) = forge.find_pull_request_by_head(&preferred).await? else {
+            continue;
+        };
+        if pr.state != PrState::Open || claimed_prs.contains(&pr.number) {
+            continue;
+        }
+
+        if prompter.confirm_relink_existing_pr(
+            &subject,
+            pr.number,
+            &pr.title,
+            &preferred,
+        )? {
+            claimed_prs.insert(pr.number);
+            stack.layers[i].pr = Some(pr.number);
+            stack.layers[i]
+                .message
+                .set(PULL_REQUEST, &config.pull_request_url(pr.number));
+            rewrote_any = true;
+        } else {
+            opts.declined_relink_commits.insert(stack.layers[i].commit);
+        }
+    }
+
+    if rewrote_any {
+        let pairs: Vec<(Oid, String)> = stack
+            .layers
+            .iter()
+            .map(|l| (l.commit, l.message.render()))
+            .collect();
+        git.rewrite_messages(stack.base, &pairs)?;
+        *stack = Stack::discover(git, stack.base, &stack.trunk)?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +213,9 @@ pub async fn sync_stack(
     let mut opts = opts.clone();
     opts.preserve_commit_history =
         config.preserve_commit_history.resolve(merge_settings);
+
+    recover_missing_pr_trailers(git, forge, config, stack, &mut opts, prompter)
+        .await?;
 
     let trees = stack.all_trees(git)?;
 
