@@ -68,6 +68,7 @@ pub async fn probe(
     stack: &Stack,
     prs: &[Option<PullRequest>],
     pushing: &[bool],
+    update_message: bool,
 ) -> Result<Guardrails> {
     let mut warnings = Vec::new();
 
@@ -108,7 +109,11 @@ pub async fn probe(
             warnings.push(w);
         }
 
-        if crate::engine::pr_message_differs_from(pr, &stack.layers[i].message)
+        if !update_message
+            && crate::engine::pr_message_differs_from(
+                pr,
+                &stack.layers[i].message,
+            )
         {
             let pr_body = crate::pr_body::strip_warning(&pr.body);
             let what = match (

@@ -306,7 +306,8 @@ impl Session {
         // A preflight round of queries, before anything is mutated. It costs a
         // second pass over the pull requests, but a warning that arrives after
         // the push that dismissed six approvals is worthless.
-        let refresh_when_behind = self.preflight(&stack).await?;
+        let refresh_when_behind =
+            self.preflight(&stack, args.update_message).await?;
 
         let opts = SyncOptions {
             sync_all: args.all,
@@ -352,7 +353,11 @@ impl Session {
 
     /// Emit guardrail warnings and report whether "behind" layers are worth
     /// refreshing. Read-only.
-    async fn preflight(&self, stack: &Stack) -> Result<bool> {
+    async fn preflight(
+        &self,
+        stack: &Stack,
+        update_message: bool,
+    ) -> Result<bool> {
         let trees = stack.all_trees(&self.git)?;
         let prs = engine::gather(&self.forge, stack).await?;
         let merge_settings = self.forge.repo_merge_settings().await?;
@@ -365,6 +370,7 @@ impl Session {
             &trees,
             &SyncOptions {
                 preserve_commit_history,
+                update_message,
                 ..Default::default()
             },
         )?;
@@ -374,6 +380,7 @@ impl Session {
             stack,
             &prs,
             &decision.push,
+            update_message,
         )
         .await?;
         for warning in &rails.warnings {
