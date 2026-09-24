@@ -1020,6 +1020,7 @@ mod tests {
     #[test]
     fn resolve_land_target_allows_single_layer_without_flags() {
         let stack = Stack {
+            trunk: "main".into(),
             base: git2::Oid::ZERO_SHA1,
             layers: vec![dummy_layer("Single commit", Some(101), Dep::Main)],
         };
@@ -1030,6 +1031,7 @@ mod tests {
     #[test]
     fn resolve_land_target_rejects_ambiguous_bare_land_on_multi_layer_stack() {
         let stack = Stack {
+            trunk: "main".into(),
             base: git2::Oid::ZERO_SHA1,
             layers: vec![
                 dummy_layer("Bottom commit", Some(101), Dep::Main),
@@ -1051,6 +1053,7 @@ mod tests {
     #[test]
     fn resolve_land_target_honors_explicit_pr_or_bottom_on_multi_layer_stack() {
         let stack = Stack {
+            trunk: "main".into(),
             base: git2::Oid::ZERO_SHA1,
             layers: vec![
                 dummy_layer("Bottom commit", Some(101), Dep::Main),
@@ -1077,6 +1080,7 @@ mod tests {
     #[test]
     fn resolve_land_target_allows_single_cherry_picked_pr_among_wip_commits() {
         let stack = Stack {
+            trunk: "main".into(),
             base: git2::Oid::ZERO_SHA1,
             layers: vec![
                 dummy_layer("WIP commit 1", None, Dep::Main),
@@ -1092,6 +1096,7 @@ mod tests {
     #[test]
     fn resolve_land_target_honors_cherry_pick_flag_and_rejects_stacked_head() {
         let stack = Stack {
+            trunk: "main".into(),
             base: git2::Oid::ZERO_SHA1,
             layers: vec![
                 dummy_layer("Bottom PR", Some(101), Dep::Main),
@@ -1105,6 +1110,7 @@ mod tests {
         assert_eq!(resolve_land_target(&stack, &cp_args, "main").unwrap(), 1);
 
         let stacked_stack = Stack {
+            trunk: "main".into(),
             base: git2::Oid::ZERO_SHA1,
             layers: vec![
                 dummy_layer("Bottom PR", Some(101), Dep::Main),

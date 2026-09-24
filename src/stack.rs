@@ -65,6 +65,8 @@ impl Layer {
 
 #[derive(Debug)]
 pub struct Stack {
+    /// Name of the trunk branch (e.g. `main`).
+    pub trunk: String,
     /// `parent(C_1)`. Must be an ancestor of the trunk.
     pub base: Oid,
     /// Bottom-up; always a valid topological order of the dependency DAG.
@@ -138,6 +140,7 @@ impl Stack {
         let oids = git.commits_since(trunk_oid)?;
         if oids.is_empty() {
             return Ok(Self {
+                trunk: trunk.to_string(),
                 base: trunk_oid,
                 layers: Vec::new(),
             });
@@ -171,7 +174,11 @@ impl Stack {
             });
         }
 
-        let mut stack = Self { base, layers };
+        let mut stack = Self {
+            trunk: trunk.to_string(),
+            base,
+            layers,
+        };
         stack.resolve_deps(git)?;
         Ok(stack)
     }

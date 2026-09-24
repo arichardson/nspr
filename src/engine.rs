@@ -136,6 +136,7 @@ pub async fn sync_stack(
     let decision = decide(git, stack, &prs, &trees, &opts)?;
 
     let mut staged = false;
+    let mut prompted_messages = std::collections::HashMap::new();
     let outcomes = execute(
         git,
         forge,
@@ -146,6 +147,7 @@ pub async fn sync_stack(
         &decision,
         &opts,
         prompter,
+        &mut prompted_messages,
         &mut staged,
     )
     .await?;
@@ -158,8 +160,6 @@ pub async fn sync_stack(
     let final_outcomes = if staged {
         let mut catchup_opts = opts.clone();
         catchup_opts.refresh_when_behind = true;
-        // Never re-prompt on the catch-up pass; the patch is already up to date.
-        catchup_opts.message = Some(AUTO_UPDATE_MESSAGE.to_string());
         let trees = stack.all_trees(git)?;
         let prs = gather(forge, stack).await?;
         reject_unusable(&prs)?;
@@ -175,6 +175,7 @@ pub async fn sync_stack(
             &decision,
             &catchup_opts,
             prompter,
+            &mut prompted_messages,
             &mut staged_again,
         )
         .await?;
@@ -326,9 +327,7 @@ pub fn decide(
             Dep::Layer(j) => prs[j].as_ref().map(|p| p.head_oid),
         };
         let base_branch_changed = match stack.layers[i].dep {
-            Dep::Main | Dep::ExternalPr(_) => {
-                prs.iter().flatten().any(|p| p.head == pr.base)
-            }
+            Dep::Main | Dep::ExternalPr(_) => pr.base != stack.trunk,
             Dep::Layer(j) => {
                 prs[j].as_ref().is_some_and(|p| p.head != pr.base)
             }
@@ -343,7 +342,12 @@ pub fn decide(
             // meaningful to compare against.
             None => true,
             Some(base_tip) => {
-                let first_oid = find_root_commit(git, pr, base_tip);
+                let current_pr_base_tip = if pr.base_oid != Oid::ZERO_SHA1 {
+                    pr.base_oid
+                } else {
+                    base_tip
+                };
+                let first_oid = find_root_commit(git, pr, current_pr_base_tip);
                 current_anchor[i] =
                     first_oid.and_then(|r| git.parent_of(r).ok());
                 if let Some(first_oid) = first_oid {
@@ -367,8 +371,11 @@ pub fn decide(
                         pr_message_differs_from(pr, &stack.layers[i].message);
                 }
 
-                let shown =
-                    displayed_patch_id(git.repo(), base_tip, pr.head_oid)?;
+                let shown = displayed_patch_id(
+                    git.repo(),
+                    current_pr_base_tip,
+                    pr.head_oid,
+                )?;
                 let desired = tree_patch_id(
                     git.repo(),
                     trees.dep[i],
@@ -590,6 +597,7 @@ async fn execute(
     decision: &Decision,
     opts: &SyncOptions,
     prompter: &dyn Prompter,
+    prompted_messages: &mut std::collections::HashMap<usize, String>,
     // Set when a layer was left behind its new base by `safe_retarget_anchor`.
     staged: &mut bool,
 ) -> Result<Vec<LayerOutcome>> {
@@ -600,6 +608,7 @@ async fn execute(
     let mut base_branches: Vec<String> = Vec::with_capacity(n);
     let mut new_roots: Vec<Option<Oid>> = vec![None; n];
     let mut retargeted_early: Vec<bool> = vec![false; n];
+    let mut deferred_to_stage2: Vec<bool> = vec![false; n];
     let mut undraft: Vec<String> = Vec::new();
 
     let mut messages: Vec<CommitMessage> =
@@ -752,7 +761,7 @@ async fn execute(
                 } else {
                     current_pr_base_tip
                 };
-                let anchor = if retargeted_before_push {
+                let raw_anchor = if retargeted_before_push {
                     parent_tip
                 } else {
                     safe_retarget_anchor(
@@ -765,6 +774,57 @@ async fn execute(
                     .unwrap_or(parent_tip)
                 };
 
+                let rebased_onto_anchor = rebase_tree_onto(
+                    git,
+                    trees.dep[i],
+                    raw_anchor,
+                    desired_tree,
+                )?;
+
+                // When a branch needs two-phase staging (`raw_anchor != parent_tip`)
+                // or depends on a branch whose push was deferred to Pass 2:
+                // check whether `pr.head_oid` on the remote is *already* safely
+                // anchored at `current_pr_base_tip` (so retargeting `pr.base`
+                // to `base_branches[i]` in Phase 3 is immediately diff-neutral
+                // without pushing a temporary commit in Pass 1), or whether
+                // `rebase_tree_onto` conflicted (so pushing `parent_tip` in
+                // Pass 1 would risk making a newly-lowered PR an ancestor of
+                // its old base branch and triggering GitHub's auto-merge).
+                let parent_deferred = matches!(
+                    stack.layers[i].dep,
+                    Dep::Layer(j) if deferred_to_stage2[j]
+                );
+                let no_auto_merge_hazard = (pr.base == base_branches[i]
+                    || (!git.is_ancestor(parent_tip, pr.head_oid)?
+                        && !git.is_ancestor(pr.head_oid, parent_tip)?))
+                    && !(0..i).any(|k| {
+                        !deferred_to_stage2[k]
+                            && prs[k].as_ref().is_some_and(|pk| {
+                                pk.base == pr.head
+                                    && git
+                                        .is_ancestor(tips[k], pr.head_oid)
+                                        .unwrap_or(true)
+                            })
+                    });
+                let already_parked_on_remote = raw_anchor != parent_tip
+                    && git.merge_base(parent_tip, pr.head_oid)?
+                        == current_pr_base_tip
+                    && !decision.patch_changed[i]
+                    && !decision.message_changed[i];
+                let defer_push_to_stage2 = no_auto_merge_hazard
+                    && (already_parked_on_remote
+                        || (parent_deferred && pr.base == base_branches[i])
+                        || (raw_anchor != parent_tip
+                            && rebased_onto_anchor.is_none()));
+
+                if defer_push_to_stage2 {
+                    *staged = true;
+                    deferred_to_stage2[i] = true;
+                    tips.push(pr.head_oid);
+                    branches.push(pr.head.clone());
+                    continue;
+                }
+
                 // The layer's content is computed against the base it is about
                 // to have, so it has to be replayed whenever the anchor is
                 // something else. That covers this layer being parked and,
@@ -775,13 +835,8 @@ async fn execute(
                 // Replaying can conflict where the forward move would not.
                 // Nothing is lost by declining, it just means taking the
                 // ordinary path.
-                let (anchor, desired_tree) = match rebase_tree_onto(
-                    git,
-                    trees.dep[i],
-                    anchor,
-                    desired_tree,
-                )? {
-                    Some(tree) => (anchor, tree),
+                let (anchor, desired_tree) = match rebased_onto_anchor {
+                    Some(tree) => (raw_anchor, tree),
                     None => (parent_tip, desired_tree),
                 };
                 if anchor != parent_tip {
@@ -832,12 +887,20 @@ async fn execute(
 
                 if !rewrite || git.tree_of(tip)? != desired_tree {
                     // Prompt only when reviewers will actually see something
-                    // different.
+                    // different, and at most once per layer across passes.
                     let message =
                         match (&opts.message, decision.patch_changed[i]) {
                             (Some(m), _) => m.clone(),
                             (None, true) => {
-                                prompter.update_message(&subject)?
+                                if let Some(existing) =
+                                    prompted_messages.get(&i)
+                                {
+                                    existing.clone()
+                                } else {
+                                    let m = prompter.update_message(&subject)?;
+                                    prompted_messages.insert(i, m.clone());
+                                    m
+                                }
                             }
                             (None, false) => AUTO_UPDATE_MESSAGE.to_string(),
                         };

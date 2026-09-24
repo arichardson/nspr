@@ -427,6 +427,25 @@ impl Forge for FakeForge {
                 }
             }
         }
+        // GitHub automatically closes an open pull request as `Merged` the
+        // instant a `git push` makes its `head` SHA an ancestor of its `base`
+        // branch tip (which happens on a naive stack reorder if the new upper
+        // branch is pushed before the new lower PR's `base` is retargeted).
+        for pr in self.prs.borrow_mut().iter_mut() {
+            if pr.state != PrState::Open {
+                continue;
+            }
+            let (Some(base_oid), Some(head_oid)) =
+                (self.branch(&pr.base), self.branch(&pr.head))
+            else {
+                continue;
+            };
+            if head_oid == base_oid
+                || self.repo.graph_descendant_of(base_oid, head_oid)?
+            {
+                pr.state = PrState::Merged;
+            }
+        }
         self.observe_displayed_diffs();
         Ok(())
     }
