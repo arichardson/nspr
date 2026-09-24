@@ -63,6 +63,7 @@ pub struct LayerStatus {
     pub auto_merge: bool,
     pub conflicting: bool,
     pub behind: bool,
+    pub message_differs: bool,
     /// Ready to land: depends on nothing but the trunk.
     pub landable: bool,
     /// The layer this one is stacked on, if any.
@@ -127,13 +128,21 @@ pub async fn status(
                 {
                     LayerState::LegacySpr
                 }
-                PrState::Open if decision.patch_changed[i] => {
+                PrState::Open
+                    if decision.patch_changed[i]
+                        || (decision.message_changed[i]
+                            && !decision.github_message_edited[i]) =>
+                {
                     LayerState::Modified
                 }
                 PrState::Open if decision.push[i] => LayerState::NeedsRestack,
                 PrState::Open => LayerState::Current,
             },
         };
+
+        let message_differs = prs[i]
+            .as_ref()
+            .is_some_and(|p| engine::pr_message_differs_from(p, &layer.message));
 
         layers.push(LayerStatus {
             index: i,
@@ -153,6 +162,7 @@ pub async fn status(
             behind: prs[i]
                 .as_ref()
                 .is_some_and(|p| p.merge_state == MergeState::Behind),
+            message_differs,
             landable: layer.dep == Dep::Main && layer.pr.is_some(),
             dep: layer.dep,
         });
@@ -196,17 +206,45 @@ impl StackStatus {
         self.render_with_options(use_unicode, use_color, term_width)
     }
 
+    /// Render the stack table after `nspr diff`, showing the action taken on
+    /// each layer (`created`, `updated`, `refreshed`, `ok`) alongside status
+    /// badges.
+    pub fn render_diff(&self, outcomes: &[engine::LayerOutcome]) -> String {
+        let term = console::Term::stdout();
+        let is_tty = term.is_term();
+        let use_color = is_tty && console::colors_enabled();
+        let use_unicode = is_tty && supports_unicode();
+        let term_width = if is_tty {
+            term.size_checked().map(|(_rows, cols)| cols as usize)
+        } else {
+            None
+        };
+        self.render_table(Some(outcomes), use_unicode, use_color, term_width)
+    }
+
     pub fn render_with_options(
         &self,
         use_unicode: bool,
         use_color: bool,
         term_width: Option<usize>,
     ) -> String {
+        self.render_table(None, use_unicode, use_color, term_width)
+    }
+
+    pub fn render_table(
+        &self,
+        outcomes: Option<&[engine::LayerOutcome]>,
+        use_unicode: bool,
+        use_color: bool,
+        term_width: Option<usize>,
+    ) -> String {
         use console::{Alignment, measure_text_width, pad_str, style, truncate_str};
+        use engine::LayerAction;
 
         struct RowData<'a> {
             layer: &'a LayerStatus,
             num_plain: String,
+            glyph: String,
             state_styled: String,
             badges_joined: String,
         }
@@ -216,31 +254,106 @@ impl StackStatus {
 
         let mut rows = Vec::with_capacity(self.layers.len());
         for layer in self.layers.iter().rev() {
-            let num_plain = match layer.number {
+            let outcome = outcomes
+                .and_then(|list| list.iter().find(|o| o.index == layer.index));
+
+            let num_plain = match layer.number.or(outcome.map(|o| o.number)) {
                 Some(n) => format!("#{n}"),
                 None => dash.to_string(),
             };
-            let state_plain = layer.state.label();
-            let state_styled = if use_color {
-                match layer.state {
-                    LayerState::Current => style(state_plain).green().to_string(),
-                    LayerState::Modified => {
-                        style(state_plain).yellow().bold().to_string()
+
+            let (raw_glyph, state_plain, glyph_styled, state_styled) =
+                if let Some(o) = outcome {
+                    match o.action {
+                        LayerAction::Created => (
+                            "○",
+                            "created",
+                            style("○").green().bold().to_string(),
+                            style("created").green().bold().to_string(),
+                        ),
+                        LayerAction::Updated => (
+                            "◉",
+                            "updated",
+                            style("◉").yellow().bold().to_string(),
+                            style("updated").yellow().bold().to_string(),
+                        ),
+                        LayerAction::Refreshed => (
+                            "◎",
+                            "refreshed",
+                            style("◎").cyan().to_string(),
+                            style("refreshed").cyan().to_string(),
+                        ),
+                        LayerAction::Skipped => {
+                            let g = if layer.draft { "◌" } else { "●" };
+                            let gs = if layer.draft {
+                                style(g).dim().to_string()
+                            } else {
+                                style(g).green().to_string()
+                            };
+                            (g, "ok", gs, style("ok").green().to_string())
+                        }
                     }
-                    LayerState::NeedsRestack => {
-                        style(state_plain).cyan().to_string()
-                    }
-                    LayerState::New => {
-                        style(state_plain).green().bold().to_string()
-                    }
-                    LayerState::Merged => {
-                        style(state_plain).magenta().to_string()
-                    }
-                    LayerState::Closed => style(state_plain).red().to_string(),
-                    LayerState::LegacySpr => {
-                        style(state_plain).yellow().bold().to_string()
-                    }
+                } else if outcomes.is_some() {
+                    let g = if layer.draft { "◌" } else { "●" };
+                    let gs = if layer.draft {
+                        style(g).dim().to_string()
+                    } else {
+                        style(g).green().to_string()
+                    };
+                    (g, "ok", gs, style("ok").green().to_string())
+                } else {
+                    let sp = layer.state.label();
+                    let raw = match layer.state {
+                        LayerState::Current if layer.draft => "◌",
+                        LayerState::Current => "●",
+                        LayerState::Modified => "◉",
+                        LayerState::NeedsRestack => "◎",
+                        LayerState::New => "○",
+                        LayerState::Merged => "✔",
+                        LayerState::Closed => "✕",
+                        LayerState::LegacySpr => "⚠",
+                    };
+                    let gs = match layer.state {
+                        LayerState::Current if layer.draft => {
+                            style(raw).dim().to_string()
+                        }
+                        LayerState::Current => style(raw).green().to_string(),
+                        LayerState::Modified => style(raw).yellow().to_string(),
+                        LayerState::NeedsRestack => style(raw).cyan().to_string(),
+                        LayerState::New => style(raw).green().bold().to_string(),
+                        LayerState::Merged => style(raw).magenta().to_string(),
+                        LayerState::Closed => style(raw).red().to_string(),
+                        LayerState::LegacySpr => {
+                            style(raw).yellow().bold().to_string()
+                        }
+                    };
+                    let ss = match layer.state {
+                        LayerState::Current => style(sp).green().to_string(),
+                        LayerState::Modified => {
+                            style(sp).yellow().bold().to_string()
+                        }
+                        LayerState::NeedsRestack => style(sp).cyan().to_string(),
+                        LayerState::New => style(sp).green().bold().to_string(),
+                        LayerState::Merged => style(sp).magenta().to_string(),
+                        LayerState::Closed => style(sp).red().to_string(),
+                        LayerState::LegacySpr => {
+                            style(sp).yellow().bold().to_string()
+                        }
+                    };
+                    (raw, sp, gs, ss)
+                };
+
+            let glyph = if use_unicode {
+                if use_color {
+                    glyph_styled
+                } else {
+                    raw_glyph.to_string()
                 }
+            } else {
+                "*".to_string()
+            };
+            let state_styled = if use_color {
+                state_styled
             } else {
                 state_plain.to_string()
             };
@@ -274,7 +387,15 @@ impl StackStatus {
                     "AUTO-MERGE".to_string()
                 });
             }
-            if layer.base.as_ref().is_some_and(|b| b != &layer.wanted_base) {
+            if outcome.is_some_and(|o| o.retargeted) {
+                let t = format!("rebased {arrow} {}", layer.wanted_base_label);
+                badges.push(if use_color {
+                    style(t).magenta().to_string()
+                } else {
+                    t
+                });
+            } else if layer.base.as_ref().is_some_and(|b| b != &layer.wanted_base)
+            {
                 let t = format!("retarget {arrow} {}", layer.wanted_base_label);
                 badges.push(if use_color {
                     style(t).magenta().to_string()
@@ -289,6 +410,13 @@ impl StackStatus {
                     t
                 });
             }
+            if layer.message_differs {
+                badges.push(if use_color {
+                    style("message differs").yellow().to_string()
+                } else {
+                    "message differs".to_string()
+                });
+            }
             if layer.landable {
                 badges.push(if use_color {
                     style("landable").green().to_string()
@@ -300,6 +428,7 @@ impl StackStatus {
             rows.push(RowData {
                 layer,
                 num_plain,
+                glyph,
                 state_styled,
                 badges_joined: badges.join("  "),
             });
@@ -325,41 +454,7 @@ impl StackStatus {
         let mut out = String::new();
 
         for row in &rows {
-            let glyph = if use_unicode {
-                let raw = match row.layer.state {
-                    LayerState::Current if row.layer.draft => "◌",
-                    LayerState::Current => "●",
-                    LayerState::Modified => "◉",
-                    LayerState::NeedsRestack => "◎",
-                    LayerState::New => "○",
-                    LayerState::Merged => "✔",
-                    LayerState::Closed => "✕",
-                    LayerState::LegacySpr => "⚠",
-                };
-                if use_color {
-                    match row.layer.state {
-                        LayerState::Current if row.layer.draft => {
-                            style(raw).dim().to_string()
-                        }
-                        LayerState::Current => style(raw).green().to_string(),
-                        LayerState::Modified => style(raw).yellow().to_string(),
-                        LayerState::NeedsRestack => {
-                            style(raw).cyan().to_string()
-                        }
-                        LayerState::New => style(raw).green().bold().to_string(),
-                        LayerState::Merged => style(raw).magenta().to_string(),
-                        LayerState::Closed => style(raw).red().to_string(),
-                        LayerState::LegacySpr => {
-                            style(raw).yellow().bold().to_string()
-                        }
-                    }
-                } else {
-                    raw.to_string()
-                }
-            } else {
-                "*".to_string()
-            };
-
+            let glyph = &row.glyph;
             let num_pad =
                 num_width.saturating_sub(measure_text_width(&row.num_plain));
             let styled_num = if use_color {
@@ -471,6 +566,7 @@ mod tests {
                     auto_merge: false,
                     conflicting: false,
                     behind: false,
+                    message_differs: false,
                     landable: true,
                     dep: Dep::Main,
                 },
@@ -488,6 +584,7 @@ mod tests {
                     auto_merge: false,
                     conflicting: false,
                     behind: false,
+                    message_differs: false,
                     landable: false,
                     dep: Dep::Layer(0),
                 },
@@ -505,6 +602,7 @@ mod tests {
                     auto_merge: false,
                     conflicting: false,
                     behind: false,
+                    message_differs: false,
                     landable: false,
                     dep: Dep::Layer(1),
                 },

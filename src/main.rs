@@ -337,7 +337,7 @@ impl Session {
         )
         .await?;
 
-        self.report(&outcomes, verbose);
+        self.report(&stack, &outcomes, verbose).await?;
 
         if self.config.stack_comments {
             let updated =
@@ -382,33 +382,24 @@ impl Session {
         Ok(rails.refresh_when_behind)
     }
 
-    fn report(&self, outcomes: &[LayerOutcome], verbose: bool) {
-        let mut quiet = true;
-        for outcome in outcomes {
-            let (verb, colour) = match outcome.action {
-                LayerAction::Created => ("created", style("created").green()),
-                LayerAction::Updated => ("updated", style("updated").cyan()),
-                LayerAction::Refreshed => {
-                    ("refreshed", style("refreshed").blue())
-                }
-                LayerAction::Skipped => ("", style("unchanged").dim()),
-            };
-            if verb.is_empty() && !verbose {
-                continue;
-            }
-            quiet = false;
-            println!(
-                "  {colour:<10} {}  {}",
-                self.config.pull_request_url(outcome.number),
-                outcome.branch,
-            );
-            if outcome.retargeted {
-                println!("             rebased onto {}", outcome.base);
-            }
-        }
-        if quiet {
+    async fn report(
+        &self,
+        stack: &Stack,
+        outcomes: &[LayerOutcome],
+        verbose: bool,
+    ) -> Result<()> {
+        let any_changed = outcomes
+            .iter()
+            .any(|o| o.action != LayerAction::Skipped || o.retargeted);
+        if !any_changed && !verbose {
             println!("Everything is already up to date.");
+            return Ok(());
         }
+        let report =
+            status::status(&self.git, &self.forge, &self.config, stack)
+                .await?;
+        print!("{}", report.render_diff(outcomes));
+        Ok(())
     }
 
     async fn refresh_remaining_metadata(&self) -> Result<()> {
@@ -457,11 +448,60 @@ impl Session {
         let Some(index) =
             stack.layers.iter().position(|l| l.pr == Some(args.number))
         else {
-            bail!(
-                "#{} is not in this stack. `nspr close` only manages pull \
-                 requests whose commits are on your current branch.",
-                args.number
+            // If the commit was already squashed or dropped locally (for
+            // example, via `git rebase -i --autosquash`), close the pull
+            // request on GitHub and retarget any layer in the current stack
+            // whose remote base still points at its branch.
+            let pr = self.forge.get_pull_request(args.number).await?;
+            if pr.state != forge::PrState::Open {
+                bail!("#{} is already closed or merged.", args.number);
+            }
+            let prs = engine::gather(&self.forge, &stack).await?;
+            let mut retargeted_any = false;
+            for other in prs.into_iter().flatten() {
+                if other.base == pr.head {
+                    self.forge
+                        .update_pull_request(
+                            other.number,
+                            forge::PullRequestUpdate {
+                                base: Some(pr.base.clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    retargeted_any = true;
+                }
+            }
+            self.forge
+                .update_pull_request(
+                    args.number,
+                    forge::PullRequestUpdate {
+                        state: Some(forge::PrState::Closed),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let _ = nspr::refs::remove(&self.git, args.number);
+            println!(
+                "{} #{} {}",
+                style("closed").red().bold(),
+                args.number,
+                pr.title
             );
+            if retargeted_any {
+                println!("Restacking...");
+                self.diff(
+                    DiffArgs {
+                        no_prompt: true,
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await?;
+            } else {
+                self.refresh_remaining_metadata().await?;
+            }
+            return Ok(());
         };
 
         let outcome = close::close_layer(
