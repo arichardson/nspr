@@ -108,6 +108,25 @@ pub async fn probe(
             warnings.push(w);
         }
 
+        if crate::engine::pr_message_differs_from(pr, &stack.layers[i].message)
+        {
+            let pr_body = crate::pr_body::strip_warning(&pr.body);
+            let what = match (
+                pr.title.trim() != stack.layers[i].message.subject.trim(),
+                pr_body.trim() != stack.layers[i].message.body.trim(),
+            ) {
+                (true, true) => "title and description",
+                (true, false) => "title",
+                (false, _) => "description",
+            };
+            warnings.push(format!(
+                "#{}'s local commit {} differs from the pull request on GitHub. \
+                 Run `nspr amend` to pull GitHub edits into your commit, or \
+                 `nspr diff --update-message` to overwrite GitHub.",
+                pr.number, what,
+            ));
+        }
+
         if !pushing.get(i).copied().unwrap_or(false) {
             continue;
         }

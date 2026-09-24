@@ -138,8 +138,16 @@ impl GitRemote {
             SshAgentStatus::NotConfigured
         };
 
-        eprintln!("git {action_desc} ({effective_url})...");
-        let _ = std::io::stderr().flush();
+        if log::log_enabled!(log::Level::Debug) {
+            eprintln!("git {action_desc} ({effective_url})...");
+            let _ = std::io::stderr().flush();
+        } else if dir == Direction::Push {
+            eprintln!(
+                "{}",
+                console::style(format!("git {action_desc} ({effective_url})...")).dim()
+            );
+            let _ = std::io::stderr().flush();
+        }
 
         let mut remote = self.repo.remote_anonymous(&self.url)?;
         let auth = self.authenticator(&ssh_status);
@@ -231,7 +239,13 @@ impl GitRemote {
             return Ok(());
         }
         let specs: Vec<&str> = refspecs.iter().map(String::as_str).collect();
-        let desc = format!("push: {}", describe_push_refspecs(refspecs));
+        let desc = if log::log_enabled!(log::Level::Debug) {
+            format!("push: {}", describe_push_refspecs(refspecs))
+        } else {
+            let count = refspecs.len();
+            let noun = if count == 1 { "branch" } else { "branches" };
+            format!("push: {count} {noun}")
+        };
         self.with_remote(Direction::Push, &desc, |remote, mut callbacks| {
             callbacks.push_update_reference(|reference, status| match status {
                 Some(status) => {

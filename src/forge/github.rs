@@ -593,89 +593,15 @@ impl Forge for GitHubForge {
                             {
                                 *slot = updated;
                             }
+                            continue;
                         }
                         Err(e) => {
                             debug!(
-                                "could not extend github stack #{} with {delta:?}: {e}",
+                                "could not extend github stack #{} with {delta:?}: {e}; will recreate",
                                 matched.number
                             );
                         }
                     }
-                    continue;
-                }
-
-                // If the stack was reordered, try updating it in-place via PATCH
-                // first so the stack number is preserved.
-                let patch_route = format!(
-                    "/repos/{}/{}/stacks/{}",
-                    self.owner, self.repo, matched.number
-                );
-                let patch_body =
-                    serde_json::json!({ "pull_requests": desired });
-                if let Ok(updated) = self
-                    .api
-                    .patch::<RemoteStack, _, _>(patch_route, Some(&patch_body))
-                    .await
-                {
-                    eprintln!(
-                        "github stack: reordered stack #{} ({} PRs)",
-                        updated.number,
-                        desired.len()
-                    );
-                    if let Some(slot) = remote_stacks
-                        .iter_mut()
-                        .find(|s| s.number == updated.number)
-                    {
-                        *slot = updated;
-                    }
-                    continue;
-                }
-
-                // If the bottom of the stack (`prefix_len >= 2`) is unchanged
-                // and only upper layers were reordered, try removing just the
-                // old suffix and adding the new suffix; if that fails, keep the
-                // intact bottom prefix stack rather than unstacking it.
-                let prefix_len = current
-                    .iter()
-                    .zip(desired.iter())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                if prefix_len >= 2 {
-                    let to_remove = &current[prefix_len..];
-                    let remove_route = format!(
-                        "/repos/{}/{}/stacks/{}/remove",
-                        self.owner, self.repo, matched.number
-                    );
-                    let remove_body =
-                        serde_json::json!({ "pull_requests": to_remove });
-                    if self
-                        .api
-                        .post::<_, serde_json::Value>(
-                            remove_route,
-                            Some(&remove_body),
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        let to_add = &desired[prefix_len..];
-                        let add_route = format!(
-                            "/repos/{}/{}/stacks/{}/add",
-                            self.owner, self.repo, matched.number
-                        );
-                        let add_body =
-                            serde_json::json!({ "pull_requests": to_add });
-                        if let Ok(updated) = self
-                            .api
-                            .post::<_, RemoteStack>(add_route, Some(&add_body))
-                            .await
-                            && let Some(slot) = remote_stacks
-                                .iter_mut()
-                                .find(|s| s.number == updated.number)
-                        {
-                            *slot = updated;
-                        }
-                    }
-                    continue;
                 }
             }
 

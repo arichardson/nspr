@@ -155,7 +155,7 @@ pub async fn sync_stack(
     // pull request points at its new base branch, immediately move parked
     // branches forward onto their new base tips in the same `nspr diff` run so
     // the user never has to run `nspr diff` twice.
-    if staged {
+    let final_outcomes = if staged {
         let mut catchup_opts = opts.clone();
         catchup_opts.refresh_when_behind = true;
         // Never re-prompt on the catch-up pass; the patch is already up to date.
@@ -202,10 +202,13 @@ pub async fn sync_stack(
                 merged.push(next);
             }
         }
-        return Ok(merged);
-    }
+        merged
+    } else {
+        outcomes
+    };
 
-    Ok(outcomes)
+    forge.sync_stacks(&stack.pr_chains()).await?;
+    Ok(final_outcomes)
 }
 
 /// Pass A: fetch the current state of every existing pull request.
@@ -261,6 +264,12 @@ pub fn reject_unusable(prs: &[Option<PullRequest>]) -> Result<()> {
     Ok(())
 }
 
+/// Whether a pull request's title or description on the forge differs from `msg`.
+pub fn pr_message_differs_from(pr: &PullRequest, msg: &CommitMessage) -> bool {
+    let pr_body = crate::pr_body::strip_warning(&pr.body);
+    pr.title.trim() != msg.subject.trim() || pr_body.trim() != msg.body.trim()
+}
+
 /// Which layers need pushing, and why.
 pub struct Decision {
     /// The layer's own patch differs from what the reviewer currently sees.
@@ -268,6 +277,9 @@ pub struct Decision {
     /// The layer's local commit message differs from the initial commit on its
     /// PR branch.
     pub message_changed: Vec<bool>,
+    /// The pull request's title or description on the forge was edited to
+    /// something different from the branch's initial commit message.
+    pub github_message_edited: Vec<bool>,
     /// The layer's branch history must be rewritten (force-pushed) because its
     /// commit message changed or its base branch was rewritten.
     pub rewrite_history: Vec<bool>,
@@ -287,6 +299,7 @@ pub fn decide(
     let n = stack.layers.len();
     let mut patch_changed = vec![false; n];
     let mut message_changed = vec![false; n];
+    let mut github_message_edited = vec![false; n];
     let mut rewrite_history = vec![false; n];
     let mut push = vec![false; n];
 
@@ -312,6 +325,17 @@ pub fn decide(
             Dep::Main | Dep::ExternalPr(_) => Some(stack.base),
             Dep::Layer(j) => prs[j].as_ref().map(|p| p.head_oid),
         };
+        let base_branch_changed = match stack.layers[i].dep {
+            Dep::Main | Dep::ExternalPr(_) => {
+                prs.iter().flatten().any(|p| p.head == pr.base)
+            }
+            Dep::Layer(j) => {
+                prs[j].as_ref().is_some_and(|p| p.head != pr.base)
+            }
+        };
+        if base_branch_changed {
+            rewrite_history[i] = true;
+        }
 
         let mut needs_conflict_refresh = false;
         patch_changed[i] = match remote_base_tip {
@@ -324,6 +348,10 @@ pub fn decide(
                     first_oid.and_then(|r| git.parent_of(r).ok());
                 if let Some(first_oid) = first_oid {
                     let current_msg = git.message_of(first_oid)?;
+                    let branch_commit_msg = CommitMessage::parse(&current_msg);
+                    github_message_edited[i] =
+                        pr_message_differs_from(pr, &branch_commit_msg);
+
                     let desired_msg =
                         stack.layers[i].message.clean_for_branch();
                     if current_msg.trim() != desired_msg.trim() {
@@ -334,6 +362,9 @@ pub fn decide(
                     {
                         rewrite_history[i] = true;
                     }
+                } else {
+                    github_message_edited[i] =
+                        pr_message_differs_from(pr, &stack.layers[i].message);
                 }
 
                 let shown =
@@ -363,6 +394,7 @@ pub fn decide(
         push[i] = patch_changed[i]
             || message_changed[i]
             || rewrite_history[i]
+            || base_branch_changed
             || needs_conflict_refresh
             || opts.sync_all
             || pr.needs_refresh(opts.refresh_when_behind)
@@ -437,6 +469,7 @@ pub fn decide(
     Ok(Decision {
         patch_changed,
         message_changed,
+        github_message_edited,
         rewrite_history,
         push,
     })
@@ -915,7 +948,10 @@ async fn execute(
                 if retargeted && !retargeted_early[i] {
                     update.base = Some(base_branch.clone());
                 }
-                if opts.update_message || decision.message_changed[i] {
+                if opts.update_message
+                    || (decision.message_changed[i]
+                        && !decision.github_message_edited[i])
+                {
                     if pr.title != subject {
                         update.title = Some(subject);
                     }
@@ -971,7 +1007,6 @@ async fn execute(
     }
 
     apply_message_edits(git, stack, &messages)?;
-    forge.sync_stacks(&stack.pr_chains()).await?;
     Ok(outcomes)
 }
 
