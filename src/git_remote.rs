@@ -235,12 +235,23 @@ impl GitRemote {
 
     /// Push raw refspecs, failing if the remote rejects any of them.
     pub fn push(&self, refspecs: &[String]) -> Result<()> {
+        self.push_with_desc(refspecs, None)
+    }
+
+    /// Push raw refspecs with an optional custom progress description.
+    pub fn push_with_desc(
+        &self,
+        refspecs: &[String],
+        custom_desc: Option<&str>,
+    ) -> Result<()> {
         if refspecs.is_empty() {
             return Ok(());
         }
         let specs: Vec<&str> = refspecs.iter().map(String::as_str).collect();
         let desc = if log::log_enabled!(log::Level::Debug) {
             format!("push: {}", describe_push_refspecs(refspecs))
+        } else if let Some(d) = custom_desc {
+            d.to_string()
         } else {
             let count = refspecs.len();
             let noun = if count == 1 { "branch" } else { "branches" };
