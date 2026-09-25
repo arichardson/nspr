@@ -394,15 +394,33 @@ impl World {
     }
 
     /// Land every layer that is ready, bottom-up. This is `nspr land --all`.
-    ///
-    /// Invariants are checked *between* lands: by the time the last layer is
-    /// gone there is nothing left to be wrong about.
     fn land_all(&mut self) -> Vec<LandOutcome> {
-        let mut out = Vec::new();
-        while let Some(i) = land::next_landable(&self.discover()) {
-            out.push(self.land(i));
-            self.assert_invariants();
+        let stack = self.discover();
+        let start = self.push_count();
+        let out = block_on(land::land_all(
+            &self.git,
+            &self.forge,
+            &self.config,
+            &stack,
+            &LandOptions::default(),
+        ))
+        .unwrap();
+        self.land_windows.push((start, self.push_count()));
+        if let Some(last) = out.last() {
+            self.base_oid = last.squash;
         }
+        let landed_prs: std::collections::HashSet<u64> =
+            out.iter().map(|o| o.number).collect();
+        self.layers.retain(|l| {
+            let pr = l
+                .message
+                .get(crate::trailers::PULL_REQUEST)
+                .and_then(crate::stack::parse_pr_ref);
+            !pr.is_some_and(|n| landed_prs.contains(&n))
+        });
+        self.sync_worktree();
+        self.refresh_specs_from_repo();
+        self.assert_invariants();
         out
     }
 
@@ -2888,7 +2906,8 @@ fn reattaching_pr_from_main_onto_parent_layer_uses_single_push() {
 }
 
 #[test]
-fn amending_bottom_layer_after_local_trunk_rebase_does_not_restack_upper_layers() {
+fn amending_bottom_layer_after_local_trunk_rebase_does_not_restack_upper_layers()
+ {
     let mut w = World::new(&[("root.txt", "root")]);
     w.add_layer("Layer one", &[("a.txt", "a1")]);
     w.add_layer("Layer two", &[("b.txt", "b1")]);
@@ -2901,7 +2920,8 @@ fn amending_bottom_layer_after_local_trunk_rebase_does_not_restack_upper_layers(
     w.amend_layer(0, &[("a.txt", "a2")]);
 
     let stack = w.discover();
-    let st = block_on(status::status(&w.git, &w.forge, &w.config, &stack)).unwrap();
+    let st =
+        block_on(status::status(&w.git, &w.forge, &w.config, &stack)).unwrap();
     assert_eq!(st.layers[0].state, status::LayerState::Modified);
     assert_eq!(st.layers[1].state, status::LayerState::Current);
     assert_eq!(st.layers[2].state, status::LayerState::Current);
@@ -2990,7 +3010,10 @@ fn stripped_pull_request_trailer_prompts_to_relink_or_open_new_pr() {
         warned_pr: std::cell::Cell<Option<u64>>,
     }
     impl crate::engine::Prompter for RelinkChoicePrompter {
-        fn update_message(&self, _subject: &str) -> color_eyre::eyre::Result<String> {
+        fn update_message(
+            &self,
+            _subject: &str,
+        ) -> color_eyre::eyre::Result<String> {
             Ok("update".to_string())
         }
         fn confirm_relink_existing_pr(
@@ -3196,4 +3219,105 @@ fn land_all_restacked_series_with_overlapping_files_and_async_pr_head_lag() {
             "{name} missing or wrong on trunk: {files:?}"
         );
     }
+}
+
+#[test]
+fn land_all_merges_ready_prs_without_force_pushing_and_deletes_at_end() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
+    w.add_layer("Layer four", &[("d.txt", "d1")]);
+    w.sync();
+
+    // Push a revision to Layer two and restack so branches have multi-commit
+    // history and green CI on their current head_oid.
+    w.amend_layer(1, &[("b.txt", "b2")]);
+    w.amend_layer(2, &[("c.txt", "c2")]);
+    w.amend_layer(3, &[("d.txt", "d2")]);
+    w.sync();
+
+    let pushes_before = w.push_count();
+    let landed = w.land_all();
+    assert_eq!(landed.len(), 4);
+    assert!(w.discover().layers.is_empty());
+
+    // Zero repairs/force-pushes occurred: every PR was merged at its existing
+    // head_oid (preserving green CI), and only branch deletions were pushed at
+    // the end.
+    assert!(landed.iter().all(|o| o.repaired.is_empty()));
+    let land_pushes: Vec<_> = w
+        .forge
+        .pushes
+        .borrow()
+        .iter()
+        .skip(pushes_before)
+        .cloned()
+        .collect();
+    assert_eq!(land_pushes.len(), 4);
+    assert!(
+        land_pushes.iter().all(|p| !p.force && p.oid.is_none()),
+        "expected only branch deletions (zero force-pushes), got: {land_pushes:?}"
+    );
+}
+
+#[test]
+fn land_all_merges_ready_prefix_without_force_push_and_repairs_remaining_once_at_end()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
+    w.add_layer("Layer four", &[("d.txt", "d1")]);
+    w.sync();
+
+    let prs = w.pr_numbers();
+    // Mark Layer three (#103) as a draft so only #101 and #102 can land now.
+    block_on(w.forge.set_draft(&format!("PR_{}", prs[2]), true)).unwrap();
+    w.forge.draft_toggles.borrow_mut().clear();
+
+    let pr2_head_before =
+        block_on(w.forge.get_pull_request(prs[1])).unwrap().head_oid;
+    let pushes_before = w.push_count();
+
+    let landed = w.land_all();
+    assert_eq!(landed.len(), 2);
+    assert_eq!(landed[0].number, prs[0]);
+    assert_eq!(landed[1].number, prs[1]);
+
+    // Layer one did not repair anything before Layer two merged; Layer two was
+    // merged at its original `pr2_head_before` (preserving its green CI), and
+    // Layers three and four were repaired only once at the very end!
+    assert!(landed[0].repaired.is_empty());
+    assert_eq!(landed[1].repaired.len(), 2);
+    assert_eq!(landed[1].repaired[0].number, prs[2]);
+    assert!(landed[1].repaired[0].retargeted);
+    assert_eq!(landed[1].repaired[1].number, prs[3]);
+    assert!(!landed[1].repaired[1].retargeted);
+
+    let land_pushes: Vec<_> = w
+        .forge
+        .pushes
+        .borrow()
+        .iter()
+        .skip(pushes_before)
+        .cloned()
+        .collect();
+    // Exactly 2 forced repair pushes (#103, #104) and 2 branch deletes (#101, #102);
+    // #102 was never force-pushed!
+    let forced_branches: Vec<String> = land_pushes
+        .iter()
+        .filter(|p| p.force)
+        .map(|p| p.branch.clone())
+        .collect();
+    assert_eq!(
+        forced_branches,
+        vec![
+            "users/tester/layer-three".to_string(),
+            "users/tester/layer-four".to_string()
+        ],
+        "PR #{} (head {pr2_head_before}) must not be force-pushed before merging",
+        prs[1]
+    );
+    assert_eq!(w.discover().layers.len(), 2);
 }
