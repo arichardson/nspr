@@ -236,36 +236,67 @@ impl Forge for GitHubForge {
         // `COMMIT_MESSAGES` — every `[nspr]` revision commit on the head
         // branch, pasted onto the trunk. `sha` is the compare-and-swap guard:
         // GitHub rejects the merge if the head branch moved since we read it.
-        let result = self
-            .api
-            .pulls(&self.owner, &self.repo)
-            .merge(number)
-            .title(req.title)
-            .message(req.message)
-            .sha(req.expected_head.to_string())
-            .method(MergeMethod::Squash)
-            .send()
-            .await;
+        //
+        // Right after `git push`, `PATCH base`, or a squash-merge of the layer
+        // below, GitHub recomputes `mergeable` asynchronously in the background
+        // and can return transient HTTP 405 ("Base branch was modified" /
+        // `mergeable == UNKNOWN`) or 409 ("Head branch was modified") for a
+        // couple of seconds.
+        let retry_delays_ms = [300_u64, 700, 1200, 2000, 3000];
+        let mut attempt = 0;
+        let merge = loop {
+            let result = self
+                .api
+                .pulls(&self.owner, &self.repo)
+                .merge(number)
+                .title(req.title.clone())
+                .message(req.message.clone())
+                .sha(req.expected_head.to_string())
+                .method(MergeMethod::Squash)
+                .send()
+                .await;
 
-        let merge = match result {
-            Ok(merge) => merge,
-            Err(e) => {
-                let advice = match status_code(&e) {
-                    Some(409) => {
-                        "the head branch moved since nspr read it, or the \
-                         pull request no longer merges cleanly. Run `nspr \
-                         diff`, then try again."
+            match result {
+                Ok(merge) => break merge,
+                Err(e) => {
+                    let code = status_code(&e);
+                    if matches!(code, Some(405 | 409))
+                        && let Some(&delay_ms) = retry_delays_ms.get(attempt)
+                        && let Ok(pr) = self.get_pull_request(number).await
+                        && pr.state == PrState::Open
+                        && pr.mergeable != Mergeable::Conflicting
+                        && (pr.mergeable == Mergeable::Unknown
+                            || code == Some(409)
+                            || attempt < 2)
+                    {
+                        debug!(
+                            "merge #{number} got HTTP {code:?} (mergeable={:?}); retrying in {delay_ms}ms",
+                            pr.mergeable
+                        );
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            delay_ms,
+                        ))
+                        .await;
+                        continue;
                     }
-                    Some(405) => {
-                        "GitHub declined: squash merging may be disabled for \
-                         this repository, or a required review or check is \
-                         still outstanding."
-                    }
-                    _ => "the merge request failed.",
-                };
-                return Err(Error::from(e)).wrap_err(format!(
-                    "could not squash-merge #{number}: {advice}"
-                ));
+                    let advice = match code {
+                        Some(409) => {
+                            "the head branch moved since nspr read it, or the \
+                             pull request no longer merges cleanly. Run `nspr \
+                             diff`, then try again."
+                        }
+                        Some(405) => {
+                            "GitHub declined: squash merging may be disabled for \
+                             this repository, or a required review or check is \
+                             still outstanding."
+                        }
+                        _ => "the merge request failed.",
+                    };
+                    return Err(Error::from(e)).wrap_err(format!(
+                        "could not squash-merge #{number}: {advice}"
+                    ));
+                }
             }
         };
 

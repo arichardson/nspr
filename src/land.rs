@@ -139,7 +139,7 @@ pub async fn land_layer(
             layer.subject()
         )
     })?;
-    let pr = forge.get_pull_request(number).await?;
+    let pr = get_synced_pull_request(git, forge, number, true).await?;
     match pr.state {
         PrState::Merged => bail!(
             "#{number} has already been merged. Run `nspr sync` to bring the \
@@ -162,7 +162,8 @@ pub async fn land_layer(
 
     let mut warnings = Vec::new();
     let dependents =
-        snapshot_dependents(forge, stack, index, config, &mut warnings).await?;
+        snapshot_dependents(git, forge, stack, index, config, &mut warnings)
+            .await?;
     let direct: HashSet<usize> =
         stack.direct_dependents_of(index).into_iter().collect();
 
@@ -260,7 +261,10 @@ pub async fn land_layer(
             ));
         }
 
-        push_specs.push(PushSpec::forced(&d.branch, new_tip));
+        push_specs.push(
+            PushSpec::forced(&d.branch, new_tip)
+                .with_label(format!("#{}", d.number)),
+        );
         let new_root_commit =
             branch_revisions(git, new_tip, new_root)?.first().copied();
         ref_updates.push((d.number, new_tip, new_root_commit));
@@ -280,7 +284,8 @@ pub async fn land_layer(
 
     // --- Step 6: push all repaired branches and delete the merged head branch
     // in a single git push operation. ----------------------------------------
-    push_specs.push(PushSpec::delete(&pr.head));
+    push_specs
+        .push(PushSpec::delete(&pr.head).with_label(format!("delete #{number}")));
     forge.push(&push_specs).await?;
 
     for (dep_num, new_tip, new_root_commit) in ref_updates {
@@ -356,9 +361,49 @@ fn check_merge_equals_cherrypick(
     Ok(())
 }
 
+/// Read a pull request from the forge, waiting briefly if `pr.head_oid` is
+/// lagging behind a branch tip that `nspr` itself just pushed.
+///
+/// GitHub updates `PullRequest.headRefOid` asynchronously in a background
+/// worker after `git-receive-pack` completes. During `nspr land --all` (or
+/// `nspr diff && nspr land`), the next layer is queried milliseconds after its
+/// branch was pushed: the live Git ref (`branch_oid`) already points at the
+/// new commit recorded in `refs/nspr/pr/<number>`, while `get_pull_request`
+/// can still return the pre-push `head_oid` for 100ms–2s.
+async fn get_synced_pull_request(
+    git: &Git,
+    forge: &dyn Forge,
+    number: u64,
+    wait_for_pr_sync: bool,
+) -> Result<crate::forge::PullRequest> {
+    let mut pr = forge.get_pull_request(number).await?;
+    if pr.state != PrState::Open {
+        return Ok(pr);
+    }
+    if let Some(recorded_oid) = crate::refs::get(git, number)
+        && pr.head_oid != recorded_oid
+        && forge.branch_oid(&pr.head).await? == Some(recorded_oid)
+    {
+        if wait_for_pr_sync {
+            for delay_ms in [50_u64, 150, 300, 600, 1000, 1500, 2000, 2000] {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                    .await;
+                pr = forge.get_pull_request(number).await?;
+                if pr.head_oid == recorded_oid || pr.state != PrState::Open {
+                    break;
+                }
+            }
+        }
+        pr.head_oid = recorded_oid;
+    }
+    forge.fetch_commit(pr.head_oid).await?;
+    Ok(pr)
+}
+
 /// Capture every transitive dependent's remote state before we mutate
 /// anything.
 async fn snapshot_dependents(
+    git: &Git,
     forge: &dyn Forge,
     stack: &Stack,
     index: usize,
@@ -374,7 +419,7 @@ async fn snapshot_dependents(
                 stack.layers[layer].subject()
             )
         })?;
-        let pr = forge.get_pull_request(number).await?;
+        let pr = get_synced_pull_request(git, forge, number, false).await?;
         if pr.state != PrState::Open {
             warnings.push(format!("#{number} is not open; leaving it alone."));
             continue;
