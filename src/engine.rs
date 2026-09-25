@@ -539,7 +539,26 @@ pub fn decide(
         };
         let up_to_date = match &prs[j] {
             None => false,
-            Some(pr) => git.tree_of(pr.head_oid)? == trees.effective[j],
+            Some(pr) => {
+                let expected_tree = match current_anchor.first().copied().flatten() {
+                    Some(root_anchor)
+                        if !opts.sync_all
+                            && !opts.refresh_when_behind
+                            && root_anchor != stack.base
+                            && git.is_ancestor(root_anchor, stack.base)? =>
+                    {
+                        rebase_tree_onto(
+                            git,
+                            trees.dep[0],
+                            root_anchor,
+                            trees.effective[j],
+                        )?
+                        .unwrap_or(trees.effective[j])
+                    }
+                    _ => trees.effective[j],
+                };
+                git.tree_of(pr.head_oid)? == expected_tree
+            }
         };
         if !up_to_date {
             push[j] = true;
@@ -573,9 +592,24 @@ pub fn decide(
             push[i] = true;
         }
         let base_moved = match stack.layers[i].dep {
-            Dep::Main | Dep::ExternalPr(_) => {
-                current_anchor[i] != Some(stack.base)
-            }
+            Dep::Main | Dep::ExternalPr(_) => match current_anchor[i] {
+                None => true,
+                Some(anchor) => {
+                    !git.is_ancestor(anchor, stack.base)?
+                        || ((opts.sync_all || opts.refresh_when_behind)
+                            && anchor != stack.base)
+                        || prs[i]
+                            .as_ref()
+                            .is_some_and(|p| p.base != stack.trunk)
+                        || rebase_tree_onto(
+                            git,
+                            trees.dep[i],
+                            anchor,
+                            trees.effective[i],
+                        )?
+                        .is_none()
+                }
+            },
             Dep::Layer(j) => {
                 push[j]
                     || prs[j].as_ref().map(|p| p.head_oid) != current_anchor[i]
@@ -747,7 +781,13 @@ async fn execute(
     for i in 0..n {
         let (parent_tip, base_branch) = match stack.layers[i].dep {
             Dep::Main | Dep::ExternalPr(_) => {
-                (stack.base, config.trunk.clone())
+                let anchor = match (&prs[i], decision.rewrite_history[i]) {
+                    (Some(pr), false) => find_root_commit(git, pr, stack.base)
+                        .and_then(|r| git.parent_of(r).ok())
+                        .unwrap_or(stack.base),
+                    _ => stack.base,
+                };
+                (anchor, config.trunk.clone())
             }
             Dep::Layer(j) => (tips[j], branches[j].clone()),
         };
