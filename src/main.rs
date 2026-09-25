@@ -431,9 +431,8 @@ impl Session {
                     .await?;
             print!("{}", report.render_diff(outcomes));
         } else {
-            for o in outcomes
-                .iter()
-                .filter(|o| o.action == LayerAction::Created)
+            for o in
+                outcomes.iter().filter(|o| o.action == LayerAction::Created)
             {
                 let subject = stack
                     .layers
@@ -473,7 +472,11 @@ impl Session {
                 style("✓").green().bold()
             );
         } else {
-            println!("{} Done ({})", style("✓").green().bold(), parts.join(", "));
+            println!(
+                "{} Done ({})",
+                style("✓").green().bold(),
+                parts.join(", ")
+            );
         }
         Ok(())
     }
@@ -726,16 +729,21 @@ impl Session {
     }
 
     async fn land(&mut self, args: LandArgs) -> Result<()> {
-        let mut landed_count = 0usize;
-        loop {
-            let stack = self.discover()?;
-            let index = resolve_land_target(&stack, &args, &self.config.trunk)?;
+        let stack = self.discover()?;
+        let opts = land::LandOptions {
+            message: args.message.clone(),
+            keep_local: false,
+        };
 
-            let opts = land::LandOptions {
-                message: args.message.clone(),
-                keep_local: false,
-            };
-            let outcome = match land::land_layer(
+        let outcomes = if args.all
+            && args.target_pr().is_none()
+            && !args.cherry_pick
+        {
+            land::land_all(&self.git, &self.forge, &self.config, &stack, &opts)
+                .await?
+        } else {
+            let index = resolve_land_target(&stack, &args, &self.config.trunk)?;
+            let outcome = land::land_layer(
                 &self.git,
                 &self.forge,
                 &self.config,
@@ -743,23 +751,15 @@ impl Session {
                 index,
                 &opts,
             )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    if landed_count > 0 {
-                        let _ = self.refresh_remaining_metadata().await;
-                    }
-                    return Err(e);
-                }
-            };
+            .await?;
+            vec![outcome]
+        };
 
-            landed_count += 1;
-            self.trunk_oid = outcome.squash;
+        if let Some(last) = outcomes.last() {
+            self.trunk_oid = last.squash;
+        }
 
-            for warning in &outcome.warnings {
-                eprintln!("{} {warning}", style("warning:").yellow().bold());
-            }
+        for outcome in &outcomes {
             println!(
                 "{} #{} {} as {}",
                 style("landed").green().bold(),
@@ -777,29 +777,18 @@ impl Session {
                     println!("  repaired #{}", repair.number);
                 }
             }
-
-            if !args.all || args.target_pr().is_some() || args.cherry_pick {
-                self.refresh_remaining_metadata().await?;
-                println!(
-                    "{} ({landed_count} landed)",
-                    style("✓ Done").green().bold()
-                );
-                return Ok(());
+            for warning in &outcome.warnings {
+                eprintln!("{} {warning}", style("warning:").yellow().bold());
             }
-            // `land --all` stops at the first layer that is not landable
-            // rather than erroring: having landed three of five is a success.
-            if let Ok(stack) = self.discover()
-                && land::next_landable(&stack).is_some()
-            {
-                continue;
-            }
-            self.refresh_remaining_metadata().await?;
-            println!(
-                "{} ({landed_count} landed)",
-                style("✓ Done").green().bold()
-            );
-            return Ok(());
         }
+
+        self.refresh_remaining_metadata().await?;
+        println!(
+            "{} ({} landed)",
+            style("✓ Done").green().bold(),
+            outcomes.len()
+        );
+        Ok(())
     }
 
     async fn list(&self, args: ListArgs) -> Result<()> {

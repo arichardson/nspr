@@ -284,8 +284,9 @@ pub async fn land_layer(
 
     // --- Step 6: push all repaired branches and delete the merged head branch
     // in a single git push operation. ----------------------------------------
-    push_specs
-        .push(PushSpec::delete(&pr.head).with_label(format!("delete #{number}")));
+    push_specs.push(
+        PushSpec::delete(&pr.head).with_label(format!("delete #{number}")),
+    );
     forge.push(&push_specs).await?;
 
     for (dep_num, new_tip, new_root_commit) in ref_updates {
@@ -298,8 +299,14 @@ pub async fn land_layer(
 
     // --- Local cleanup: the landed commit becomes empty and drops out. ------
     if !opts.keep_local {
-        let commits: Vec<Oid> = stack.layers.iter().map(|l| l.commit).collect();
-        git.rebase_commits(&commits, squash).wrap_err(
+        let unlanded_commits: Vec<Oid> = stack
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, l)| l.commit)
+            .collect();
+        git.rebase_commits(&unlanded_commits, squash).wrap_err(
             "#{number} landed, but the local stack could not be rebased onto \
              it. Run `git rebase --onto <trunk>` manually, then `nspr sync`.",
         )?;
@@ -312,6 +319,504 @@ pub async fn land_layer(
         repaired,
         warnings,
     })
+}
+
+/// State of a layer's pull request tracked across `land_all`.
+#[derive(Debug, Clone)]
+struct LayerPrState {
+    number: u64,
+    branch: String,
+    base: String,
+    tip: Oid,
+    state: PrState,
+    draft: bool,
+    auto_merge_warning: Option<String>,
+    /// If this layer depends on another layer in `stack`, the remote tip of
+    /// that dependency that `tip` is currently anchored on.
+    anchor_tip: Option<Oid>,
+}
+
+/// Squash-merge all ready layers from the bottom up, preserving their existing
+/// head commits (and green CI checks) whenever GitHub can 3-way merge them
+/// cleanly into the trunk, and only repairing any remaining unmerged layers
+/// once at the end.
+pub async fn land_all(
+    git: &Git,
+    forge: &dyn Forge,
+    config: &Config,
+    stack: &Stack,
+    opts: &LandOptions,
+) -> Result<Vec<LandOutcome>> {
+    git.check_no_uncommitted_changes()?;
+    crate::upgrade::reject_if_legacy_spr(git, forge, config, stack).await?;
+
+    if stack.layers.is_empty() {
+        bail!("nothing to land: no commits ahead of `{}`", config.trunk);
+    }
+    if next_landable(stack).is_none() {
+        return land_layer(git, forge, config, stack, 0, opts)
+            .await
+            .map(|o| vec![o]);
+    }
+
+    let mut current_trunk = forge
+        .branch_oid(&config.trunk)
+        .await?
+        .ok_or_else(|| eyre!("no `{}` branch on the remote", config.trunk))?;
+    forge.fetch_commit(current_trunk).await?;
+
+    // Snapshot pull requests for all layers up front before mutating anything.
+    let mut pr_states: HashMap<usize, LayerPrState> = HashMap::new();
+    for (i, layer) in stack.layers.iter().enumerate() {
+        if let Some(number) = layer.pr {
+            let pr =
+                get_synced_pull_request(git, forge, number, i == 0).await?;
+            let auto_merge_warning = if pr.state == PrState::Open {
+                crate::guardrails::auto_merge_warning(&pr, &config.trunk)
+            } else {
+                None
+            };
+            pr_states.insert(
+                i,
+                LayerPrState {
+                    number,
+                    branch: pr.head,
+                    base: pr.base,
+                    tip: pr.head_oid,
+                    state: pr.state,
+                    draft: pr.draft,
+                    auto_merge_warning,
+                    anchor_tip: None,
+                },
+            );
+        } else if stack
+            .dependents_of(i)
+            .into_iter()
+            .any(|d| stack.layers[d].pr.is_some())
+        {
+            bail!(
+                "`{}` has no pull request yet, but a layer above it does; run \
+                 `nspr diff` first so it can be retargeted",
+                layer.subject()
+            );
+        }
+    }
+
+    for i in 0..stack.layers.len() {
+        if let Dep::Layer(dep) = stack.layers[i].dep
+            && let Some(dep_tip) = pr_states.get(&dep).map(|s| s.tip)
+            && let Some(state) = pr_states.get_mut(&i)
+        {
+            state.anchor_tip = Some(dep_tip);
+        }
+    }
+
+    let mut landed_layers: HashSet<usize> = HashSet::new();
+    let mut pending_deletes: Vec<(u64, String)> = Vec::new();
+    let mut outcomes: Vec<LandOutcome> = Vec::new();
+    let mut stop_warning: Option<String> = None;
+
+    for index in 0..stack.layers.len() {
+        let dep_ready = match stack.layers[index].dep {
+            Dep::Main => true,
+            Dep::Layer(dep) => landed_layers.contains(&dep),
+            Dep::ExternalPr(_) => false,
+        };
+        if !dep_ready {
+            continue;
+        }
+
+        let Some(state) = pr_states.get(&index).cloned() else {
+            if outcomes.is_empty() {
+                bail!(
+                    "`{}` has no pull request yet; run `nspr diff` first",
+                    stack.layers[index].subject()
+                );
+            }
+            continue;
+        };
+
+        match state.state {
+            PrState::Merged => {
+                if outcomes.is_empty() {
+                    bail!(
+                        "#{} has already been merged. Run `nspr sync` to bring \
+                         the local stack up to date.",
+                        state.number
+                    );
+                }
+                continue;
+            }
+            PrState::Closed => {
+                if outcomes.is_empty() {
+                    bail!("#{} is closed.", state.number);
+                }
+                continue;
+            }
+            PrState::Open => {}
+        }
+        if state.draft {
+            if outcomes.is_empty() {
+                bail!(
+                    "#{} is still a draft; mark it ready for review first.",
+                    state.number
+                );
+            }
+            continue;
+        }
+
+        let cp_index =
+            git.cherrypick(stack.layers[index].commit, current_trunk)?;
+        if cp_index.has_conflicts() {
+            let msg = "this commit no longer applies on top of the trunk. Run \
+                       `nspr sync` to rebase, then try again.";
+            if outcomes.is_empty() {
+                bail!("{msg}");
+            }
+            stop_warning = Some(format!("stopped at #{}: {msg}", state.number));
+            continue;
+        }
+        let cherrypicked = git.write_index(cp_index)?;
+
+        let mut current_tip = state.tip;
+        let direct_merge_matches = {
+            let repo = git.repo();
+            let trunk_c = repo.find_commit(current_trunk)?;
+            let head_c = repo.find_commit(current_tip)?;
+            let merged = repo.merge_commits(&trunk_c, &head_c, None)?;
+            !merged.has_conflicts() && git.write_index(merged)? == cherrypicked
+        };
+
+        if !direct_merge_matches {
+            // Check whether the PR branch has the exact reviewed patch relative
+            // to its pre-land dependency anchor, and only conflicts with
+            // `current_trunk` because an earlier layer in this stack modified
+            // overlapping lines or was amended without restacking this layer.
+            let reanchored_matches = if let Some(old_root) = state.anchor_tip {
+                let old_base = git.merge_base(old_root, current_tip)?;
+                let reanchored = git.merge_trees(
+                    git.tree_of(old_base)?,
+                    git.tree_of(current_trunk)?,
+                    git.tree_of(current_tip)?,
+                )?;
+                !reanchored.has_conflicts()
+                    && git.write_index(reanchored)? == cherrypicked
+            } else {
+                false
+            };
+
+            if !reanchored_matches {
+                let msg = "the local commit has changed since the pull request \
+                           was last pushed, so landing it would merge something \
+                           nobody reviewed. Run `nspr diff` first.";
+                if outcomes.is_empty() {
+                    bail!("{msg}");
+                }
+                stop_warning =
+                    Some(format!("stopped at #{}: {msg}", state.number));
+                continue;
+            }
+
+            let last_outcome = outcomes
+                .last_mut()
+                .expect("anchor_tip implies an earlier layer landed");
+            let repaired = repair_remaining_dependents(
+                git,
+                forge,
+                config,
+                stack,
+                &landed_layers,
+                current_trunk,
+                &mut pr_states,
+                &mut pending_deletes,
+                &mut last_outcome.warnings,
+            )
+            .await?;
+            last_outcome.repaired.extend(repaired);
+
+            let synced_pr =
+                get_synced_pull_request(git, forge, state.number, true).await?;
+            current_tip = synced_pr.head_oid;
+            pr_states.get_mut(&index).unwrap().tip = current_tip;
+        }
+
+        // Retarget this layer (if needed) and its direct open dependents to
+        // trunk before merging so GitHub never auto-closes a dependent.
+        let mut retargeted: Vec<(usize, u64, String)> = Vec::new();
+        if pr_states[&index].base != config.trunk {
+            let old_base = pr_states[&index].base.clone();
+            forge
+                .update_pull_request(
+                    state.number,
+                    PullRequestUpdate {
+                        base: Some(config.trunk.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            pr_states.get_mut(&index).unwrap().base = config.trunk.clone();
+            retargeted.push((index, state.number, old_base));
+        }
+        for d_layer in stack.direct_dependents_of(index) {
+            if let Some(d_state) = pr_states.get(&d_layer)
+                && d_state.state == PrState::Open
+                && d_state.base != config.trunk
+            {
+                let d_num = d_state.number;
+                let old_base = d_state.base.clone();
+                forge
+                    .update_pull_request(
+                        d_num,
+                        PullRequestUpdate {
+                            base: Some(config.trunk.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                pr_states.get_mut(&d_layer).unwrap().base =
+                    config.trunk.clone();
+                retargeted.push((d_layer, d_num, old_base));
+            }
+        }
+
+        let (title, message) =
+            squash_message(&stack.layers[index], state.number, opts);
+        let merged = forge
+            .merge_pull_request(
+                state.number,
+                SquashMerge {
+                    title: title.clone(),
+                    message,
+                    expected_head: current_tip,
+                },
+            )
+            .await;
+
+        let squash = match merged {
+            Ok(oid) => oid,
+            Err(e) => {
+                let pairs: Vec<(u64, String)> = retargeted
+                    .iter()
+                    .map(|(_, num, base)| (*num, base.clone()))
+                    .collect();
+                rollback(forge, &pairs).await;
+                for (r_layer, _, old_base) in retargeted {
+                    if let Some(st) = pr_states.get_mut(&r_layer) {
+                        st.base = old_base;
+                    }
+                }
+                if outcomes.is_empty() {
+                    return Err(e).wrap_err(format!(
+                        "could not merge #{}",
+                        state.number
+                    ));
+                }
+                stop_warning =
+                    Some(format!("stopped at #{}: {e:#}", state.number));
+                continue;
+            }
+        };
+        forge.fetch_commit(squash).await?;
+
+        landed_layers.insert(index);
+        pr_states.get_mut(&index).unwrap().state = PrState::Merged;
+        current_trunk = squash;
+        pending_deletes.push((state.number, state.branch.clone()));
+        outcomes.push(LandOutcome {
+            number: state.number,
+            title,
+            squash,
+            repaired: Vec::new(),
+            warnings: Vec::new(),
+        });
+    }
+
+    // Repair any remaining unmerged layers once onto the final squash commit,
+    // and delete all merged head branches in a single `git push`.
+    let last_outcome = outcomes.last_mut().expect("at least one layer landed");
+    let repaired = repair_remaining_dependents(
+        git,
+        forge,
+        config,
+        stack,
+        &landed_layers,
+        current_trunk,
+        &mut pr_states,
+        &mut pending_deletes,
+        &mut last_outcome.warnings,
+    )
+    .await?;
+    last_outcome.repaired.extend(repaired);
+    if let Some(w) = stop_warning {
+        last_outcome.warnings.push(w);
+    }
+
+    if !opts.keep_local {
+        let unlanded_commits: Vec<Oid> = stack
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !landed_layers.contains(i))
+            .map(|(_, l)| l.commit)
+            .collect();
+        git.rebase_commits(&unlanded_commits, current_trunk)
+            .wrap_err(
+                "pull requests landed, but the local stack could not be \
+                 rebased onto the trunk. Run `git rebase --onto <trunk>` \
+                 manually, then `nspr sync`.",
+            )?;
+    }
+
+    Ok(outcomes)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn repair_remaining_dependents(
+    git: &Git,
+    forge: &dyn Forge,
+    config: &Config,
+    stack: &Stack,
+    landed_layers: &HashSet<usize>,
+    current_trunk: Oid,
+    pr_states: &mut HashMap<usize, LayerPrState>,
+    pending_deletes: &mut Vec<(u64, String)>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Repair>> {
+    let mut repaired = Vec::new();
+    let mut push_specs: Vec<PushSpec> = Vec::new();
+    let mut ref_updates: Vec<(u64, Oid, Option<Oid>)> = Vec::new();
+
+    for d_layer in 0..stack.layers.len() {
+        if landed_layers.contains(&d_layer) {
+            continue;
+        }
+        let Dep::Layer(dep) = stack.layers[d_layer].dep else {
+            continue;
+        };
+        let direct_dep_landed = landed_layers.contains(&dep);
+        let new_root = if direct_dep_landed {
+            current_trunk
+        } else if let Some(dep_state) = pr_states.get(&dep) {
+            dep_state.tip
+        } else {
+            continue;
+        };
+
+        let Some(d_state) = pr_states.get(&d_layer).cloned() else {
+            continue;
+        };
+        if d_state.state != PrState::Open {
+            warnings.push(format!(
+                "#{} is not open; leaving it alone.",
+                d_state.number
+            ));
+            continue;
+        }
+        let Some(old_root) = d_state.anchor_tip else {
+            continue;
+        };
+        if old_root == new_root {
+            continue;
+        }
+
+        if let Some(w) = pr_states
+            .get_mut(&d_layer)
+            .unwrap()
+            .auto_merge_warning
+            .take()
+        {
+            warnings.push(w);
+        }
+
+        if direct_dep_landed && d_state.base != config.trunk {
+            forge
+                .update_pull_request(
+                    d_state.number,
+                    PullRequestUpdate {
+                        base: Some(config.trunk.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            pr_states.get_mut(&d_layer).unwrap().base = config.trunk.clone();
+        }
+
+        let clean_msg = stack.layers[d_layer].message.clean_for_branch();
+        let revisions = branch_revisions(git, d_state.tip, old_root)?;
+        let d_snap = Dependent {
+            layer: d_layer,
+            number: d_state.number,
+            branch: d_state.branch.clone(),
+            base: d_state.base.clone(),
+            tip: d_state.tip,
+        };
+        let (new_tip, collapsed) =
+            match replay(git, &revisions, new_root, &clean_msg)? {
+                Some(tip) => (tip, false),
+                None => (
+                    collapse(
+                        git, &d_snap, old_root, new_root, &clean_msg, warnings,
+                    )?,
+                    true,
+                ),
+            };
+
+        let before = displayed_patch_id(git.repo(), old_root, d_state.tip)?;
+        let after = displayed_patch_id(git.repo(), new_root, new_tip)?;
+        if before != after {
+            warnings.push(format!(
+                "#{}'s diff changed while landing; some inline comments may \
+                 be marked outdated. This normally means the trunk moved \
+                 underneath you.",
+                d_state.number
+            ));
+        }
+
+        push_specs.push(
+            PushSpec::forced(&d_state.branch, new_tip)
+                .with_label(format!("#{}", d_state.number)),
+        );
+        let new_root_commit =
+            branch_revisions(git, new_tip, new_root)?.first().copied();
+        ref_updates.push((d_state.number, new_tip, new_root_commit));
+
+        let st = pr_states.get_mut(&d_layer).unwrap();
+        st.tip = new_tip;
+        st.anchor_tip = Some(new_root);
+
+        repaired.push(Repair {
+            number: d_state.number,
+            branch: d_state.branch,
+            old_tip: d_state.tip,
+            new_tip,
+            revisions: revisions.len(),
+            collapsed,
+            retargeted: direct_dep_landed,
+        });
+    }
+
+    let deletes: Vec<(u64, String)> = std::mem::take(pending_deletes);
+    for (num, branch) in &deletes {
+        push_specs.push(
+            PushSpec::delete(branch).with_label(format!("delete #{num}")),
+        );
+    }
+
+    if !push_specs.is_empty() {
+        forge.push(&push_specs).await?;
+    }
+
+    for (dep_num, new_tip, new_root_commit) in ref_updates {
+        crate::refs::update(git, dep_num, new_tip)?;
+        if let Some(root_commit) = new_root_commit {
+            crate::refs::update_root(git, dep_num, root_commit)?;
+        }
+    }
+    for (num, _) in deletes {
+        crate::refs::remove(git, num)?;
+    }
+
+    Ok(repaired)
 }
 
 /// The lowest layer that is ready to land, if any.
@@ -574,8 +1079,9 @@ fn collapse(
     initial_message: &str,
     warnings: &mut Vec<String>,
 ) -> Result<Oid> {
+    let old_base = git.merge_base(old_root, d.tip)?;
     let index = git.merge_trees(
-        git.tree_of(old_root)?,
+        git.tree_of(old_base)?,
         git.tree_of(new_root)?,
         git.tree_of(d.tip)?,
     )?;
