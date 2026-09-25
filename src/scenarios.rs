@@ -446,10 +446,14 @@ impl World {
                 .forge
                 .branch(&pr.base)
                 .unwrap_or_else(|| panic!("base branch {} missing", pr.base));
+            let head_tip = self
+                .forge
+                .branch(&pr.head)
+                .unwrap_or_else(|| panic!("head branch {} missing", pr.head));
 
             // What GitHub renders for the pull request...
             let displayed =
-                review_diff::displayed_patch_id(&repo, base_tip, pr.head_oid)
+                review_diff::displayed_patch_id(&repo, base_tip, head_tip)
                     .unwrap();
 
             // ...versus the patch this layer is supposed to contribute.
@@ -486,7 +490,7 @@ impl World {
         for layer in &stack.layers {
             let Some(number) = layer.pr else { continue };
             let pr = block_on(self.forge.get_pull_request(number)).unwrap();
-            let mut cur = pr.head_oid;
+            let mut cur = self.forge.branch(&pr.head).unwrap();
             while !self.git.is_ancestor(cur, self.base_oid).unwrap() {
                 let commit = repo.find_commit(cur).unwrap();
                 assert_eq!(
@@ -3063,3 +3067,133 @@ fn stripped_pull_request_trailer_prompts_to_relink_or_open_new_pr() {
     assert_eq!(w.pr_numbers(), vec![101, 104, 103]);
 }
 
+#[test]
+fn land_all_restacked_series_with_overlapping_files_and_async_pr_head_lag() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer(
+        "Layer A",
+        &[
+            ("a.txt", "a1"),
+            (
+                "shared.txt",
+                "header = \"v1\"\nstep1 = \"todo\"\nstep2 = \"todo\"\nstep3 = \"todo\"\n",
+            ),
+        ],
+    );
+    w.add_layer(
+        "Layer B",
+        &[
+            ("b.txt", "b1"),
+            (
+                "shared.txt",
+                "header = \"v1\"\nstep1 = \"done-b\"\nstep2 = \"todo\"\nstep3 = \"todo\"\n",
+            ),
+        ],
+    );
+    w.add_layer(
+        "Layer C",
+        &[
+            ("c.txt", "c1"),
+            (
+                "shared.txt",
+                "header = \"v1\"\nstep1 = \"done-b\"\nstep2 = \"done-c\"\nstep3 = \"todo\"\n",
+            ),
+        ],
+    );
+    w.add_layer(
+        "Layer D",
+        &[
+            ("d.txt", "d1"),
+            (
+                "shared.txt",
+                "header = \"v1\"\nstep1 = \"done-b\"\nstep2 = \"done-c\"\nstep3 = \"done-d\"\n",
+            ),
+        ],
+    );
+    w.sync();
+
+    // Reorder B and C (A -> C -> B -> D) and push revision updates to C and B.
+    w.swap_layers(1, 2);
+    w.amend_layer(
+        1,
+        &[
+            ("c.txt", "c2"),
+            (
+                "shared.txt",
+                "header = \"v1\"\nstep1 = \"done-c-rev2\"\nstep2 = \"todo\"\nstep3 = \"todo\"\n",
+            ),
+        ],
+    );
+    w.amend_layer(
+        2,
+        &[
+            ("b.txt", "b2"),
+            (
+                "shared.txt",
+                "header = \"v1\"\nstep1 = \"done-c-rev2\"\nstep2 = \"done-b-rev2\"\nstep3 = \"todo\"\n",
+            ),
+        ],
+    );
+    w.amend_layer(
+        3,
+        &[
+            ("d.txt", "d1"),
+            (
+                "shared.txt",
+                "header = \"v1\"\nstep1 = \"done-c-rev2\"\nstep2 = \"done-b-rev2\"\nstep3 = \"done-d\"\n",
+            ),
+        ],
+    );
+    w.sync();
+
+    // Advance trunk, rebase locally, and amend only the bottom layer (Layer A),
+    // matching the LLVM patch stack workflow.
+    w.advance_trunk_and_pull(&[("upstream.txt", "u1")]);
+    w.amend_layer(0, &[("a.txt", "a2")]);
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Updated);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(outcomes[2].action, LayerAction::Skipped);
+    assert_eq!(outcomes[3].action, LayerAction::Skipped);
+
+    // Simulate GitHub returning stale `PullRequest.headRefOid` reads right
+    // after each repair push during `nspr land --all`.
+    *w.forge.async_pr_head_lag.borrow_mut() = 2;
+
+    let landed = w.land_all();
+    assert_eq!(landed.len(), 4);
+    assert!(w.discover().layers.is_empty());
+
+    let subjects: Vec<String> = landed
+        .iter()
+        .map(|l| w.git.message_of(l.squash).unwrap())
+        .map(|m| m.lines().next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        subjects,
+        vec![
+            "Layer A (#101)",
+            "Layer C (#103)",
+            "Layer B (#102)",
+            "Layer D (#104)"
+        ]
+    );
+
+    let files = w.files_of(w.base_oid);
+    for (name, content) in [
+        ("upstream.txt", "u1"),
+        ("a.txt", "a2"),
+        ("c.txt", "c2"),
+        ("b.txt", "b2"),
+        ("d.txt", "d1"),
+        (
+            "shared.txt",
+            "header = \"v1\"\nstep1 = \"done-c-rev2\"\nstep2 = \"done-b-rev2\"\nstep3 = \"done-d\"\n",
+        ),
+    ] {
+        assert!(
+            files.contains(&(name.to_string(), content.to_string())),
+            "{name} missing or wrong on trunk: {files:?}"
+        );
+    }
+}

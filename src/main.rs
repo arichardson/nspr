@@ -726,6 +726,7 @@ impl Session {
     }
 
     async fn land(&mut self, args: LandArgs) -> Result<()> {
+        let mut landed_count = 0usize;
         loop {
             let stack = self.discover()?;
             let index = resolve_land_target(&stack, &args, &self.config.trunk)?;
@@ -734,7 +735,7 @@ impl Session {
                 message: args.message.clone(),
                 keep_local: false,
             };
-            let outcome = land::land_layer(
+            let outcome = match land::land_layer(
                 &self.git,
                 &self.forge,
                 &self.config,
@@ -742,8 +743,18 @@ impl Session {
                 index,
                 &opts,
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    if landed_count > 0 {
+                        let _ = self.refresh_remaining_metadata().await;
+                    }
+                    return Err(e);
+                }
+            };
 
+            landed_count += 1;
             self.trunk_oid = outcome.squash;
 
             for warning in &outcome.warnings {
@@ -757,11 +768,22 @@ impl Session {
                 self.git.short_id(outcome.squash)?
             );
             for repair in &outcome.repaired {
-                println!("  repaired #{}", repair.number);
+                if repair.retargeted {
+                    println!(
+                        "  repaired #{} (retargeted → {})",
+                        repair.number, self.config.trunk
+                    );
+                } else {
+                    println!("  repaired #{}", repair.number);
+                }
             }
 
             if !args.all || args.target_pr().is_some() || args.cherry_pick {
                 self.refresh_remaining_metadata().await?;
+                println!(
+                    "{} ({landed_count} landed)",
+                    style("✓ Done").green().bold()
+                );
                 return Ok(());
             }
             // `land --all` stops at the first layer that is not landable
@@ -772,6 +794,10 @@ impl Session {
                 continue;
             }
             self.refresh_remaining_metadata().await?;
+            println!(
+                "{} ({landed_count} landed)",
+                style("✓ Done").green().bold()
+            );
             return Ok(());
         }
     }

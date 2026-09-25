@@ -51,6 +51,14 @@ pub fn update_root(git: &Git, number: u64, root_oid: Oid) -> Result<()> {
     Ok(())
 }
 
+/// Look up the recorded head commit of a pull request's branch, if recorded.
+pub fn get(git: &Git, number: u64) -> Option<Oid> {
+    git.repo()
+        .find_reference(&ref_name(number))
+        .ok()
+        .and_then(|r| r.target())
+}
+
 /// Look up the initial commit (`c_0`) of a pull request's branch, if recorded.
 pub fn get_root(git: &Git, number: u64) -> Option<Oid> {
     git.repo()

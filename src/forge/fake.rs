@@ -62,6 +62,12 @@ pub struct FakeForge {
     pub diff_observations: RefCell<Vec<(u64, Vec<String>)>>,
     /// `(pr number, draft)` in call order.
     pub draft_toggles: RefCell<Vec<(u64, bool)>>,
+    /// When `> 0`, simulates GitHub's eventual consistency after `git push`:
+    /// updating an existing branch leaves `get_pull_request` returning the
+    /// pre-push `head_oid` for this many reads while `branch_oid` already
+    /// reflects the new commit.
+    pub async_pr_head_lag: RefCell<usize>,
+    stale_pr_heads: RefCell<HashMap<String, (Oid, usize)>>,
 }
 
 impl FakeForge {
@@ -85,6 +91,8 @@ impl FakeForge {
             merge_settings: RefCell::new(RepoMergeSettings::default()),
             diff_observations: RefCell::new(Vec::new()),
             draft_toggles: RefCell::new(Vec::new()),
+            async_pr_head_lag: RefCell::new(0),
+            stale_pr_heads: RefCell::new(HashMap::new()),
         }
     }
 
@@ -292,7 +300,19 @@ impl Forge for FakeForge {
     async fn get_pull_request(&self, number: u64) -> Result<PullRequest> {
         let pr = self.find(number)?;
         let base_oid = self.branch(&pr.base).unwrap_or(Oid::ZERO_SHA1);
-        let head_oid = self.branch(&pr.head).unwrap_or(Oid::ZERO_SHA1);
+        let head_oid = {
+            let mut stale = self.stale_pr_heads.borrow_mut();
+            if let Some((stale_oid, remaining)) = stale.get_mut(&pr.head) {
+                let oid = *stale_oid;
+                *remaining -= 1;
+                if *remaining == 0 {
+                    stale.remove(&pr.head);
+                }
+                oid
+            } else {
+                self.branch(&pr.head).unwrap_or(Oid::ZERO_SHA1)
+            }
+        };
 
         // Derive the merge state from the graph, as GitHub would. Note that
         // GitHub only surfaces BEHIND when the repository requires branches to
@@ -401,11 +421,13 @@ impl Forge for FakeForge {
     }
 
     async fn push(&self, specs: &[PushSpec]) -> Result<()> {
+        let lag = *self.async_pr_head_lag.borrow();
         for spec in specs {
             self.pushes.borrow_mut().push(spec.clone());
             match spec.oid {
                 None => {
                     self.branches.borrow_mut().remove(&spec.branch);
+                    self.stale_pr_heads.borrow_mut().remove(&spec.branch);
                 }
                 Some(new) => {
                     let existing = self.branch(&spec.branch);
@@ -422,6 +444,15 @@ impl Forge for FakeForge {
                             new,
                             old
                         );
+                    }
+                    if let Some(old) = existing
+                        && old != new
+                        && lag > 0
+                        && spec.branch != self.trunk
+                    {
+                        self.stale_pr_heads
+                            .borrow_mut()
+                            .insert(spec.branch.clone(), (old, lag));
                     }
                     self.branches.borrow_mut().insert(spec.branch.clone(), new);
                 }
