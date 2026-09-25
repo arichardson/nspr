@@ -2876,10 +2876,38 @@ fn reattaching_pr_from_main_onto_parent_layer_uses_single_push() {
 
     assert_eq!(
         w.push_count() - pushes_before,
-        2,
-        "re-attaching onto a parent layer should update both layers in a single pass (2 branch refspecs, no second pass)"
+        1,
+        "re-attaching onto an unchanged parent layer should only push the modified child layer in a single pass"
     );
     assert_only_ever_displayed(&w, prs[1], &["b.txt"]);
+    w.assert_invariants();
+}
+
+#[test]
+fn amending_bottom_layer_after_local_trunk_rebase_does_not_restack_upper_layers() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
+    w.sync();
+
+    // Trunk advances and local stack is rebased onto it, then only Layer one is
+    // amended (matching `~/cheri/upstream-llvm-project`).
+    w.advance_trunk_and_pull(&[("upstream.txt", "u1")]);
+    w.amend_layer(0, &[("a.txt", "a2")]);
+
+    let stack = w.discover();
+    let st = block_on(status::status(&w.git, &w.forge, &w.config, &stack)).unwrap();
+    assert_eq!(st.layers[0].state, status::LayerState::Modified);
+    assert_eq!(st.layers[1].state, status::LayerState::Current);
+    assert_eq!(st.layers[2].state, status::LayerState::Current);
+
+    let pushes_before = w.push_count();
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Updated);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(outcomes[2].action, LayerAction::Skipped);
+    assert_eq!(w.push_count() - pushes_before, 1);
     w.assert_invariants();
 }
 

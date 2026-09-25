@@ -321,9 +321,9 @@ impl StackStatus {
                         ),
                         LayerAction::Refreshed => (
                             "◎",
-                            "refreshed",
+                            "restacked",
                             style("◎").cyan().to_string(),
-                            style("refreshed").cyan().to_string(),
+                            style("restacked").cyan().to_string(),
                         ),
                         LayerAction::Skipped => {
                             let g = if layer.draft { "◌" } else { "●" };

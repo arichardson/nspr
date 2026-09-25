@@ -459,7 +459,7 @@ impl Session {
             parts.push(format!("{updated} updated"));
         }
         if refreshed > 0 {
-            parts.push(format!("{refreshed} refreshed"));
+            parts.push(format!("{refreshed} restacked"));
         }
         if retargeted > 0 {
             parts.push(format!("{retargeted} retargeted"));
