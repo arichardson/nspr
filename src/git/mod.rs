@@ -327,3 +327,56 @@ impl Git {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn opens_and_writes_refs_in_reftable_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = Command::new("git")
+            .args([
+                "init",
+                "--ref-format=reftable",
+                "--initial-branch=main",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .expect("failed to run git init");
+        assert!(status.success(), "git init --ref-format=reftable failed");
+
+        let repo = git2::Repository::open(dir.path())
+            .expect("libgit2 should open reftable repository");
+        let git = Git::new(repo);
+
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = git.repo().treebuilder(None).unwrap().write().unwrap();
+        let tree = git.repo().find_tree(tree_id).unwrap();
+        let c1 = git
+            .repo()
+            .commit(Some("HEAD"), &sig, &sig, "Initial commit\n", &tree, &[])
+            .unwrap();
+        let c1_commit = git.repo().find_commit(c1).unwrap();
+        let c2 = git
+            .repo()
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Second commit\n\nPull-Request: #1\n",
+                &tree,
+                &[&c1_commit],
+            )
+            .unwrap();
+
+        assert_eq!(git.head().unwrap(), c2);
+        assert_eq!(git.resolve_reference("refs/heads/main").unwrap(), c2);
+        git.set_reference("refs/nspr/pr-1/head", c2, "test reftable write")
+            .unwrap();
+        assert_eq!(git.resolve_reference("refs/nspr/pr-1/head").unwrap(), c2);
+        assert_eq!(git.commits_since(c1).unwrap(), vec![c2]);
+    }
+}
+
