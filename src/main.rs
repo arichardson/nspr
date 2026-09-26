@@ -215,22 +215,8 @@ struct Session {
 
 impl Session {
     async fn open(remote: &str) -> Result<Self> {
-        let repo = git2::Repository::discover(".").map_err(|e| {
-            // libgit2 cannot read reftable repositories, and recent git
-            // versions create them. The raw message names an "extension",
-            // which tells the user nothing about what to do.
-            if e.message().contains("refstorage") {
-                eyre!(
-                    "this repository stores its refs in the `reftable` \
-                     format, which the git library nspr uses cannot read \
-                     yet.\nConvert it with `git refs migrate \
-                     --ref-format=files`, or clone with `git clone \
-                     --ref-format=files`."
-                )
-            } else {
-                eyre!("cannot open a git repository here: {}", e.message())
-            }
-        })?;
+        let repo = git2::Repository::discover(".")
+            .map_err(|e| eyre!("cannot open a git repository here: {}", e.message()))?;
         let git = Git::new(repo);
 
         // The slug has to come from local config: we need it to build the API

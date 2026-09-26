@@ -16,7 +16,7 @@ color-eyre = "0.6"
 console = "0.16"
 dialoguer = "0.12"
 env_logger = "0.11"
-git2 = { version = "0.21", default-features = false, features = ["https", "ssh"] }
+git2 = { version = "0.21", default-features = false, features = ["https", "ssh", "unstable-sha256"] }
 git2-ext = "2.0"
 indoc = "2.0"
 lazy-regex = "3.4"
@@ -38,3 +38,7 @@ tempfile = "3"
 
 [lints.clippy]
 used-underscore-binding = "deny"
+
+[patch.crates-io]
+libgit2-sys = { path = "vendor/libgit2-sys" }
+
