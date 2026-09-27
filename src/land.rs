@@ -488,6 +488,12 @@ pub async fn land_all(
         };
 
         if !direct_merge_matches {
+            log::debug!(
+                "land_all: #{} (tip {}) does not 3-way merge directly onto trunk {}; checking re-anchored patch",
+                state.number,
+                current_tip,
+                current_trunk
+            );
             // Check whether the PR branch has the exact reviewed patch relative
             // to its pre-land dependency anchor, and only conflicts with
             // `current_trunk` because an earlier layer in this stack modified
@@ -517,6 +523,11 @@ pub async fn land_all(
                 continue;
             }
 
+            log::debug!(
+                "land_all: #{} patch matches local commit; repairing remaining branches onto trunk {}",
+                state.number,
+                current_trunk
+            );
             let last_outcome = outcomes
                 .last_mut()
                 .expect("anchor_tip implies an earlier layer landed");
@@ -538,6 +549,13 @@ pub async fn land_all(
                 get_synced_pull_request(git, forge, state.number, true).await?;
             current_tip = synced_pr.head_oid;
             pr_states.get_mut(&index).unwrap().tip = current_tip;
+        } else {
+            log::debug!(
+                "land_all: #{} (tip {}) 3-way merges directly onto trunk {} without restacking",
+                state.number,
+                current_tip,
+                current_trunk
+            );
         }
 
         // Retarget this layer (if needed) and its direct open dependents to
@@ -891,6 +909,10 @@ async fn get_synced_pull_request(
     {
         if wait_for_pr_sync {
             for delay_ms in [50_u64, 150, 300, 600, 1000, 1500, 2000, 2000] {
+                log::debug!(
+                    "waiting {delay_ms}ms for #{number} headRefOid ({}) to catch up to pushed branch tip ({recorded_oid})",
+                    pr.head_oid
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
                     .await;
                 pr = forge.get_pull_request(number).await?;

@@ -143,6 +143,7 @@ impl GitHubForge {
 #[async_trait(?Send)]
 impl Forge for GitHubForge {
     async fn get_pull_request(&self, number: u64) -> Result<PullRequest> {
+        debug!("API POST /graphql PullRequest(number={number})");
         let body = serde_json::json!({
             "query": PULL_REQUEST_QUERY,
             "variables": {
@@ -162,11 +163,25 @@ impl Forge for GitHubForge {
             )?;
 
         let pr = pull_request_from(pull_request_node(response, number)?)?;
+        debug!(
+            "  -> #{number}: state={:?} base={} ({}) head={} ({}) mergeable={:?} merge_state={:?}",
+            pr.state,
+            pr.base,
+            pr.base_oid,
+            pr.head,
+            pr.head_oid,
+            pr.mergeable,
+            pr.merge_state
+        );
         self.remote.fetch_objects(&[pr.base_oid, pr.head_oid])?;
         Ok(pr)
     }
 
     async fn create_pull_request(&self, req: CreatePr) -> Result<u64> {
+        debug!(
+            "API POST /repos/{}/{}/pulls head={} base={} draft={} title={:?}",
+            self.owner, self.repo, req.head, req.base, req.draft, req.title
+        );
         let pr = self
             .api
             .pulls(&self.owner, &self.repo)
@@ -182,6 +197,7 @@ impl Forge for GitHubForge {
                     req.head, req.base
                 )
             })?;
+        debug!("  -> created PR #{}", pr.number);
         Ok(pr.number)
     }
 
@@ -193,6 +209,15 @@ impl Forge for GitHubForge {
         if update.is_empty() {
             return Ok(());
         }
+        debug!(
+            "API PATCH /repos/{}/{}/pulls/{number} base={:?} state={:?} title_updated={} body_updated={}",
+            self.owner,
+            self.repo,
+            update.base,
+            update.state,
+            update.title.is_some(),
+            update.body.is_some()
+        );
 
         let pulls = self.api.pulls(&self.owner, &self.repo);
         let mut request = pulls.update(number);
@@ -242,9 +267,17 @@ impl Forge for GitHubForge {
         // and can return transient HTTP 405 ("Base branch was modified" /
         // `mergeable == UNKNOWN`) or 409 ("Head branch was modified") for a
         // couple of seconds.
-        let retry_delays_ms = [300_u64, 700, 1200, 2000, 3000];
+        let retry_delays_ms = [300_u64, 700, 1200, 2000, 3000, 4000, 5000];
         let mut attempt = 0;
         let merge = loop {
+            debug!(
+                "API PUT /repos/{}/{}/pulls/{number}/merge (squash, expected_head={}, title={:?}, attempt={})",
+                self.owner,
+                self.repo,
+                req.expected_head,
+                req.title,
+                attempt + 1
+            );
             let result = self
                 .api
                 .pulls(&self.owner, &self.repo)
@@ -264,14 +297,16 @@ impl Forge for GitHubForge {
                         && let Some(&delay_ms) = retry_delays_ms.get(attempt)
                         && let Ok(pr) = self.get_pull_request(number).await
                         && pr.state == PrState::Open
-                        && pr.mergeable != Mergeable::Conflicting
-                        && (pr.mergeable == Mergeable::Unknown
+                        && (pr.head_oid != req.expected_head
+                            || pr.mergeable == Mergeable::Unknown
                             || code == Some(409)
-                            || attempt < 2)
+                            || attempt < 4)
                     {
                         debug!(
-                            "merge #{number} got HTTP {code:?} (mergeable={:?}); retrying in {delay_ms}ms",
-                            pr.mergeable
+                            "merge #{number} got HTTP {code:?} (head_oid={}, mergeable={:?}, merge_state={:?}); retrying in {delay_ms}ms",
+                            pr.head_oid,
+                            pr.mergeable,
+                            pr.merge_state
                         );
                         attempt += 1;
                         tokio::time::sleep(std::time::Duration::from_millis(
@@ -313,6 +348,7 @@ impl Forge for GitHubForge {
                  `nspr sync`."
             )
         })?;
+        debug!("  -> merged #{number} as squash commit {sha}");
         Oid::from_str(&sha).map_err(Error::from)
     }
 
@@ -324,6 +360,7 @@ impl Forge for GitHubForge {
             "/repos/{}/{}/branches/{branch}/protection",
             self.owner, self.repo
         );
+        debug!("API GET {route}");
         match self
             .api
             .get::<ProtectionResponse, _, _>(route, None::<&()>)
@@ -352,6 +389,7 @@ impl Forge for GitHubForge {
     }
 
     async fn branch_oid(&self, branch: &str) -> Result<Option<Oid>> {
+        debug!("API POST /graphql Ref(refs/heads/{branch})");
         let body = serde_json::json!({
             "query": BRANCH_OID_QUERY,
             "variables": {
@@ -371,13 +409,16 @@ impl Forge for GitHubForge {
             .and_then(|g| g.target)
             .map(|t| t.oid)
         else {
+            debug!("  -> branch {branch} not found");
             return Ok(None);
         };
+        debug!("  -> branch {branch} = {oid_str}");
         Ok(Some(Oid::from_str(&oid_str)?))
     }
 
     async fn push(&self, specs: &[PushSpec]) -> Result<()> {
         let refspecs: Vec<String> = specs.iter().map(refspec).collect();
+        debug!("git push refspecs={refspecs:?}");
         let has_metadata =
             specs.iter().any(|s| s.label.is_some() || s.context.is_some());
         let custom_desc = if has_metadata {
