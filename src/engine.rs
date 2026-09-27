@@ -487,13 +487,16 @@ pub fn decide(
                     trees.dep[i],
                     trees.effective[i],
                 )?;
-                needs_conflict_refresh = would_conflict_or_diverge_on_forge(
-                    git,
-                    base_tip,
-                    pr.head_oid,
-                    trees.dep[i],
-                    trees.effective[i],
-                )?;
+                if !matches!(stack.layers[i].dep, Dep::Layer(..)) {
+                    needs_conflict_refresh =
+                        would_conflict_or_diverge_on_forge(
+                            git,
+                            base_tip,
+                            pr.head_oid,
+                            trees.dep[i],
+                            trees.effective[i],
+                        )?;
+                }
                 shown != desired
             }
         };
@@ -600,14 +603,47 @@ pub fn decide(
             continue;
         }
         let Some(pr_i) = &prs[i] else {
-            resulting_branch_tree.push(trees.effective[i]);
+            let new_pr_tree = match stack.layers[i].dep {
+                Dep::Layer(j) => rebase_tree_onto_tree(
+                    git,
+                    trees.dep[i],
+                    resulting_branch_tree[j],
+                    trees.effective[i],
+                )?
+                .unwrap_or(trees.effective[i]),
+                _ => trees.effective[i],
+            };
+            resulting_branch_tree.push(new_pr_tree);
             continue;
         };
-        if let Dep::Layer(j) = stack.layers[i].dep
-            && rewrite_history[j]
-        {
-            rewrite_history[i] = true;
-            push[i] = true;
+        if let Dep::Layer(j) = stack.layers[i].dep {
+            if rewrite_history[j] {
+                rewrite_history[i] = true;
+                push[i] = true;
+            } else if !push[i]
+                && let Some(pr_j) = &prs[j]
+                && git.tree_of(pr_j.head_oid)? != resulting_branch_tree[j]
+            {
+                let desired_on_j = rebase_tree_onto_tree(
+                    git,
+                    trees.dep[i],
+                    resulting_branch_tree[j],
+                    trees.effective[i],
+                )?;
+                let conflicts_with_j = match desired_on_j {
+                    Some(desired) => would_conflict_or_diverge_on_forge(
+                        git,
+                        pr_j.head_oid,
+                        pr_i.head_oid,
+                        resulting_branch_tree[j],
+                        desired,
+                    )?,
+                    None => true,
+                };
+                if conflicts_with_j {
+                    push[i] = true;
+                }
+            }
         }
         let base_moved = match stack.layers[i].dep {
             Dep::Main | Dep::ExternalPr(_) => match current_anchor[i] {

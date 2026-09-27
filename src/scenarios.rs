@@ -3470,3 +3470,134 @@ fn land_all_batches_repair_once_when_lower_layer_fast_forwarded() {
     assert_eq!(landed[0].repaired.len(), 4);
     assert!(landed[1..].iter().all(|o| o.repaired.is_empty()));
 }
+
+#[test]
+fn adding_new_layer_after_lower_layer_fast_forwards_does_not_force_push_or_leak_diff()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+
+    let pushes_before = w.push_count();
+
+    w.amend_layer(0, &[("a.txt", "a2")]);
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Updated);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
+
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
+    w.add_layer("Layer four", &[("d.txt", "d1")]);
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Skipped);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(outcomes[2].action, LayerAction::Created);
+    assert_eq!(outcomes[3].action, LayerAction::Created);
+    w.assert_invariants();
+
+    let all_pushes: Vec<_> = w
+        .forge
+        .pushes
+        .borrow()
+        .iter()
+        .skip(pushes_before)
+        .cloned()
+        .collect();
+    assert_eq!(all_pushes.len(), 3);
+    assert!(
+        all_pushes.iter().all(|p| !p.force),
+        "expected only fast-forward pushes (zero force-pushes), got: {all_pushes:?}"
+    );
+}
+
+#[test]
+fn editing_upper_layer_message_after_lower_layer_fast_forwards_only_rewrites_that_layer()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
+    w.sync();
+
+    w.amend_layer(0, &[("a.txt", "a2")]);
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Updated);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(outcomes[2].action, LayerAction::Skipped);
+
+    let pushes_before = w.push_count();
+
+    w.layers[2].message.body = "New description for layer three.".to_string();
+    w.rebuild();
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Skipped);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(outcomes[2].action, LayerAction::Updated);
+    w.assert_invariants();
+
+    let forced_branches: Vec<String> = w
+        .forge
+        .pushes
+        .borrow()
+        .iter()
+        .skip(pushes_before)
+        .filter(|p| p.force)
+        .map(|p| p.branch.clone())
+        .collect();
+    assert_eq!(
+        forced_branches,
+        vec!["users/tester/layer-three".to_string()],
+        "only layer-three should be force-pushed when its commit message changes"
+    );
+}
+
+#[test]
+fn lower_layer_amend_does_not_refresh_indirect_upper_layer_when_middle_layer_skipped()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer(
+        "Layer one",
+        &[(
+            "shared.txt",
+            "line1-v1\nctx2\nctx3\nctx4\nctx5\nctx6\nline7-v1\n",
+        )],
+    );
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.add_layer(
+        "Layer three",
+        &[(
+            "shared.txt",
+            "line1-v1\nctx2\nctx3\nctx4\nctx5\nctx6\nline7-by-three\n",
+        )],
+    );
+    w.sync();
+
+    let pushes_before = w.push_count();
+
+    w.layers[0].changes = vec![(
+        "shared.txt".into(),
+        "line1-v2\nctx2\nctx3\nctx4\nctx5\nctx6\nline7-v1\n".into(),
+    )];
+    w.layers[2].changes = vec![(
+        "shared.txt".into(),
+        "line1-v2\nctx2\nctx3\nctx4\nctx5\nctx6\nline7-by-three\n".into(),
+    )];
+    w.rebuild();
+
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Updated);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(outcomes[2].action, LayerAction::Skipped);
+    w.assert_invariants();
+
+    let all_pushes: Vec<_> = w
+        .forge
+        .pushes
+        .borrow()
+        .iter()
+        .skip(pushes_before)
+        .cloned()
+        .collect();
+    assert_eq!(all_pushes.len(), 1);
+    assert!(!all_pushes[0].force);
+}
