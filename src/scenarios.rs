@@ -865,37 +865,31 @@ fn behind_layers_refresh_only_when_the_repo_requires_up_to_date_branches() {
 // Pushing a layer drags its stale dependencies along with it
 // ---------------------------------------------------------------------------
 
-/// The patch-id gate says "only push layers whose patch changed", but that is
-/// not quite sufficient. Pushing layer `i` appends a commit whose second parent
-/// is the dependency's remote tip, so GitHub renders
-/// `diff(tree(dep_tip), effective(i))`. If `dep_tip` is stale, the dependency's
-/// un-pushed changes leak into layer `i`'s diff.
+/// When layers one and three change independent files (`a.txt` and `c.txt`) and
+/// layer two does not change, layer three's patch can be rebased directly onto
+/// its existing anchor on layer two without restacking layer two (and without
+/// leaking `a.txt` into layer three's diff).
 ///
-/// Here layers one and three change and layer two does not. Layer two must be
-/// restacked anyway — but as a `Refreshed`, with no prompt, because its own
-/// patch is untouched.
+/// However, if layer three's new patch depends on layer one's new content,
+/// layer two's old tree no longer has the context layer three needs, so layer
+/// two must be `Refreshed` first.
 #[test]
 fn pushing_a_layer_restacks_its_stale_dependencies() {
     let mut w = World::new(&[("root.txt", "root")]);
-    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer one", &[("a.txt", "a1\nkeep\n")]);
     w.add_layer("Layer two", &[("b.txt", "b1")]);
     w.add_layer("Layer three", &[("c.txt", "c1")]);
     w.sync();
 
-    w.amend_layer(0, &[("a.txt", "a2")]);
+    // Independent changes in layer one and layer three: layer two is Skipped
+    // and neither layer needs a force-push.
+    w.amend_layer(0, &[("a.txt", "a2\nkeep\n")]);
     w.amend_layer(2, &[("c.txt", "c2")]);
     let outcomes = w.sync();
 
     assert_eq!(outcomes[0].action, LayerAction::Updated);
-    assert_eq!(
-        outcomes[1].action,
-        LayerAction::Refreshed,
-        "layer two's own patch is unchanged, but layer three cannot be \
-         pushed correctly until layer two carries layer one's new content"
-    );
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
     assert_eq!(outcomes[2].action, LayerAction::Updated);
-
-    // Without the restack, layer three's diff would also show `a.txt`.
     w.assert_invariants();
 
     let repo = w.t.open();
@@ -909,6 +903,24 @@ fn pushing_a_layer_restacks_its_stale_dependencies() {
         !text.contains("a.txt"),
         "layer one's change leaked into layer three's diff:\n{text}"
     );
+
+    // Dependent change in layer three that builds on layer one's new `a2` line:
+    // layer three's patch cannot apply to layer two's old `a1` tree, so layer
+    // two is automatically Refreshed.
+    w.amend_layer(
+        2,
+        &[("a.txt", "a2-modified-by-three\nkeep\n"), ("c.txt", "c2")],
+    );
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Skipped);
+    assert_eq!(
+        outcomes[1].action,
+        LayerAction::Refreshed,
+        "layer two's own patch is unchanged, but layer three cannot be \
+         pushed until layer two carries layer one's new content"
+    );
+    assert_eq!(outcomes[2].action, LayerAction::Updated);
+    w.assert_invariants();
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,17 +1304,16 @@ fn status_reports_what_diff_would_do() {
         vec![true, false, false]
     );
 
-    // Amend the bottom and the top. Status must agree with the engine,
-    // including the restack of the middle layer that the patch-id gate alone
-    // would not predict.
-    w.amend_layer(0, &[("a.txt", "a2")]);
+    // Amend the bottom and the top on independent files: the middle layer
+    // remains Current and is Skipped on sync.
+    w.amend_layer(0, &[("a.txt", "a2\nkeep\n")]);
     w.amend_layer(2, &[("c.txt", "c2")]);
     let s = w.status();
     assert_eq!(
         s.layers.iter().map(|l| l.state.clone()).collect::<Vec<_>>(),
         vec![
             status::LayerState::Modified,
-            status::LayerState::NeedsRestack,
+            status::LayerState::Current,
             status::LayerState::Modified,
         ]
     );
@@ -1315,6 +1326,24 @@ fn status_reports_what_diff_would_do() {
     // And it agrees with what the sync then actually does.
     let outcomes = w.sync();
     assert_eq!(outcomes[0].action, LayerAction::Updated);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(outcomes[2].action, LayerAction::Updated);
+
+    // Now amend the top layer to build on layer one's new `a2` line so the
+    // middle layer's old `a1` tree cannot serve as the base: status predicts
+    // NeedsRestack for the middle layer, matching sync's Refreshed.
+    w.amend_layer(2, &[("a.txt", "a2-top\nkeep\n"), ("c.txt", "c2")]);
+    let s = w.status();
+    assert_eq!(
+        s.layers.iter().map(|l| l.state.clone()).collect::<Vec<_>>(),
+        vec![
+            status::LayerState::Current,
+            status::LayerState::NeedsRestack,
+            status::LayerState::Modified,
+        ]
+    );
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Skipped);
     assert_eq!(outcomes[1].action, LayerAction::Refreshed);
     assert_eq!(outcomes[2].action, LayerAction::Updated);
 }
@@ -2664,13 +2693,33 @@ fn linear_revisions_retained_across_amends_and_restacks() {
     assert_eq!(outcomes[1].action, LayerAction::Skipped);
     assert_eq!(outcomes[2].action, LayerAction::Skipped);
 
-    // Now amend layer two again (`b3`): layer two replays `[b1, b2]` onto layer one's
-    // new tip and appends `b3` (giving 3 linear commits), and cascades re-anchoring
-    // to layer three so every PR branch in the stack remains 1-parent linear.
+    // Now amend layer two again (`b3`): because `a.txt` and `b.txt` do not
+    // conflict, layer two stays anchored on layer one's initial commit and
+    // appends `b3` as a 3rd fast-forward commit without force-pushing layer two
+    // or cascading a restack to layer three.
+    let pushes_before = w.push_count();
     w.amend_layer(1, &[("b.txt", "b3")]);
     let outcomes = w.sync();
     assert_eq!(outcomes[0].action, LayerAction::Skipped);
     assert_eq!(outcomes[1].action, LayerAction::Updated);
+    assert_eq!(outcomes[2].action, LayerAction::Skipped);
+    w.assert_invariants();
+    assert!(
+        w.forge.pushes.borrow()[pushes_before..]
+            .iter()
+            .all(|p| !p.force),
+        "amending layer two must fast-forward without force-pushing"
+    );
+
+    // When a restack onto layer one's new tip is requested, layer two replays
+    // all 3 linear revisions (`[b1, b2, b3]`) onto layer one's new tip and
+    // cascades re-anchoring to layer three.
+    let outcomes = w.sync_with(SyncOptions {
+        refresh_when_behind: true,
+        ..Default::default()
+    });
+    assert_eq!(outcomes[0].action, LayerAction::Skipped);
+    assert_eq!(outcomes[1].action, LayerAction::Refreshed);
     assert_eq!(outcomes[2].action, LayerAction::Refreshed);
     w.assert_invariants();
 
@@ -3320,4 +3369,104 @@ fn land_all_merges_ready_prefix_without_force_push_and_repairs_remaining_once_at
         prs[1]
     );
     assert_eq!(w.discover().layers.len(), 2);
+}
+
+#[test]
+fn amending_upper_layer_after_lower_layer_fast_forwards_does_not_force_push_stack()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
+    w.add_layer("Layer four", &[("d.txt", "d1")]);
+    w.add_layer("Layer five", &[("e.txt", "e1")]);
+    w.sync();
+
+    let pushes_before = w.push_count();
+
+    // Amend layer one (fast-forward commit on layer one; layers 2..5 skipped).
+    w.amend_layer(0, &[("a.txt", "a2")]);
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Updated);
+    assert!(
+        outcomes[1..]
+            .iter()
+            .all(|o| o.action == LayerAction::Skipped)
+    );
+
+    // Amend layer four: only layer four should push a fast-forward commit;
+    // layers two, three, and five must remain untouched with zero force-pushes.
+    w.amend_layer(3, &[("d.txt", "d2")]);
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Skipped);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(outcomes[2].action, LayerAction::Skipped);
+    assert_eq!(outcomes[3].action, LayerAction::Updated);
+    assert_eq!(outcomes[4].action, LayerAction::Skipped);
+
+    // Amend layer five: only layer five should push a fast-forward commit;
+    // layers one through four must remain untouched with zero force-pushes.
+    w.amend_layer(4, &[("e.txt", "e2")]);
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Skipped);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(outcomes[2].action, LayerAction::Skipped);
+    assert_eq!(outcomes[3].action, LayerAction::Skipped);
+    assert_eq!(outcomes[4].action, LayerAction::Updated);
+
+    w.assert_invariants();
+
+    let all_pushes: Vec<_> = w
+        .forge
+        .pushes
+        .borrow()
+        .iter()
+        .skip(pushes_before)
+        .cloned()
+        .collect();
+    assert_eq!(all_pushes.len(), 3);
+    assert!(
+        all_pushes.iter().all(|p| !p.force),
+        "expected 3 fast-forward pushes and zero force-pushes, got: {all_pushes:?}"
+    );
+}
+
+#[test]
+fn land_all_batches_repair_once_when_lower_layer_fast_forwarded() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer(
+        "Layer one",
+        &[("a.txt", "a1"), ("shared.txt", "line1-v1\nline2-v1\n")],
+    );
+    w.add_layer("Layer two", &[("shared.txt", "line1-v1\nline2-by-two\n")]);
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
+    w.add_layer("Layer four", &[("d.txt", "d1")]);
+    w.add_layer("Layer five", &[("e.txt", "e1")]);
+    w.sync();
+
+    // Advance trunk, rebase locally, and amend Layer one on `a.txt`. Layer one
+    // fast-forwards onto its old anchor (keeping all 5 PR branches rooted at
+    // the pre-advance trunk commit), while Layers 2..5 are Skipped.
+    w.advance_trunk_and_pull(&[("upstream.txt", "u1")]);
+    w.amend_layer(
+        0,
+        &[("a.txt", "a2"), ("shared.txt", "line1-v1\nline2-v1\n")],
+    );
+    let outcomes = w.sync();
+    assert_eq!(outcomes[0].action, LayerAction::Updated);
+    assert!(
+        outcomes[1..]
+            .iter()
+            .all(|o| o.action == LayerAction::Skipped)
+    );
+
+    let landed = w.land_all();
+    assert_eq!(landed.len(), 5);
+    assert!(w.discover().layers.is_empty());
+
+    // Layer one landed directly; Layers 2..5 were repaired once in a single
+    // batch onto Layer one's squash commit, after which Layers 2..5 all merged
+    // directly with zero further repairs.
+    assert_eq!(landed[0].repaired.len(), 4);
+    assert!(landed[1..].iter().all(|o| o.repaired.is_empty()));
 }
