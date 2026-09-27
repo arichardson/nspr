@@ -168,12 +168,13 @@ impl LandArgs {
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn"),
-    )
-    .init();
-
     let cli = Cli::parse();
+    let default_filter = if cli.verbose { "nspr=debug,warn" } else { "warn" };
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(default_filter),
+    )
+    .format_timestamp_millis()
+    .init();
 
     // `Forge` is `?Send` — the test fake holds `RefCell`s — so everything runs
     // on one thread inside a `LocalSet`.

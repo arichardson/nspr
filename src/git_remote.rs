@@ -257,17 +257,30 @@ impl GitRemote {
             let noun = if count == 1 { "branch" } else { "branches" };
             format!("push: {count} {noun}")
         };
+        let deleted_refs: std::collections::HashSet<String> = refspecs
+            .iter()
+            .filter_map(|s| s.strip_prefix(':').map(str::to_owned))
+            .collect();
         self.with_remote(Direction::Push, &desc, |remote, mut callbacks| {
-            callbacks.push_update_reference(|reference, status| match status {
-                Some(status) => {
-                    warn!("{reference} rejected: {status}");
-                    Err(git2::Error::from_str(&format!(
-                        "{reference} rejected: {status}"
-                    )))
-                }
-                None => {
-                    trace!("pushed {reference}");
-                    Ok(())
+            callbacks.push_update_reference(move |reference, status| {
+                match status {
+                    Some(status) if deleted_refs.contains(reference) => {
+                        log::debug!(
+                            "delete of {reference} reported `{status}` (already deleted by remote; ignoring)"
+                        );
+                        Ok(())
+                    }
+                    Some(status) => {
+                        warn!("{reference} rejected: {status}");
+                        Err(git2::Error::from_str(&format!(
+                            "{reference} rejected: {status}"
+                        )))
+                    }
+                    None => {
+                        log::debug!("  -> pushed {reference}: ok");
+                        trace!("pushed {reference}");
+                        Ok(())
+                    }
                 }
             });
             let mut options = PushOptions::new();
