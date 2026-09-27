@@ -64,6 +64,7 @@ pub struct LayerStatus {
     pub conflicting: bool,
     pub behind: bool,
     pub message_differs: bool,
+    pub github_message_edited: bool,
     /// Ready to land: depends on nothing but the trunk.
     pub landable: bool,
     /// The layer this one is stacked on, if any.
@@ -126,9 +127,9 @@ pub fn from_parts(
             }
         };
 
-        let message_differs = prs[i]
-            .as_ref()
-            .is_some_and(|p| engine::pr_message_differs_from(p, &layer.message));
+        let message_differs = prs[i].as_ref().is_some_and(|p| {
+            engine::pr_message_differs_from(p, &layer.message)
+        });
 
         let state = match &prs[i] {
             None => LayerState::New,
@@ -144,10 +145,10 @@ pub fn from_parts(
                 }
                 PrState::Open
                     if decision.patch_changed[i]
-                        || (decision.message_changed[i]
+                        || ((decision.message_changed[i]
+                            || message_differs)
                             && (!decision.github_message_edited[i]
-                                || update_message))
-                        || (update_message && message_differs) =>
+                                || update_message)) =>
                 {
                     LayerState::Modified
                 }
@@ -175,6 +176,7 @@ pub fn from_parts(
                 .as_ref()
                 .is_some_and(|p| p.merge_state == MergeState::Behind),
             message_differs,
+            github_message_edited: decision.github_message_edited[i],
             landable: layer.dep == Dep::Main && layer.pr.is_some(),
             dep: layer.dep,
         });
@@ -280,7 +282,9 @@ impl StackStatus {
         use_color: bool,
         term_width: Option<usize>,
     ) -> String {
-        use console::{Alignment, measure_text_width, pad_str, style, truncate_str};
+        use console::{
+            Alignment, measure_text_width, pad_str, style, truncate_str,
+        };
         use engine::LayerAction;
 
         struct RowData<'a> {
@@ -361,8 +365,12 @@ impl StackStatus {
                         }
                         LayerState::Current => style(raw).green().to_string(),
                         LayerState::Modified => style(raw).yellow().to_string(),
-                        LayerState::NeedsRestack => style(raw).cyan().to_string(),
-                        LayerState::New => style(raw).green().bold().to_string(),
+                        LayerState::NeedsRestack => {
+                            style(raw).cyan().to_string()
+                        }
+                        LayerState::New => {
+                            style(raw).green().bold().to_string()
+                        }
                         LayerState::Merged => style(raw).magenta().to_string(),
                         LayerState::Closed => style(raw).red().to_string(),
                         LayerState::LegacySpr => {
@@ -374,7 +382,9 @@ impl StackStatus {
                         LayerState::Modified => {
                             style(sp).yellow().bold().to_string()
                         }
-                        LayerState::NeedsRestack => style(sp).cyan().to_string(),
+                        LayerState::NeedsRestack => {
+                            style(sp).cyan().to_string()
+                        }
                         LayerState::New => style(sp).green().bold().to_string(),
                         LayerState::Merged => style(sp).magenta().to_string(),
                         LayerState::Closed => style(sp).red().to_string(),
@@ -436,7 +446,10 @@ impl StackStatus {
                 } else {
                     t
                 });
-            } else if layer.base.as_ref().is_some_and(|b| b != &layer.wanted_base)
+            } else if layer
+                .base
+                .as_ref()
+                .is_some_and(|b| b != &layer.wanted_base)
             {
                 let t = format!("retarget {arrow} {}", layer.wanted_base_label);
                 badges.push(if use_color {
@@ -453,7 +466,7 @@ impl StackStatus {
                 });
             }
             if layer.message_differs {
-                if update_message {
+                if update_message || !layer.github_message_edited {
                     badges.push(if use_color {
                         style("update message").cyan().to_string()
                     } else {
@@ -544,13 +557,17 @@ impl StackStatus {
                 );
                 (
                     format!("  {padded_badges}"),
-                    2 + 1 + 2 + num_width + 2 + state_width + 2 + max_badges_width + 2,
+                    2 + 1
+                        + 2
+                        + num_width
+                        + 2
+                        + state_width
+                        + 2
+                        + max_badges_width
+                        + 2,
                 )
             } else {
-                (
-                    String::new(),
-                    2 + 1 + 2 + num_width + 2 + state_width + 2,
-                )
+                (String::new(), 2 + 1 + 2 + num_width + 2 + state_width + 2)
             };
 
             let subject = if let Some(cols) = term_width
@@ -617,6 +634,7 @@ mod tests {
                     conflicting: false,
                     behind: false,
                     message_differs: false,
+                    github_message_edited: false,
                     landable: true,
                     dep: Dep::Main,
                 },
@@ -635,6 +653,7 @@ mod tests {
                     conflicting: false,
                     behind: false,
                     message_differs: false,
+                    github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(0),
                 },
@@ -653,6 +672,7 @@ mod tests {
                     conflicting: false,
                     behind: false,
                     message_differs: false,
+                    github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(1),
                 },

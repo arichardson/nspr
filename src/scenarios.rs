@@ -317,7 +317,7 @@ impl World {
             &self.config,
             &stack,
             &prs,
-            &decision.push,
+            &decision,
             false,
         ))
         .unwrap()
@@ -2233,17 +2233,7 @@ fn non_squash_only_repo_auto_falls_back_to_single_commit_force_push() {
         "Auto fallback must keep PR branch as a single commit across amends"
     );
 
-    let stack = w.discover();
-    let prs = block_on(crate::engine::gather(&w.forge, &stack)).unwrap();
-    let g = block_on(guardrails::probe(
-        &w.forge,
-        &w.config,
-        &stack,
-        &prs,
-        &[false],
-        false,
-    ))
-    .unwrap();
+    let g = w.guardrails();
     assert!(
         g.warnings
             .iter()
@@ -2255,15 +2245,7 @@ fn non_squash_only_repo_auto_falls_back_to_single_commit_force_push() {
     // 2. Setting `PreserveCommitHistory::False` silences the warning.
     w.config.preserve_commit_history =
         crate::config::PreserveCommitHistory::False;
-    let g_false = block_on(guardrails::probe(
-        &w.forge,
-        &w.config,
-        &stack,
-        &prs,
-        &[false],
-        false,
-    ))
-    .unwrap();
+    let g_false = w.guardrails();
     assert!(
         g_false.warnings.is_empty(),
         "expected no warnings when preserveCommitHistory = false, got: {:?}",
@@ -3599,4 +3581,112 @@ fn lower_layer_amend_does_not_refresh_indirect_upper_layer_when_middle_layer_ski
         .collect();
     assert_eq!(all_pushes.len(), 1);
     assert!(!all_pushes[0].force);
+}
+
+#[test]
+fn pr_description_retains_non_internal_trailers_and_strips_only_nspr_trailers()
+{
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer(
+        "Layer one\n\nDetailed explanation.\n\nFixes: https://github.com/llvm/llvm-project/issues/12345\nSigned-off-by: Tester <tester@example.com>",
+        &[("a.txt", "a1")],
+    );
+    w.add_layer("Layer two\n\nFixes: #99999", &[("b.txt", "b1")]);
+    w.sync();
+
+    let prs = w.pr_numbers();
+    let pr1 = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    let pr2 = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    let body1 = crate::pr_body::strip_warning(&pr1.body);
+    let body2 = crate::pr_body::strip_warning(&pr2.body);
+
+    assert_eq!(
+        body1.trim(),
+        "Detailed explanation.\n\nFixes: https://github.com/llvm/llvm-project/issues/12345\nSigned-off-by: Tester <tester@example.com>"
+    );
+    assert!(!body1.contains("Pull-Request:"));
+    assert!(!body1.contains("Depends-On:"));
+
+    assert_eq!(body2.trim(), "Fixes: #99999");
+    assert!(!body2.contains("Pull-Request:"));
+    assert!(!body2.contains("Depends-On:"));
+
+    // `amend` sees no diff when nothing changed on GitHub.
+    assert!(w.amend().is_empty());
+
+    // Editing the title/prose on GitHub and running `amend` preserves the
+    // trailers without duplicating them, and subsequent `sync` is a no-op.
+    w.forge.edit_in_ui(
+        prs[0],
+        "Layer one renamed",
+        "Updated explanation.\n\nFixes: https://github.com/llvm/llvm-project/issues/12345\nSigned-off-by: Tester <tester@example.com>",
+    );
+    let amended = w.amend();
+    assert_eq!(amended.len(), 1);
+    let stack = w.discover();
+    assert_eq!(stack.layers[0].subject(), "Layer one renamed");
+    assert_eq!(stack.layers[0].message.body, "Updated explanation.");
+    assert_eq!(
+        stack.layers[0].message.get("Fixes"),
+        Some("https://github.com/llvm/llvm-project/issues/12345")
+    );
+    assert_eq!(
+        stack.layers[0].message.get("Signed-off-by"),
+        Some("Tester <tester@example.com>")
+    );
+    assert_eq!(stack.layers[0].pr, Some(prs[0]));
+}
+
+#[test]
+fn sync_restores_dropped_fixes_trailer_on_github_without_pushing_any_branches()
+{
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer(
+        "Layer two\n\nSome explanation.\n\nFixes: https://github.com/llvm/llvm-project/issues/226752",
+        &[("b.txt", "b1")],
+    );
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Simulate a PR whose description on GitHub was created by an older `nspr`
+    // build that stripped the `Fixes:` trailer (so `pr.body` has only the
+    // prose body while the branch commit already has the full `clean_for_branch()`
+    // message including `Fixes:`).
+    w.forge.edit_in_ui(prs[1], "Layer two", "Some explanation.");
+
+    // `guardrails` must NOT emit a warning telling the user to pass
+    // `--update-message` or run `nspr amend`.
+    assert!(
+        w.guardrails()
+            .warnings
+            .iter()
+            .all(|msg| !msg.contains("differs from the pull request")),
+        "unexpected guardrails warnings: {:?}",
+        w.guardrails().warnings
+    );
+
+    // Running plain `nspr diff` (`w.sync()`) must update ONLY the GitHub PR
+    // description and push zero git branches.
+    let pushes_before = w.push_count();
+    let outcomes = w.sync();
+    assert_eq!(
+        w.push_count(),
+        pushes_before,
+        "no git branches should be pushed when only the GitHub PR description needs the Fixes trailer restored"
+    );
+    assert_eq!(outcomes[0].action, LayerAction::Skipped);
+    assert_eq!(outcomes[1].action, LayerAction::Updated);
+
+    let pr2 = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    let body2 = crate::pr_body::strip_warning(&pr2.body);
+    assert_eq!(
+        body2.trim(),
+        "Some explanation.\n\nFixes: https://github.com/llvm/llvm-project/issues/226752"
+    );
+
+    // Subsequent `sync` is a complete no-op.
+    let outcomes = w.sync();
+    assert!(outcomes.iter().all(|o| o.action == LayerAction::Skipped));
+    assert_eq!(w.push_count(), pushes_before);
 }

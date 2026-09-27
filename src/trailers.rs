@@ -210,6 +210,64 @@ impl CommitMessage {
         copy.remove(PULL_REQUEST);
         copy.render()
     }
+
+    /// Render the pull request description body, stripping only internal `nspr`
+    /// trailers (`Depends-On`, `Pull-Request`, `Pull Request`) while preserving
+    /// the prose body and all user trailers (`Fixes:`, `Signed-off-by:`, etc.).
+    pub fn clean_body_for_pr(&self) -> String {
+        let mut out = String::new();
+        if !self.body.trim().is_empty() {
+            out.push_str(self.body.trim());
+        }
+        let kept_trailers: Vec<_> = self
+            .trailers
+            .iter()
+            .filter(|(k, _)| {
+                !matches_trailer_key(k, DEPENDS_ON)
+                    && !matches_trailer_key(k, PULL_REQUEST)
+            })
+            .collect();
+        if !kept_trailers.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            for (i, (token, value)) in kept_trailers.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                let _ = write!(out, "{token}: {value}");
+            }
+        }
+        out
+    }
+
+    /// Update the subject, prose body, and non-internal trailers from a pull
+    /// request's title and description while preserving internal `nspr`
+    /// trailers (`Pull-Request`, `Depends-On`).
+    pub fn update_from_pr(&mut self, title: &str, pr_body: &str) {
+        let internal_trailers: Vec<(String, String)> = self
+            .trailers
+            .iter()
+            .filter(|(k, _)| {
+                matches_trailer_key(k, PULL_REQUEST)
+                    || matches_trailer_key(k, DEPENDS_ON)
+            })
+            .cloned()
+            .collect();
+        let parsed =
+            Self::parse(&format!("{}\n\n{}", title.trim(), pr_body.trim()));
+        self.subject = parsed.subject;
+        self.body = parsed.body;
+        self.trailers = parsed
+            .trailers
+            .into_iter()
+            .filter(|(k, _)| {
+                !matches_trailer_key(k, PULL_REQUEST)
+                    && !matches_trailer_key(k, DEPENDS_ON)
+            })
+            .chain(internal_trailers)
+            .collect();
+    }
 }
 
 #[cfg(test)]
@@ -352,5 +410,40 @@ mod tests {
             CommitMessage::parse("S\n\nB\n\nPull-Request: x\n  continued\n");
         assert_eq!(m.trailers.len(), 1);
         assert_eq!(m.get(PULL_REQUEST), Some("x\n  continued"));
+    }
+
+    #[test]
+    fn clean_body_for_pr_keeps_user_trailers_and_strips_internal() {
+        let m = CommitMessage::parse(
+            "Subject\n\nSome prose.\n\nFixes: #12345\nSigned-off-by: A <a@b>\nPull-Request: https://x/1\nDepends-On: #100\n",
+        );
+        assert_eq!(
+            m.clean_body_for_pr(),
+            "Some prose.\n\nFixes: #12345\nSigned-off-by: A <a@b>"
+        );
+
+        let no_prose = CommitMessage::parse(
+            "Subject\n\nFixes: https://github.com/llvm/llvm-project/issues/123\nPull-Request: https://x/1\n",
+        );
+        assert_eq!(
+            no_prose.clean_body_for_pr(),
+            "Fixes: https://github.com/llvm/llvm-project/issues/123"
+        );
+    }
+
+    #[test]
+    fn update_from_pr_preserves_internal_trailers_without_duplicating_user_trailers()
+     {
+        let mut m = CommitMessage::parse(
+            "Old subject\n\nOld prose.\n\nFixes: #12345\nPull-Request: https://x/1\nDepends-On: #100\n",
+        );
+        m.update_from_pr("New subject", "New prose.\n\nFixes: #12345");
+        assert_eq!(m.subject, "New subject");
+        assert_eq!(m.body, "New prose.");
+        assert_eq!(m.get("Fixes"), Some("#12345"));
+        assert_eq!(m.get(PULL_REQUEST), Some("https://x/1"));
+        assert_eq!(m.get(DEPENDS_ON), Some("#100"));
+        assert_eq!(m.trailers.len(), 3);
+        assert_eq!(m.clean_body_for_pr(), "New prose.\n\nFixes: #12345");
     }
 }

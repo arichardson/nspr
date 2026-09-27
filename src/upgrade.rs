@@ -242,7 +242,7 @@ pub async fn upgrade_stack(
         let base_branch = base_branches[i].clone();
         let subject = stack.layers[i].subject().to_string();
         let body = crate::pr_body::splice_warning(
-            &stack.layers[i].message.body,
+            &stack.layers[i].message.clean_body_for_pr(),
             warn_merge_strategy,
         );
         let old_base = pr.base.clone();

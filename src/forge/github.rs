@@ -304,9 +304,7 @@ impl Forge for GitHubForge {
                     {
                         debug!(
                             "merge #{number} got HTTP {code:?} (head_oid={}, mergeable={:?}, merge_state={:?}); retrying in {delay_ms}ms",
-                            pr.head_oid,
-                            pr.mergeable,
-                            pr.merge_state
+                            pr.head_oid, pr.mergeable, pr.merge_state
                         );
                         attempt += 1;
                         tokio::time::sleep(std::time::Duration::from_millis(
@@ -419,8 +417,9 @@ impl Forge for GitHubForge {
     async fn push(&self, specs: &[PushSpec]) -> Result<()> {
         let refspecs: Vec<String> = specs.iter().map(refspec).collect();
         debug!("git push refspecs={refspecs:?}");
-        let has_metadata =
-            specs.iter().any(|s| s.label.is_some() || s.context.is_some());
+        let has_metadata = specs
+            .iter()
+            .any(|s| s.label.is_some() || s.context.is_some());
         let custom_desc = if has_metadata {
             let targets = specs
                 .iter()

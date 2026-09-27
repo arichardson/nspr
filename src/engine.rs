@@ -376,7 +376,19 @@ pub fn reject_unusable(prs: &[Option<PullRequest>]) -> Result<()> {
 /// Whether a pull request's title or description on the forge differs from `msg`.
 pub fn pr_message_differs_from(pr: &PullRequest, msg: &CommitMessage) -> bool {
     let pr_body = crate::pr_body::strip_warning(&pr.body);
-    pr.title.trim() != msg.subject.trim() || pr_body.trim() != msg.body.trim()
+    pr.title.trim() != msg.subject.trim()
+        || pr_body.trim() != msg.clean_body_for_pr().trim()
+}
+
+/// True if a human edited the pull request's title or description on the
+/// forge away from `msg` (accounting for pull requests created by earlier
+/// `nspr` versions that omitted non-internal trailers from the description).
+fn pr_was_edited_on_forge(pr: &PullRequest, msg: &CommitMessage) -> bool {
+    let pr_body = crate::pr_body::strip_warning(&pr.body);
+    let pr_body_trimmed = pr_body.trim();
+    pr.title.trim() != msg.subject.trim()
+        || (pr_body_trimmed != msg.clean_body_for_pr().trim()
+            && pr_body_trimmed != msg.body.trim())
 }
 
 /// Which layers need pushing, and why.
@@ -431,11 +443,11 @@ pub fn decide(
         };
 
         let remote_base_tip = match stack.layers[i].dep {
-            Dep::Main | Dep::ExternalPr(_) => Some(stack.base),
+            Dep::Main | Dep::ExternalPr(..) => Some(stack.base),
             Dep::Layer(j) => prs[j].as_ref().map(|p| p.head_oid),
         };
         let base_branch_changed = match stack.layers[i].dep {
-            Dep::Main | Dep::ExternalPr(_) => pr.base != stack.trunk,
+            Dep::Main | Dep::ExternalPr(..) => pr.base != stack.trunk,
             Dep::Layer(j) => prs[j].as_ref().is_some_and(|p| p.head != pr.base),
         };
         if base_branch_changed {
@@ -460,7 +472,7 @@ pub fn decide(
                     let current_msg = git.message_of(first_oid)?;
                     let branch_commit_msg = CommitMessage::parse(&current_msg);
                     github_message_edited[i] =
-                        pr_message_differs_from(pr, &branch_commit_msg);
+                        pr_was_edited_on_forge(pr, &branch_commit_msg);
 
                     let desired_msg =
                         stack.layers[i].message.clean_for_branch();
@@ -474,7 +486,7 @@ pub fn decide(
                     }
                 } else {
                     github_message_edited[i] =
-                        pr_message_differs_from(pr, &stack.layers[i].message);
+                        pr_was_edited_on_forge(pr, &stack.layers[i].message);
                 }
 
                 let shown = displayed_patch_id(
@@ -1338,7 +1350,7 @@ async fn execute(
             None if !decision.push[i] => continue,
             None => {
                 let body = crate::pr_body::splice_warning(
-                    &stack.layers[i].message.body,
+                    &stack.layers[i].message.clean_body_for_pr(),
                     warn_merge_strategy,
                 );
                 let number = forge
@@ -1392,15 +1404,12 @@ async fn execute(
                         wanted_base_label(stack, config, i)
                     ));
                 }
-                if opts.update_message
-                    || (decision.message_changed[i]
-                        && !decision.github_message_edited[i])
-                {
+                if opts.update_message || !decision.github_message_edited[i] {
                     if pr.title != subject {
                         update.title = Some(subject);
                     }
                     let body = crate::pr_body::splice_warning(
-                        &stack.layers[i].message.body,
+                        &stack.layers[i].message.clean_body_for_pr(),
                         warn_merge_strategy,
                     );
                     if pr.body != body {

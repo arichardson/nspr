@@ -110,8 +110,9 @@ pub async fn patch_layer(
             continue;
         }
 
+        let pr_body = crate::pr_body::strip_warning(&pr.body);
         let mut msg =
-            CommitMessage::parse(&format!("{}\n\n{}", pr.title, pr.body));
+            CommitMessage::parse(&format!("{}\n\n{}", pr.title, pr_body));
         let pr_url = format!(
             "https://github.com/{}/{}/pull/{}",
             config.owner, config.repo, pr.number

@@ -169,7 +169,11 @@ impl LandArgs {
 fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
-    let default_filter = if cli.verbose { "nspr=debug,warn" } else { "warn" };
+    let default_filter = if cli.verbose {
+        "nspr=debug,warn"
+    } else {
+        "warn"
+    };
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(default_filter),
     )
@@ -216,8 +220,9 @@ struct Session {
 
 impl Session {
     async fn open(remote: &str) -> Result<Self> {
-        let repo = git2::Repository::discover(".")
-            .map_err(|e| eyre!("cannot open a git repository here: {}", e.message()))?;
+        let repo = git2::Repository::discover(".").map_err(|e| {
+            eyre!("cannot open a git repository here: {}", e.message())
+        })?;
         let git = Git::new(repo);
 
         // The slug has to come from local config: we need it to build the API
@@ -365,7 +370,7 @@ impl Session {
             &self.config,
             stack,
             &prs,
-            &initial_decision.push,
+            &initial_decision,
             opts.update_message,
         )
         .await?;
@@ -384,8 +389,10 @@ impl Session {
             eprintln!("{} {warning}", style("warning:").yellow().bold());
         }
         let any_will_push = decision.push.iter().any(|&p| p)
-            || (opts.update_message
-                && plan.layers.iter().any(|l| l.message_differs));
+            || plan
+                .layers
+                .iter()
+                .any(|l| l.state == status::LayerState::Modified);
         if any_will_push {
             println!();
         }
