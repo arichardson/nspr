@@ -62,14 +62,15 @@ pub async fn amend(
             }
             let body =
                 crate::pr_body::strip_warning(&pr.body).trim().to_string();
-            if pr.title != message.subject || body != message.body {
+            if pr.title != message.subject
+                || body != message.clean_body_for_pr()
+            {
                 changed.push(Amended {
                     number,
                     old_subject: message.subject.clone(),
                     new_subject: pr.title.clone(),
                 });
-                message.subject = pr.title;
-                message.body = body;
+                message.update_from_pr(&pr.title, &body);
             }
         }
 

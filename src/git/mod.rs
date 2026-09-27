@@ -337,11 +337,7 @@ mod tests {
     fn opens_and_writes_refs_in_reftable_repository() {
         let dir = tempfile::tempdir().unwrap();
         let status = Command::new("git")
-            .args([
-                "init",
-                "--ref-format=reftable",
-                "--initial-branch=main",
-            ])
+            .args(["init", "--ref-format=reftable", "--initial-branch=main"])
             .current_dir(dir.path())
             .status()
             .expect("failed to run git init");
@@ -379,4 +375,3 @@ mod tests {
         assert_eq!(git.commits_since(c1).unwrap(), vec![c2]);
     }
 }
-

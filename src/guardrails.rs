@@ -67,7 +67,7 @@ pub async fn probe(
     config: &Config,
     stack: &Stack,
     prs: &[Option<PullRequest>],
-    pushing: &[bool],
+    decision: &crate::engine::Decision,
     update_message: bool,
 ) -> Result<Guardrails> {
     let mut warnings = Vec::new();
@@ -110,6 +110,11 @@ pub async fn probe(
         }
 
         if !update_message
+            && decision
+                .github_message_edited
+                .get(i)
+                .copied()
+                .unwrap_or(false)
             && crate::engine::pr_message_differs_from(
                 pr,
                 &stack.layers[i].message,
@@ -118,7 +123,8 @@ pub async fn probe(
             let pr_body = crate::pr_body::strip_warning(&pr.body);
             let what = match (
                 pr.title.trim() != stack.layers[i].message.subject.trim(),
-                pr_body.trim() != stack.layers[i].message.body.trim(),
+                pr_body.trim()
+                    != stack.layers[i].message.clean_body_for_pr().trim(),
             ) {
                 (true, true) => "title and description",
                 (true, false) => "title",
@@ -132,7 +138,7 @@ pub async fn probe(
             ));
         }
 
-        if !pushing.get(i).copied().unwrap_or(false) {
+        if !decision.push.get(i).copied().unwrap_or(false) {
             continue;
         }
 

@@ -144,7 +144,10 @@ impl GitRemote {
         } else if dir == Direction::Push {
             eprintln!(
                 "{}",
-                console::style(format!("git {action_desc} ({effective_url})...")).dim()
+                console::style(format!(
+                    "git {action_desc} ({effective_url})..."
+                ))
+                .dim()
             );
             let _ = std::io::stderr().flush();
         }
