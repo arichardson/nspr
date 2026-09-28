@@ -412,6 +412,68 @@ impl Stack {
         chains
     }
 
+    /// All layers grouped into connected components of the dependency graph
+    /// (including layers that do not have a pull request yet).
+    pub fn components(&self) -> Vec<Vec<usize>> {
+        let n = self.layers.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn find(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Dep::Layer(j) = layer.dep {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                parent[a] = b;
+            }
+        }
+
+        let mut components: Vec<Vec<usize>> = Vec::new();
+        let mut root_to_component: HashMap<usize, usize> = HashMap::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            match root_to_component.get(&root) {
+                Some(&slot) => components[slot].push(i),
+                None => {
+                    root_to_component.insert(root, components.len());
+                    components.push(vec![i]);
+                }
+            }
+        }
+        components
+    }
+
+    /// Return the connected component of layers containing `index`.
+    pub fn component_of(&self, index: usize) -> Vec<usize> {
+        self.components()
+            .into_iter()
+            .find(|c| c.contains(&index))
+            .unwrap_or_default()
+    }
+
+    /// True if `component` is a simple linear chain rooted at the trunk (or an
+    /// external pull request) where each subsequent layer depends on the
+    /// immediately preceding layer in `component`.
+    pub fn is_component_linear(&self, component: &[usize]) -> bool {
+        let Some(&first) = component.first() else {
+            return true;
+        };
+        if !matches!(self.layers[first].dep, Dep::Main | Dep::ExternalPr(_)) {
+            return false;
+        }
+        for window in component.windows(2) {
+            if self.layers[window[1]].dep != Dep::Layer(window[0]) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Layers grouped into connected components of the dependency graph,
     /// counting only layers that have a pull request.
     ///
@@ -471,18 +533,119 @@ impl Stack {
     /// True if the stack has no branches: the bottom layer sits on the trunk
     /// and every subsequent layer depends on the layer immediately below it.
     pub fn is_linear(&self) -> bool {
-        if self.layers.is_empty() {
-            return true;
+        let all: Vec<usize> = (0..self.layers.len()).collect();
+        self.is_component_linear(&all)
+    }
+
+    /// Rewrite `Depends-On:` trailers on any surviving layer whose dependency
+    /// would otherwise change when `removed` commits disappear from the linear
+    /// branch. Returns the (possibly rewritten) commit OIDs for all layers.
+    pub fn rewrite_deps_for_removal(
+        &self,
+        git: &Git,
+        removed: &HashSet<usize>,
+        rewrite_explicit_pr_refs: bool,
+    ) -> Result<Vec<Oid>> {
+        if removed.is_empty() {
+            return Ok(self.layers.iter().map(|l| l.commit).collect());
         }
-        if self.layers[0].dep != Dep::Main {
-            return false;
+
+        let mut messages: Vec<CommitMessage> =
+            Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            messages.push(CommitMessage::parse(&git.message_of(layer.commit)?));
         }
-        for (i, layer) in self.layers.iter().enumerate().skip(1) {
-            if layer.dep != Dep::Layer(i - 1) {
-                return false;
+
+        let mut any_rewritten = false;
+        let mut prev_survivor: Option<usize> = None;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            if removed.contains(&i) {
+                continue;
             }
+
+            let mut inherited = layer.dep;
+            while let Dep::Layer(p) = inherited {
+                if removed.contains(&p) {
+                    inherited = self.layers[p].dep;
+                } else {
+                    break;
+                }
+            }
+
+            let implicit = match prev_survivor {
+                None => Dep::Main,
+                Some(prev) => Dep::Layer(prev),
+            };
+
+            let dep_was_removed =
+                matches!(layer.dep, Dep::Layer(p) if removed.contains(&p));
+
+            let needs_rewrite = match &layer.dep_spec {
+                None => inherited != implicit,
+                Some(DepSpec::Commit(_)) => dep_was_removed,
+                Some(DepSpec::Pr(_)) => {
+                    rewrite_explicit_pr_refs && dep_was_removed
+                }
+                Some(DepSpec::Main) => false,
+            };
+
+            if needs_rewrite {
+                let spec_str = match inherited {
+                    Dep::Main => self.trunk.clone(),
+                    Dep::ExternalPr(n) => format!("#{n}"),
+                    Dep::Layer(p) => match self.layers[p].pr {
+                        Some(n) => format!("#{n}"),
+                        None => git.short_id(self.layers[p].commit)?,
+                    },
+                };
+                if messages[i].get(DEPENDS_ON) != Some(spec_str.as_str()) {
+                    messages[i].set(DEPENDS_ON, &spec_str);
+                    any_rewritten = true;
+                }
+            }
+
+            prev_survivor = Some(i);
         }
-        true
+
+        if any_rewritten {
+            let pairs: Vec<(Oid, String)> = self
+                .layers
+                .iter()
+                .zip(&messages)
+                .map(|(l, m)| (l.commit, m.render()))
+                .collect();
+            git.rewrite_messages(self.base, &pairs)
+        } else {
+            Ok(self.layers.iter().map(|l| l.commit).collect())
+        }
+    }
+
+    /// Drop `removed` layers and rebase the surviving commits onto `onto`,
+    /// rewriting `Depends-On:` trailers on any surviving layer whose dependency
+    /// would otherwise change when the removed commits disappear from the
+    /// linear branch.
+    pub fn rebase_without(
+        &self,
+        git: &Git,
+        removed: &HashSet<usize>,
+        onto: Oid,
+        rewrite_explicit_pr_refs: bool,
+    ) -> Result<()> {
+        let source_commits = self.rewrite_deps_for_removal(
+            git,
+            removed,
+            rewrite_explicit_pr_refs,
+        )?;
+        let unlanded: Vec<Oid> = source_commits
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !removed.contains(i))
+            .map(|(_, oid)| oid)
+            .collect();
+
+        git.rebase_commits(&unlanded, onto)?;
+        Ok(())
     }
 }
 

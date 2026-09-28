@@ -116,6 +116,10 @@ struct DiffArgs {
     #[arg(short = 'c', long)]
     cherry_pick: bool,
 
+    /// Start a new independent stack on trunk (`Depends-On: main`) at the first unsubmitted commit (or HEAD if all commits already have pull requests).
+    #[arg(long, conflicts_with = "cherry_pick")]
+    new_stack: bool,
+
     /// Description for this update, instead of being prompted.
     #[arg(short, long)]
     message: Option<String>,
@@ -291,6 +295,33 @@ impl Session {
                 stack = self.discover()?;
             }
             Some(head_idx)
+        } else if args.new_stack {
+            let target_idx = stack
+                .layers
+                .iter()
+                .position(|l| l.pr.is_none())
+                .unwrap_or(stack.layers.len() - 1);
+            if target_idx > 0
+                && stack.layers[target_idx].dep != nspr::stack::Dep::Main
+            {
+                let mut msg = stack.layers[target_idx].message.clone();
+                msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
+                let pairs: Vec<(git2::Oid, String)> = stack
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| {
+                        if i == target_idx {
+                            (l.commit, msg.render())
+                        } else {
+                            (l.commit, l.message.render())
+                        }
+                    })
+                    .collect();
+                self.git.rewrite_messages(stack.base, &pairs)?;
+                stack = self.discover()?;
+            }
+            None
         } else {
             None
         };
@@ -724,15 +755,26 @@ impl Session {
 
     async fn land(&mut self, args: LandArgs) -> Result<()> {
         let stack = self.discover()?;
-        let opts = land::LandOptions {
+        let mut opts = land::LandOptions {
             message: args.message.clone(),
             keep_local: false,
+            only_layers: None,
         };
 
-        let outcomes = if args.all
-            && args.target_pr().is_none()
-            && !args.cherry_pick
-        {
+        let outcomes = if args.all && !args.cherry_pick {
+            if let Some(pr_num) = args.target_pr() {
+                let idx = stack
+                    .layers
+                    .iter()
+                    .position(|l| l.pr == Some(pr_num))
+                    .ok_or_else(|| {
+                        eyre!(
+                            "#{pr_num} is not in this stack. Run `nspr status` to see your stack."
+                        )
+                    })?;
+                opts.only_layers =
+                    Some(stack.component_of(idx).into_iter().collect());
+            }
             land::land_all(&self.git, &self.forge, &self.config, &stack, &opts)
                 .await?
         } else {

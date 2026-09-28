@@ -3713,3 +3713,81 @@ fn land_single_pr_deletes_branch_via_api_without_git_push() {
     assert!(!w.forge.branch_exists("users/tester/single-fix"));
     assert!(w.discover().layers.is_empty());
 }
+
+#[test]
+fn multiple_independent_stacks_in_single_branch_status_comments_and_land() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("[ToolA] Part 1", &[("a1.txt", "a1")]);
+    w.add_layer("[ToolA] Part 2", &[("a2.txt", "a2")]);
+    w.add_layer("[ToolB] Part 1", &[("b1.txt", "b1")]);
+    w.add_layer("[ToolB] Part 2", &[("b2.txt", "b2")]);
+    w.set_trailer(2, crate::trailers::DEPENDS_ON, TRUNK);
+
+    let outcomes = w.sync();
+    assert_eq!(outcomes.len(), 4);
+    assert_eq!(outcomes[0].base, TRUNK);
+    assert_eq!(outcomes[1].base, outcomes[0].branch);
+    assert_eq!(outcomes[2].base, TRUNK);
+    assert_eq!(outcomes[3].base, outcomes[2].branch);
+    w.assert_invariants();
+
+    // Status renders each independent stack with its own `┴─ main` footer.
+    let st = w.status();
+    let rendered = st.render_with_options(true, false, None);
+    let expected = concat!(
+        "  ●  #104  ok            [ToolB] Part 2\n",
+        "  ●  #103  ok  landable  [ToolB] Part 1\n",
+        "  ┴─ main\n",
+        "\n",
+        "  ●  #102  ok            [ToolA] Part 2\n",
+        "  ●  #101  ok  landable  [ToolA] Part 1\n",
+        "  ┴─ main\n",
+    );
+    assert_eq!(rendered, expected);
+
+    // Stack comments only list PRs from the same component.
+    w.update_stack_comments();
+    let comment_a = w.comment_on(101).unwrap();
+    assert!(comment_a.body.contains("#101"));
+    assert!(comment_a.body.contains("#102"));
+    assert!(!comment_a.body.contains("#103"));
+    assert!(!comment_a.body.contains("#104"));
+
+    let comment_b = w.comment_on(103).unwrap();
+    assert!(comment_b.body.contains("#103"));
+    assert!(comment_b.body.contains("#104"));
+    assert!(!comment_b.body.contains("#101"));
+    assert!(!comment_b.body.contains("#102"));
+
+    // Landing the bottom of the upper stack (`#103`) repairs `#104` onto trunk
+    // and transfers `Depends-On: main` to `[ToolB] Part 2` so it stays
+    // independent instead of attaching to `[ToolA] Part 2`.
+    let landed = w.land(2);
+    assert_eq!(landed.number, 103);
+    assert_eq!(landed.repaired.len(), 1);
+    assert_eq!(landed.repaired[0].number, 104);
+    assert!(landed.repaired[0].retargeted);
+
+    let after = w.discover();
+    assert_eq!(after.layers.len(), 3);
+    assert_eq!(after.layers[0].dep, crate::stack::Dep::Main);
+    assert_eq!(after.layers[1].dep, crate::stack::Dep::Layer(0));
+    assert_eq!(
+        after.layers[2].dep,
+        crate::stack::Dep::Main,
+        "surviving child of landed second-stack root must inherit Depends-On: main"
+    );
+    w.assert_invariants();
+
+    let st_after = w.status();
+    let rendered_after = st_after.render_with_options(true, false, None);
+    let expected_after = concat!(
+        "  ●  #104  ok  landable  [ToolB] Part 2\n",
+        "  ┴─ main\n",
+        "\n",
+        "  ●  #102  ok            [ToolA] Part 2\n",
+        "  ●  #101  ok  landable  [ToolA] Part 1\n",
+        "  ┴─ main\n",
+    );
+    assert_eq!(rendered_after, expected_after);
+}

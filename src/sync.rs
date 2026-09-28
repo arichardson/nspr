@@ -112,13 +112,23 @@ pub async fn sync_trunk(
     forge.fetch_commit(trunk).await?;
 
     let mut merged = Vec::new();
+    let mut cleanly_merged = std::collections::HashSet::new();
     let mut warnings = Vec::new();
+    let trunk_tree = git.tree_of(trunk)?;
 
-    for layer in &stack.layers {
+    for (i, layer) in stack.layers.iter().enumerate() {
         let Some(number) = layer.pr else { continue };
         let pr = forge.get_pull_request(number).await?;
         match pr.state {
-            PrState::Merged => merged.push(number),
+            PrState::Merged => {
+                merged.push(number);
+                if let Ok(idx) = git.cherrypick(layer.commit, trunk)
+                    && !idx.has_conflicts()
+                    && git.write_index(idx).ok() == Some(trunk_tree)
+                {
+                    cleanly_merged.insert(i);
+                }
+            }
             PrState::Closed => warnings.push(format!(
                 "#{number} (`{}`) was closed without merging. Delete the \
                  commit, or remove its `{PULL_REQUEST}:` trailer to open a \
@@ -131,7 +141,8 @@ pub async fn sync_trunk(
 
     let rebased = trunk != stack.base;
     if rebased {
-        let commits: Vec<Oid> = stack.layers.iter().map(|l| l.commit).collect();
+        let commits =
+            stack.rewrite_deps_for_removal(git, &cleanly_merged, false)?;
         git.rebase_commits(&commits, trunk).wrap_err(
             "could not rebase the stack onto the trunk. Resolve the conflict \
              with `git rebase` and run `nspr sync` again.",
