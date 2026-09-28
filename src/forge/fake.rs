@@ -420,6 +420,12 @@ impl Forge for FakeForge {
         Ok(self.branch(branch))
     }
 
+    async fn delete_branch(&self, branch: &str) -> Result<()> {
+        self.branches.borrow_mut().remove(branch);
+        self.stale_pr_heads.borrow_mut().remove(branch);
+        Ok(())
+    }
+
     async fn push(&self, specs: &[PushSpec]) -> Result<()> {
         let lag = *self.async_pr_head_lag.borrow();
         for spec in specs {

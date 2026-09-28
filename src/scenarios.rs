@@ -3273,9 +3273,8 @@ fn land_all_merges_ready_prs_without_force_pushing_and_deletes_at_end() {
     assert_eq!(landed.len(), 4);
     assert!(w.discover().layers.is_empty());
 
-    // Zero repairs/force-pushes occurred: every PR was merged at its existing
-    // head_oid (preserving green CI), and only branch deletions were pushed at
-    // the end.
+    // Zero git pushes occurred: every PR was merged at its existing head_oid
+    // (preserving green CI), and merged head branches were deleted via the API.
     assert!(landed.iter().all(|o| o.repaired.is_empty()));
     let land_pushes: Vec<_> = w
         .forge
@@ -3285,11 +3284,13 @@ fn land_all_merges_ready_prs_without_force_pushing_and_deletes_at_end() {
         .skip(pushes_before)
         .cloned()
         .collect();
-    assert_eq!(land_pushes.len(), 4);
     assert!(
-        land_pushes.iter().all(|p| !p.force && p.oid.is_none()),
-        "expected only branch deletions (zero force-pushes), got: {land_pushes:?}"
+        land_pushes.is_empty(),
+        "expected zero git pushes when all layers merge cleanly and branches are deleted via API, got: {land_pushes:?}"
     );
+    for branch in ["layer-one", "layer-two", "layer-three", "layer-four"] {
+        assert!(!w.forge.branch_exists(&format!("users/tester/{branch}")));
+    }
 }
 
 #[test]
@@ -3334,8 +3335,9 @@ fn land_all_merges_ready_prefix_without_force_push_and_repairs_remaining_once_at
         .skip(pushes_before)
         .cloned()
         .collect();
-    // Exactly 2 forced repair pushes (#103, #104) and 2 branch deletes (#101, #102);
+    // Exactly 2 forced repair pushes (#103, #104), and #101/#102 deleted via API;
     // #102 was never force-pushed!
+    assert_eq!(land_pushes.len(), 2);
     let forced_branches: Vec<String> = land_pushes
         .iter()
         .filter(|p| p.force)
@@ -3350,6 +3352,8 @@ fn land_all_merges_ready_prefix_without_force_push_and_repairs_remaining_once_at
         "PR #{} (head {pr2_head_before}) must not be force-pushed before merging",
         prs[1]
     );
+    assert!(!w.forge.branch_exists("users/tester/layer-one"));
+    assert!(!w.forge.branch_exists("users/tester/layer-two"));
     assert_eq!(w.discover().layers.len(), 2);
 }
 
@@ -3690,4 +3694,23 @@ fn sync_restores_dropped_fixes_trailer_on_github_without_pushing_any_branches()
     let outcomes = w.sync();
     assert!(outcomes.iter().all(|o| o.action == LayerAction::Skipped));
     assert_eq!(w.push_count(), pushes_before);
+}
+
+#[test]
+fn land_single_pr_deletes_branch_via_api_without_git_push() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Single fix", &[("a.txt", "a1")]);
+    w.sync();
+
+    let pushes_before = w.push_count();
+    let landed = w.land(0);
+    assert_eq!(landed.number, 101);
+    assert!(landed.repaired.is_empty());
+    assert_eq!(
+        w.push_count(),
+        pushes_before,
+        "landing a single PR without dependents must not perform any git push"
+    );
+    assert!(!w.forge.branch_exists("users/tester/single-fix"));
+    assert!(w.discover().layers.is_empty());
 }

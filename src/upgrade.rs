@@ -233,7 +233,6 @@ pub async fn upgrade_stack(
         config.preserve_commit_history.resolve(merge_settings);
     let warn_merge_strategy =
         preserve_commit_history && !merge_settings.is_squash_only();
-    let mut delete_pushes: Vec<PushSpec> = Vec::new();
     for (i, pr) in prs.iter().enumerate() {
         let Some(pr) = pr else {
             continue;
@@ -268,7 +267,7 @@ pub async fn upgrade_stack(
             && old_base != config.trunk
             && !head_branches.contains(&old_base)
         {
-            delete_pushes.push(PushSpec::delete(&old_base));
+            forge.delete_branch(&old_base).await?;
             deleted_synthetic_base = Some(old_base.clone());
         }
 
@@ -293,10 +292,6 @@ pub async fn upgrade_stack(
             deleted_synthetic_base,
             tip,
         });
-    }
-
-    if !delete_pushes.is_empty() {
-        forge.push(&delete_pushes).await?;
     }
 
     crate::engine::apply_message_edits(git, stack, &messages)?;

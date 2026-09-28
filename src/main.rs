@@ -754,23 +754,6 @@ impl Session {
         }
 
         for outcome in &outcomes {
-            println!(
-                "{} #{} {} as {}",
-                style("landed").green().bold(),
-                outcome.number,
-                outcome.title,
-                self.git.short_id(outcome.squash)?
-            );
-            for repair in &outcome.repaired {
-                if repair.retargeted {
-                    println!(
-                        "  repaired #{} (retargeted → {})",
-                        repair.number, self.config.trunk
-                    );
-                } else {
-                    println!("  repaired #{}", repair.number);
-                }
-            }
             for warning in &outcome.warnings {
                 eprintln!("{} {warning}", style("warning:").yellow().bold());
             }
