@@ -18,8 +18,8 @@ use color_eyre::eyre::{Result, bail};
 use crate::config::Config;
 use crate::forge::{Forge, PrState, PullRequestUpdate};
 use crate::git::Git;
-use crate::stack::{Dep, DepSpec, Stack};
-use crate::trailers::{CommitMessage, DEPENDS_ON};
+use crate::stack::{Dep, Stack};
+use crate::trailers::DEPENDS_ON;
 
 #[derive(Debug, Clone)]
 pub struct CloseOutcome {
@@ -120,36 +120,13 @@ pub async fn close_layer(
         )
         .await?;
 
-    // Rewrite any trailer that named the closed pull request, otherwise the
-    // next `nspr diff` would try to resolve a reference to something closed
-    // and refuse to do anything at all.
-    let mut messages: Vec<CommitMessage> = stack
-        .layers
-        .iter()
-        .map(|l| CommitMessage::parse(&git.message_of(l.commit).unwrap()))
-        .collect();
-    for &i in &dependents {
-        if stack.layers[i].dep_spec == Some(DepSpec::Pr(number)) {
-            messages[i].set(DEPENDS_ON, &inherited_spec);
-        }
-    }
-
-    let rewrites: Vec<(git2::Oid, String)> = stack
-        .layers
-        .iter()
-        .zip(&messages)
-        .map(|(l, m)| (l.commit, m.render()))
-        .collect();
-    let rewritten = git.rewrite_messages(stack.base, &rewrites)?;
-
-    // Drop the closed layer from the local chain.
-    let keep: Vec<git2::Oid> = rewritten
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != index)
-        .map(|(_, oid)| *oid)
-        .collect();
-    git.rebase_commits(&keep, stack.base)?;
+    let _ = inherited_spec;
+    stack.rebase_without(
+        git,
+        &std::collections::HashSet::from([index]),
+        stack.base,
+        true,
+    )?;
 
     crate::refs::remove(git, number)?;
 

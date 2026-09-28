@@ -91,8 +91,10 @@ pub fn render(config: &Config, stack: &Stack, current: usize) -> String {
     let mut out = String::from("#### Stack\n\n");
     out.push_str(&format!("- `{}`\n", config.trunk));
 
-    if stack.is_linear() {
-        for (i, layer) in stack.layers.iter().enumerate() {
+    let component = stack.component_of(current);
+    if stack.is_component_linear(&component) {
+        for &i in &component {
+            let layer = &stack.layers[i];
             let reference = match layer.pr {
                 Some(n) => format!("#{n}"),
                 None => "(not submitted)".to_string(),
@@ -107,12 +109,14 @@ pub fn render(config: &Config, stack: &Stack, current: usize) -> String {
             }
         }
     } else {
-        // Group children by parent layer so DFS traversal keeps branches intact
+        // Group children by parent layer within this connected component so DFS
+        // traversal keeps branches intact without leaking independent stacks.
         let mut children_map: std::collections::HashMap<
             Option<usize>,
             Vec<usize>,
         > = std::collections::HashMap::new();
-        for (i, layer) in stack.layers.iter().enumerate() {
+        for &i in &component {
+            let layer = &stack.layers[i];
             let parent = match layer.dep {
                 Dep::Main | Dep::ExternalPr(_) => None,
                 Dep::Layer(j) => Some(j),
@@ -367,5 +371,68 @@ mod tests {
         assert!(rendered.contains("  - #101 Layer 1\n"));
         assert!(rendered.contains("    - ➡️ **#102 Layer 2**\n"));
         assert!(rendered.contains("    - #103 Layer 3 sibling\n"));
+    }
+
+    #[test]
+    fn render_multiple_independent_stacks_isolates_each_component() {
+        let config = Config::new(
+            "owner".into(),
+            "repo".into(),
+            "main".into(),
+            "user".into(),
+        );
+        let oid = git2::Oid::ZERO_SHA1;
+        let stack = Stack {
+            trunk: "main".into(),
+            base: oid,
+            layers: vec![
+                Layer {
+                    commit: oid,
+                    parent: oid,
+                    message: crate::trailers::CommitMessage::parse("ToolA 1\n"),
+                    pr: Some(101),
+                    dep_spec: None,
+                    dep: Dep::Main,
+                },
+                Layer {
+                    commit: oid,
+                    parent: oid,
+                    message: crate::trailers::CommitMessage::parse("ToolA 2\n"),
+                    pr: Some(102),
+                    dep_spec: None,
+                    dep: Dep::Layer(0),
+                },
+                Layer {
+                    commit: oid,
+                    parent: oid,
+                    message: crate::trailers::CommitMessage::parse("ToolB 1\n"),
+                    pr: Some(201),
+                    dep_spec: None,
+                    dep: Dep::Main,
+                },
+                Layer {
+                    commit: oid,
+                    parent: oid,
+                    message: crate::trailers::CommitMessage::parse("ToolB 2\n"),
+                    pr: Some(202),
+                    dep_spec: None,
+                    dep: Dep::Layer(2),
+                },
+            ],
+        };
+
+        let comment_a = render(&config, &stack, 0);
+        assert!(comment_a.contains("- ➡️ **#101 ToolA 1**\n"));
+        assert!(comment_a.contains("- #102 ToolA 2\n"));
+        assert!(!comment_a.contains("#201"));
+        assert!(!comment_a.contains("#202"));
+        assert!(!comment_a.contains("  -"));
+
+        let comment_b = render(&config, &stack, 3);
+        assert!(comment_b.contains("- #201 ToolB 1\n"));
+        assert!(comment_b.contains("- ➡️ **#202 ToolB 2**\n"));
+        assert!(!comment_b.contains("#101"));
+        assert!(!comment_b.contains("#102"));
+        assert!(!comment_b.contains("  -"));
     }
 }

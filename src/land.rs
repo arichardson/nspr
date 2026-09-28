@@ -52,6 +52,9 @@ pub struct LandOptions {
     /// commit. Only useful for inspection; the next `nspr diff` would try to
     /// re-create the landed pull request.
     pub keep_local: bool,
+    /// When set, only land layers in this set (for example, a single connected
+    /// stack component selected via `nspr land --all <PR>`).
+    pub only_layers: Option<HashSet<usize>>,
 }
 
 /// What happened to one dependent layer.
@@ -300,17 +303,12 @@ pub async fn land_layer(
 
     // --- Local cleanup: the landed commit becomes empty and drops out. ------
     if !opts.keep_local {
-        let unlanded_commits: Vec<Oid> = stack
-            .layers
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != index)
-            .map(|(_, l)| l.commit)
-            .collect();
-        git.rebase_commits(&unlanded_commits, squash).wrap_err(
-            "#{number} landed, but the local stack could not be rebased onto \
-             it. Run `git rebase --onto <trunk>` manually, then `nspr sync`.",
-        )?;
+        stack
+            .rebase_without(git, &HashSet::from([index]), squash, false)
+            .wrap_err(
+                "#{number} landed, but the local stack could not be rebased onto \
+                 it. Run `git rebase --onto <trunk>` manually, then `nspr sync`.",
+            )?;
     }
 
     Ok(LandOutcome {
@@ -415,8 +413,14 @@ pub async fn land_all(
     let mut landed_layers: HashSet<usize> = HashSet::new();
     let mut outcomes: Vec<LandOutcome> = Vec::new();
     let mut stop_warning: Option<String> = None;
+    let mut first_error: Option<color_eyre::Report> = None;
 
     for index in 0..stack.layers.len() {
+        if let Some(allowed) = &opts.only_layers
+            && !allowed.contains(&index)
+        {
+            continue;
+        }
         let dep_ready = match stack.layers[index].dep {
             Dep::Main => true,
             Dep::Layer(dep) => landed_layers.contains(&dep),
@@ -427,40 +431,40 @@ pub async fn land_all(
         }
 
         let Some(state) = pr_states.get(&index).cloned() else {
-            if outcomes.is_empty() {
-                bail!(
+            if first_error.is_none() {
+                first_error = Some(eyre!(
                     "`{}` has no pull request yet; run `nspr diff` first",
                     stack.layers[index].subject()
-                );
+                ));
             }
             continue;
         };
 
         match state.state {
             PrState::Merged => {
-                if outcomes.is_empty() {
-                    bail!(
+                if first_error.is_none() {
+                    first_error = Some(eyre!(
                         "#{} has already been merged. Run `nspr sync` to bring \
                          the local stack up to date.",
                         state.number
-                    );
+                    ));
                 }
                 continue;
             }
             PrState::Closed => {
-                if outcomes.is_empty() {
-                    bail!("#{} is closed.", state.number);
+                if first_error.is_none() {
+                    first_error = Some(eyre!("#{} is closed.", state.number));
                 }
                 continue;
             }
             PrState::Open => {}
         }
         if state.draft {
-            if outcomes.is_empty() {
-                bail!(
+            if first_error.is_none() {
+                first_error = Some(eyre!(
                     "#{} is still a draft; mark it ready for review first.",
                     state.number
-                );
+                ));
             }
             continue;
         }
@@ -470,8 +474,8 @@ pub async fn land_all(
         if cp_index.has_conflicts() {
             let msg = "this commit no longer applies on top of the trunk. Run \
                        `nspr sync` to rebase, then try again.";
-            if outcomes.is_empty() {
-                bail!("{msg}");
+            if first_error.is_none() {
+                first_error = Some(eyre!("{msg}"));
             }
             stop_warning = Some(format!("stopped at #{}: {msg}", state.number));
             continue;
@@ -515,8 +519,8 @@ pub async fn land_all(
                 let msg = "the local commit has changed since the pull request \
                            was last pushed, so landing it would merge something \
                            nobody reviewed. Run `nspr diff` first.";
-                if outcomes.is_empty() {
-                    bail!("{msg}");
+                if first_error.is_none() {
+                    first_error = Some(eyre!("{msg}"));
                 }
                 stop_warning =
                     Some(format!("stopped at #{}: {msg}", state.number));
@@ -622,14 +626,15 @@ pub async fn land_all(
                         st.base = old_base;
                     }
                 }
-                if outcomes.is_empty() {
-                    return Err(e).wrap_err(format!(
+                let err_msg = format!("{e:#}");
+                if first_error.is_none() {
+                    first_error = Some(e.wrap_err(format!(
                         "could not merge #{}",
                         state.number
-                    ));
+                    )));
                 }
                 stop_warning =
-                    Some(format!("stopped at #{}: {e:#}", state.number));
+                    Some(format!("stopped at #{}: {err_msg}", state.number));
                 continue;
             }
         };
@@ -648,6 +653,15 @@ pub async fn land_all(
             repaired: Vec::new(),
             warnings: Vec::new(),
         });
+    }
+
+    if outcomes.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            eyre!(
+                "nothing at the bottom of the stack is ready to land. Run \
+                 `nspr status` to see why."
+            )
+        }));
     }
 
     // Repair any remaining unmerged layers once onto the final squash commit.
@@ -669,14 +683,8 @@ pub async fn land_all(
     }
 
     if !opts.keep_local {
-        let unlanded_commits: Vec<Oid> = stack
-            .layers
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !landed_layers.contains(i))
-            .map(|(_, l)| l.commit)
-            .collect();
-        git.rebase_commits(&unlanded_commits, current_trunk)
+        stack
+            .rebase_without(git, &landed_layers, current_trunk, false)
             .wrap_err(
                 "pull requests landed, but the local stack could not be \
                  rebased onto the trunk. Run `git rebase --onto <trunk>` \
