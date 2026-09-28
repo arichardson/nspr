@@ -414,6 +414,35 @@ impl Forge for GitHubForge {
         Ok(Some(Oid::from_str(&oid_str)?))
     }
 
+    async fn delete_branch(&self, branch: &str) -> Result<()> {
+        debug!(
+            "API DELETE /repos/{}/{}/git/refs/heads/{branch}",
+            self.owner, self.repo
+        );
+        let res = self
+            .api
+            .repos(&self.owner, &self.repo)
+            .delete_ref(&octocrab::params::repos::Reference::Branch(
+                branch.to_string(),
+            ))
+            .await;
+        match res {
+            Ok(()) => Ok(()),
+            // GitHub returns 404 or 422 ("Reference does not exist") when the
+            // repository's `delete_branch_on_merge` setting already deleted the
+            // head branch automatically upon merge.
+            Err(e) if matches!(status_code(&e), Some(404 | 422)) => {
+                debug!(
+                    "branch {branch} already deleted on remote ({:?}): {e}",
+                    status_code(&e)
+                );
+                Ok(())
+            }
+            Err(e) => Err(Error::from(e))
+                .wrap_err(format!("could not delete remote branch `{branch}`")),
+        }
+    }
+
     async fn push(&self, specs: &[PushSpec]) -> Result<()> {
         let refspecs: Vec<String> = specs.iter().map(refspec).collect();
         debug!("git push refspecs={refspecs:?}");

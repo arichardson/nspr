@@ -252,6 +252,8 @@ pub trait Forge {
     }
     /// Current tip of a remote branch, or `None` if it does not exist.
     async fn branch_oid(&self, branch: &str) -> Result<Option<Oid>>;
+    /// Delete a remote branch via the forge API (no-op if already deleted).
+    async fn delete_branch(&self, branch: &str) -> Result<()>;
     async fn push(&self, specs: &[PushSpec]) -> Result<()>;
     /// Find an unused branch name starting from `preferred`.
     async fn unused_branch_name(&self, preferred: &str) -> Result<String>;

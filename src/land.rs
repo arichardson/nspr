@@ -208,6 +208,7 @@ pub async fn land_layer(
         }
     };
     forge.fetch_commit(squash).await?;
+    print_landed(git, number, &title, squash)?;
 
     // --- Steps 3-5: replay each dependent's revisions onto the new tip. -----
     //
@@ -218,8 +219,7 @@ pub async fn land_layer(
         HashMap::from([(index, pr.head_oid)]);
     let mut repaired = Vec::new();
 
-    let mut push_specs: Vec<PushSpec> =
-        Vec::with_capacity(dependents.len() + 1);
+    let mut push_specs: Vec<PushSpec> = Vec::with_capacity(dependents.len());
     let mut ref_updates: Vec<(u64, Oid, Option<Oid>)> =
         Vec::with_capacity(dependents.len());
 
@@ -282,12 +282,12 @@ pub async fn land_layer(
         });
     }
 
-    // --- Step 6: push all repaired branches and delete the merged head branch
-    // in a single git push operation. ----------------------------------------
-    push_specs.push(
-        PushSpec::delete(&pr.head).with_label(format!("delete #{number}")),
-    );
-    forge.push(&push_specs).await?;
+    // --- Step 6: push any repaired dependent branches and delete the merged
+    // head branch via the forge API. -----------------------------------------
+    if !push_specs.is_empty() {
+        forge.push(&push_specs).await?;
+        print_repaired(&repaired, &config.trunk);
+    }
 
     for (dep_num, new_tip, new_root_commit) in ref_updates {
         crate::refs::update(git, dep_num, new_tip)?;
@@ -295,6 +295,7 @@ pub async fn land_layer(
             crate::refs::update_root(git, dep_num, root_commit)?;
         }
     }
+    forge.delete_branch(&pr.head).await?;
     crate::refs::remove(git, number)?;
 
     // --- Local cleanup: the landed commit becomes empty and drops out. ------
@@ -412,7 +413,6 @@ pub async fn land_all(
     }
 
     let mut landed_layers: HashSet<usize> = HashSet::new();
-    let mut pending_deletes: Vec<(u64, String)> = Vec::new();
     let mut outcomes: Vec<LandOutcome> = Vec::new();
     let mut stop_warning: Option<String> = None;
 
@@ -539,7 +539,6 @@ pub async fn land_all(
                 &landed_layers,
                 current_trunk,
                 &mut pr_states,
-                &mut pending_deletes,
                 &mut last_outcome.warnings,
             )
             .await?;
@@ -635,11 +634,13 @@ pub async fn land_all(
             }
         };
         forge.fetch_commit(squash).await?;
+        print_landed(git, state.number, &title, squash)?;
+        forge.delete_branch(&state.branch).await?;
+        crate::refs::remove(git, state.number)?;
 
         landed_layers.insert(index);
         pr_states.get_mut(&index).unwrap().state = PrState::Merged;
         current_trunk = squash;
-        pending_deletes.push((state.number, state.branch.clone()));
         outcomes.push(LandOutcome {
             number: state.number,
             title,
@@ -649,8 +650,7 @@ pub async fn land_all(
         });
     }
 
-    // Repair any remaining unmerged layers once onto the final squash commit,
-    // and delete all merged head branches in a single `git push`.
+    // Repair any remaining unmerged layers once onto the final squash commit.
     let last_outcome = outcomes.last_mut().expect("at least one layer landed");
     let repaired = repair_remaining_dependents(
         git,
@@ -660,7 +660,6 @@ pub async fn land_all(
         &landed_layers,
         current_trunk,
         &mut pr_states,
-        &mut pending_deletes,
         &mut last_outcome.warnings,
     )
     .await?;
@@ -697,7 +696,6 @@ async fn repair_remaining_dependents(
     landed_layers: &HashSet<usize>,
     current_trunk: Oid,
     pr_states: &mut HashMap<usize, LayerPrState>,
-    pending_deletes: &mut Vec<(u64, String)>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Repair>> {
     let mut repaired = Vec::new();
@@ -813,15 +811,9 @@ async fn repair_remaining_dependents(
         });
     }
 
-    let deletes: Vec<(u64, String)> = std::mem::take(pending_deletes);
-    for (num, branch) in &deletes {
-        push_specs.push(
-            PushSpec::delete(branch).with_label(format!("delete #{num}")),
-        );
-    }
-
     if !push_specs.is_empty() {
         forge.push(&push_specs).await?;
+        print_repaired(&repaired, &config.trunk);
     }
 
     for (dep_num, new_tip, new_root_commit) in ref_updates {
@@ -830,11 +822,34 @@ async fn repair_remaining_dependents(
             crate::refs::update_root(git, dep_num, root_commit)?;
         }
     }
-    for (num, _) in deletes {
-        crate::refs::remove(git, num)?;
-    }
 
     Ok(repaired)
+}
+
+fn print_landed(
+    git: &Git,
+    number: u64,
+    title: &str,
+    squash: Oid,
+) -> Result<()> {
+    println!(
+        "{} #{} {} as {}",
+        console::style("landed").green().bold(),
+        number,
+        title,
+        git.short_id(squash)?
+    );
+    Ok(())
+}
+
+fn print_repaired(repaired: &[Repair], trunk: &str) {
+    for repair in repaired {
+        if repair.retargeted {
+            println!("  repaired #{} (retargeted → {})", repair.number, trunk);
+        } else {
+            println!("  repaired #{}", repair.number);
+        }
+    }
 }
 
 /// The lowest layer that is ready to land, if any.
