@@ -16,6 +16,9 @@ query PullRequest($owner: String!, $name: String!, $number: Int!) {
       autoMergeRequest {
         enabledAt
       }
+      mergeCommit {
+        oid
+      }
     }
   }
 }

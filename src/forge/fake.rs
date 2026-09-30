@@ -30,6 +30,8 @@ struct FakePr {
     body: String,
     base: String,
     head: String,
+    last_head_oid: Oid,
+    merge_commit: Option<Oid>,
     auto_merge: bool,
     draft: bool,
 }
@@ -231,6 +233,8 @@ impl FakeForge {
             .find(|p| p.number == number)
         {
             p.state = PrState::Merged;
+            p.last_head_oid = head_oid;
+            p.merge_commit = Some(squash);
         }
         Ok(squash)
     }
@@ -310,7 +314,7 @@ impl Forge for FakeForge {
                 }
                 oid
             } else {
-                self.branch(&pr.head).unwrap_or(Oid::ZERO_SHA1)
+                self.branch(&pr.head).unwrap_or(pr.last_head_oid)
             }
         };
 
@@ -344,6 +348,7 @@ impl Forge for FakeForge {
             head: pr.head,
             base_oid,
             head_oid,
+            merge_commit: pr.merge_commit,
             mergeable: Mergeable::Mergeable,
             merge_state,
             auto_merge: pr.auto_merge,
@@ -355,6 +360,7 @@ impl Forge for FakeForge {
         let mut n = self.next_number.borrow_mut();
         let number = *n;
         *n += 1;
+        let last_head_oid = self.branch(&req.head).unwrap_or(Oid::ZERO_SHA1);
         self.prs.borrow_mut().push(FakePr {
             number,
             state: PrState::Open,
@@ -362,6 +368,8 @@ impl Forge for FakeForge {
             body: req.body,
             base: req.base,
             head: req.head,
+            last_head_oid,
+            merge_commit: None,
             auto_merge: false,
             draft: req.draft,
         });
@@ -461,6 +469,11 @@ impl Forge for FakeForge {
                             .insert(spec.branch.clone(), (old, lag));
                     }
                     self.branches.borrow_mut().insert(spec.branch.clone(), new);
+                    for pr in self.prs.borrow_mut().iter_mut() {
+                        if pr.head == spec.branch {
+                            pr.last_head_oid = new;
+                        }
+                    }
                 }
             }
         }

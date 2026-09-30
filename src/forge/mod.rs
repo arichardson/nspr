@@ -54,6 +54,8 @@ pub struct PullRequest {
     pub head: String,
     pub base_oid: Oid,
     pub head_oid: Oid,
+    /// When `state == PrState::Merged`, the commit created on the base branch.
+    pub merge_commit: Option<Oid>,
     pub mergeable: Mergeable,
     pub merge_state: MergeState,
     /// Auto-merge would merge this PR into its *base branch*, not the trunk —

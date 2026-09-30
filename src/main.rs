@@ -846,6 +846,11 @@ impl Session {
             sync::sync_trunk(&self.git, &self.forge, &self.config, &stack)
                 .await?;
         self.trunk_oid = report.trunk;
+        let _ = self.git.set_reference(
+            &format!("refs/remotes/{}/{}", self.remote, self.config.trunk),
+            self.trunk_oid,
+            "nspr: update trunk tracking ref after sync",
+        );
 
         for warning in &report.warnings {
             eprintln!("{} {warning}", style("warning:").yellow().bold());
@@ -925,6 +930,11 @@ impl Session {
 
         if let Some(last) = outcomes.last() {
             self.trunk_oid = last.squash;
+            let _ = self.git.set_reference(
+                &format!("refs/remotes/{}/{}", self.remote, self.config.trunk),
+                self.trunk_oid,
+                "nspr: update trunk tracking ref after land",
+            );
         }
 
         for outcome in &outcomes {
