@@ -373,13 +373,46 @@ impl Stack {
             .collect()
     }
 
+    /// Whether layer `i` is included in the active selection (`only_layer` / `only_layers`).
+    pub fn is_layer_selected(
+        i: usize,
+        only_layer: Option<usize>,
+        only_layers: Option<&HashSet<usize>>,
+    ) -> bool {
+        if let Some(only) = only_layer
+            && i != only
+        {
+            return false;
+        }
+        if let Some(set) = only_layers
+            && !set.contains(&i)
+        {
+            return false;
+        }
+        true
+    }
+
     /// Ordered bottom-to-top pull request number chains (`len >= 2`) suitable
     /// for registering with GitHub's native Stacks API (`/repos/{owner}/{repo}/stacks`).
     pub fn pr_chains(&self) -> Vec<Vec<u64>> {
+        self.pr_chains_for(None)
+    }
+
+    /// Ordered bottom-to-top pull request number chains (`len >= 2`), optionally
+    /// restricted to components that intersect `only_layers`.
+    pub fn pr_chains_for(
+        &self,
+        only_layers: Option<&HashSet<usize>>,
+    ) -> Vec<Vec<u64>> {
         let mut visited = vec![false; self.layers.len()];
         let mut chains = Vec::new();
         for start in 0..self.layers.len() {
             if visited[start] || self.layers[start].pr.is_none() {
+                continue;
+            }
+            if let Some(set) = only_layers
+                && !set.contains(&start)
+            {
                 continue;
             }
             let is_root = match self.layers[start].dep {

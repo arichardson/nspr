@@ -188,6 +188,23 @@ pub async fn update_all(
     config: &Config,
     stack: &Stack,
 ) -> Result<usize> {
+    update_for_opts(
+        forge,
+        config,
+        stack,
+        &crate::engine::SyncOptions::default(),
+    )
+    .await
+}
+
+/// Post or update the stack comment on layers selected by `opts` (skipping
+/// unrelated stacks when `nspr diff` is scoped to the current stack).
+pub async fn update_for_opts(
+    forge: &dyn Forge,
+    config: &Config,
+    stack: &Stack,
+    opts: &crate::engine::SyncOptions,
+) -> Result<usize> {
     // A pull request on its own is not a stack; the table would be noise.
     let stacked: std::collections::HashSet<usize> = stack
         .pr_components()
@@ -198,6 +215,9 @@ pub async fn update_all(
 
     let mut updated = 0;
     for (i, layer) in stack.layers.iter().enumerate() {
+        if !opts.is_layer_selected(i) {
+            continue;
+        }
         let Some(number) = layer.pr else { continue };
 
         let existing =

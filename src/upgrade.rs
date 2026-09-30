@@ -111,7 +111,7 @@ pub async fn reject_if_legacy_spr(
     stack: &Stack,
 ) -> Result<()> {
     let prs = crate::engine::gather(forge, stack).await?;
-    reject_if_legacy_spr_with_prs(git, config, stack, &prs, None)
+    reject_if_legacy_spr_with_prs(git, config, stack, &prs, None, None)
 }
 
 pub fn reject_if_legacy_spr_with_prs(
@@ -120,11 +120,10 @@ pub fn reject_if_legacy_spr_with_prs(
     stack: &Stack,
     prs: &[Option<PullRequest>],
     only_layer: Option<usize>,
+    only_layers: Option<&HashSet<usize>>,
 ) -> Result<()> {
     for (i, layer) in stack.layers.iter().enumerate() {
-        if let Some(only) = only_layer
-            && i != only
-        {
+        if !Stack::is_layer_selected(i, only_layer, only_layers) {
             continue;
         }
         let is_spr = match &prs[i] {

@@ -44,12 +44,22 @@ pub struct SyncOptions {
     pub refresh_when_behind: bool,
     /// Only sync this specific layer index (used by `nspr diff --cherry-pick`).
     pub only_layer: Option<usize>,
+    /// Only sync this specific set of layer indices (used when scoping `nspr diff`
+    /// to the current stack component by default).
+    pub only_layers: Option<std::collections::HashSet<usize>>,
     /// Whether to push incremental `[nspr]` commits (`true`) or rewrite each
     /// PR branch as a single commit with force-pushes (`false`).
     pub preserve_commit_history: bool,
     /// Commits for which the user explicitly declined re-linking to an existing
     /// open pull request during this `nspr diff` invocation.
     pub declined_relink_commits: std::collections::HashSet<Oid>,
+}
+
+impl SyncOptions {
+    /// Whether layer `i` is included in the current sync scope.
+    pub fn is_layer_selected(&self, i: usize) -> bool {
+        Stack::is_layer_selected(i, self.only_layer, self.only_layers.as_ref())
+    }
 }
 
 impl Default for SyncOptions {
@@ -61,6 +71,7 @@ impl Default for SyncOptions {
             draft: false,
             refresh_when_behind: false,
             only_layer: None,
+            only_layers: None,
             preserve_commit_history: true,
             declined_relink_commits: std::collections::HashSet::new(),
         }
@@ -116,9 +127,7 @@ pub async fn recover_missing_pr_trailers(
     let mut rewrote_any = false;
 
     for i in 0..stack.layers.len() {
-        if let Some(only) = opts.only_layer
-            && i != only
-        {
+        if !opts.is_layer_selected(i) {
             continue;
         }
         if stack.layers[i].pr.is_some()
@@ -205,7 +214,7 @@ pub async fn sync_stack(
     opts: &SyncOptions,
     prompter: &dyn Prompter,
 ) -> Result<Vec<LayerOutcome>> {
-    resolve_external_deps(forge, stack).await?;
+    resolve_external_deps(forge, stack, opts).await?;
 
     let merge_settings = forge.repo_merge_settings().await?;
     let mut opts = opts.clone();
@@ -217,14 +226,15 @@ pub async fn sync_stack(
 
     let trees = stack.all_trees(git)?;
 
-    let prs = gather(forge, stack).await?;
-    reject_unusable(&prs)?;
+    let prs = gather_for(forge, stack, &opts).await?;
+    reject_unusable_for(&prs, opts.only_layer, opts.only_layers.as_ref())?;
     crate::upgrade::reject_if_legacy_spr_with_prs(
         git,
         config,
         stack,
         &prs,
         opts.only_layer,
+        opts.only_layers.as_ref(),
     )?;
     let decision = decide(git, stack, &prs, &trees, &opts)?;
 
@@ -268,8 +278,12 @@ pub async fn sync_stack(
         let mut catchup_opts = opts.clone();
         catchup_opts.refresh_when_behind = true;
         let trees = stack.all_trees(git)?;
-        let prs = gather(forge, stack).await?;
-        reject_unusable(&prs)?;
+        let prs = gather_for(forge, stack, &catchup_opts).await?;
+        reject_unusable_for(
+            &prs,
+            catchup_opts.only_layer,
+            catchup_opts.only_layers.as_ref(),
+        )?;
         let decision = decide(git, stack, &prs, &trees, &catchup_opts)?;
         let mut staged_again = false;
         let second = execute(
@@ -316,7 +330,9 @@ pub async fn sync_stack(
         outcomes
     };
 
-    forge.sync_stacks(&stack.pr_chains()).await?;
+    forge
+        .sync_stacks(&stack.pr_chains_for(opts.only_layers.as_ref()))
+        .await?;
     Ok(final_outcomes)
 }
 
@@ -329,8 +345,33 @@ pub async fn gather(
     forge: &dyn Forge,
     stack: &Stack,
 ) -> Result<Vec<Option<PullRequest>>> {
-    let mut prs = Vec::with_capacity(stack.layers.len());
-    for layer in &stack.layers {
+    gather_for(forge, stack, &SyncOptions::default()).await
+}
+
+/// Fetch pull requests needed for the layers selected by `opts` (including any
+/// ancestor layers they depend on), skipping unrelated stack components.
+pub async fn gather_for(
+    forge: &dyn Forge,
+    stack: &Stack,
+    opts: &SyncOptions,
+) -> Result<Vec<Option<PullRequest>>> {
+    let n = stack.layers.len();
+    let mut needed = vec![false; n];
+    for i in (0..n).rev() {
+        if opts.is_layer_selected(i) || needed[i] {
+            needed[i] = true;
+            if let Dep::Layer(j) = stack.layers[i].dep {
+                needed[j] = true;
+            }
+        }
+    }
+
+    let mut prs = Vec::with_capacity(n);
+    for (i, layer) in stack.layers.iter().enumerate() {
+        if !needed[i] {
+            prs.push(None);
+            continue;
+        }
         match layer.pr {
             None => prs.push(None),
             Some(number) => {
@@ -351,7 +392,21 @@ pub async fn gather(
 /// Separate from [`gather`] because `status` wants to *show* you a closed or
 /// merged pull request rather than fail on it.
 pub fn reject_unusable(prs: &[Option<PullRequest>]) -> Result<()> {
-    for pr in prs.iter().flatten() {
+    reject_unusable_for(prs, None, None)
+}
+
+/// Refuse to push to a pull request among the selected layers that is closed
+/// or already merged.
+pub fn reject_unusable_for(
+    prs: &[Option<PullRequest>],
+    only_layer: Option<usize>,
+    only_layers: Option<&std::collections::HashSet<usize>>,
+) -> Result<()> {
+    for (i, pr) in prs.iter().enumerate() {
+        if !Stack::is_layer_selected(i, only_layer, only_layers) {
+            continue;
+        }
+        let Some(pr) = pr else { continue };
         let number = pr.number;
         match pr.state {
             PrState::Closed => bail!(
@@ -432,9 +487,7 @@ pub fn decide(
     // is `dep_tree(i)`, the dependency's local effective tree, never the
     // dependency's remote tip, which may be several amends out of date.
     for i in 0..n {
-        if let Some(only) = opts.only_layer
-            && i != only
-        {
+        if !opts.is_layer_selected(i) {
             continue;
         }
         let Some(pr) = &prs[i] else {
@@ -1305,6 +1358,9 @@ async fn execute(
     // run is its own kind of mess.
     if config.draft_while_retargeting {
         for i in 0..n {
+            if !opts.is_layer_selected(i) {
+                continue;
+            }
             let Some(pr) = &prs[i] else { continue };
             if pr.draft || pr.base == base_branches[i] || retargeted_early[i] {
                 continue;
@@ -1381,6 +1437,9 @@ async fn execute(
     let mut retargeted_descriptions: Vec<String> = Vec::new();
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
+        if !opts.is_layer_selected(i) {
+            continue;
+        }
         let base_branch = base_branches[i].clone();
         let tip = tips[i];
         let branch = branches[i].clone();
@@ -1534,11 +1593,15 @@ fn canonical_dep(config: &Config, stack: &Stack, i: usize) -> Option<String> {
 /// A **merged** reference becomes [`Dep::Main`]. Anything else is an error: we
 /// must never fall back to "previous layer", which would silently re-stack the
 /// commit onto a sibling the author explicitly disclaimed.
-async fn resolve_external_deps(
+pub async fn resolve_external_deps(
     forge: &dyn Forge,
     stack: &mut Stack,
+    opts: &SyncOptions,
 ) -> Result<()> {
     for i in 0..stack.layers.len() {
+        if !opts.is_layer_selected(i) {
+            continue;
+        }
         let Dep::ExternalPr(number) = stack.layers[i].dep else {
             continue;
         };

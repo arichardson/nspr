@@ -108,7 +108,7 @@ struct CloseArgs {
 
 #[derive(Args, Default)]
 struct DiffArgs {
-    /// Push every layer, even ones whose displayed diff has not changed.
+    /// Push all stacks on the branch, not just the current stack.
     #[arg(short, long)]
     all: bool,
 
@@ -264,15 +264,6 @@ impl Session {
 
     async fn diff(&self, args: DiffArgs, verbose: bool) -> Result<()> {
         let mut stack = self.discover()?;
-        if !args.cherry_pick {
-            nspr::upgrade::reject_if_legacy_spr(
-                &self.git,
-                &self.forge,
-                &self.config,
-                &stack,
-            )
-            .await?;
-        }
 
         let only_layer = if args.cherry_pick {
             let head_idx = stack.layers.len() - 1;
@@ -326,12 +317,36 @@ impl Session {
             None
         };
 
+        let components = stack.components();
+        let only_layers = if !args.all
+            && !args.cherry_pick
+            && components.len() > 1
+        {
+            let head_idx = stack.layers.len() - 1;
+            let current_comp = stack.component_of(head_idx);
+            let commit_word = if current_comp.len() == 1 {
+                "commit"
+            } else {
+                "commits"
+            };
+            eprintln!(
+                "{} branch has {} independent stacks; only updating the current stack ({} {commit_word}). Use `nspr diff --all` to push all stacks.",
+                style("warning:").yellow().bold(),
+                components.len(),
+                current_comp.len(),
+            );
+            Some(current_comp.into_iter().collect())
+        } else {
+            None
+        };
+
         let mut opts = SyncOptions {
-            sync_all: args.all,
+            sync_all: false,
             message: args.message.clone(),
             update_message: args.update_message,
             draft: args.draft,
             only_layer,
+            only_layers,
             ..Default::default()
         };
 
@@ -357,7 +372,7 @@ impl Session {
         // A preflight round of queries, before anything is mutated: renders the
         // stack plan up-front and emits guardrail warnings before any prompt or
         // network push runs.
-        self.preflight(&stack, &mut opts).await?;
+        self.preflight(&mut stack, &mut opts).await?;
 
         let outcomes = engine::sync_stack(
             &self.git,
@@ -369,12 +384,16 @@ impl Session {
         )
         .await?;
 
-        self.report(&stack, &outcomes, verbose).await?;
+        self.report(&stack, &opts, &outcomes, verbose).await?;
 
         if self.config.stack_comments {
-            let updated =
-                stack_comment::update_all(&self.forge, &self.config, &stack)
-                    .await?;
+            let updated = stack_comment::update_for_opts(
+                &self.forge,
+                &self.config,
+                &stack,
+                &opts,
+            )
+            .await?;
             if verbose {
                 println!("  {} stack comment(s) written", updated);
             }
@@ -386,11 +405,25 @@ impl Session {
     /// `opts.preserve_commit_history` and `opts.refresh_when_behind`. Read-only.
     async fn preflight(
         &self,
-        stack: &Stack,
+        stack: &mut Stack,
         opts: &mut SyncOptions,
     ) -> Result<()> {
+        engine::resolve_external_deps(&self.forge, stack, opts).await?;
         let trees = stack.all_trees(&self.git)?;
-        let prs = engine::gather(&self.forge, stack).await?;
+        let prs = engine::gather_for(&self.forge, stack, opts).await?;
+        engine::reject_unusable_for(
+            &prs,
+            opts.only_layer,
+            opts.only_layers.as_ref(),
+        )?;
+        nspr::upgrade::reject_if_legacy_spr_with_prs(
+            &self.git,
+            &self.config,
+            stack,
+            &prs,
+            opts.only_layer,
+            opts.only_layers.as_ref(),
+        )?;
         let merge_settings = self.forge.repo_merge_settings().await?;
         opts.preserve_commit_history =
             self.config.preserve_commit_history.resolve(merge_settings);
@@ -407,7 +440,7 @@ impl Session {
         .await?;
         opts.refresh_when_behind = rails.refresh_when_behind;
         let decision = engine::decide(&self.git, stack, &prs, &trees, opts)?;
-        let plan = status::from_parts(
+        let mut plan = status::from_parts(
             &self.git,
             &self.config,
             stack,
@@ -415,6 +448,7 @@ impl Session {
             &decision,
             opts.update_message,
         )?;
+        plan.layers.retain(|l| opts.is_layer_selected(l.index));
         print!("{}", plan.render_plan(opts.update_message));
         for warning in &rails.warnings {
             eprintln!("{} {warning}", style("warning:").yellow().bold());
@@ -433,6 +467,7 @@ impl Session {
     async fn report(
         &self,
         stack: &Stack,
+        opts: &SyncOptions,
         outcomes: &[LayerOutcome],
         verbose: bool,
     ) -> Result<()> {
@@ -451,9 +486,10 @@ impl Session {
         let retargeted = outcomes.iter().filter(|o| o.retargeted).count();
 
         if verbose {
-            let report =
+            let mut report =
                 status::status(&self.git, &self.forge, &self.config, stack)
                     .await?;
+            report.layers.retain(|l| opts.is_layer_selected(l.index));
             print!("{}", report.render_diff(outcomes));
         } else {
             for o in
@@ -490,7 +526,9 @@ impl Session {
         }
 
         if parts.is_empty() {
-            let total = stack.layers.len();
+            let total = (0..stack.layers.len())
+                .filter(|&i| opts.is_layer_selected(i))
+                .count();
             let noun = if total == 1 { "PR" } else { "PRs" };
             println!(
                 "{} Done (all {total} {noun} up to date)",
@@ -596,6 +634,7 @@ impl Session {
                 println!("Restacking...");
                 self.diff(
                     DiffArgs {
+                        all: true,
                         no_prompt: true,
                         ..Default::default()
                     },
