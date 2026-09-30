@@ -224,7 +224,8 @@ pub async fn sync_stack(
     recover_missing_pr_trailers(git, forge, config, stack, &mut opts, prompter)
         .await?;
 
-    let trees = stack.all_trees(git)?;
+    let trees =
+        stack.trees_for(git, opts.only_layer, opts.only_layers.as_ref())?;
 
     let prs = gather_for(forge, stack, &opts).await?;
     reject_unusable_for(&prs, opts.only_layer, opts.only_layers.as_ref())?;
@@ -277,7 +278,11 @@ pub async fn sync_stack(
     let final_outcomes = if staged {
         let mut catchup_opts = opts.clone();
         catchup_opts.refresh_when_behind = true;
-        let trees = stack.all_trees(git)?;
+        let trees = stack.trees_for(
+            git,
+            catchup_opts.only_layer,
+            catchup_opts.only_layers.as_ref(),
+        )?;
         let prs = gather_for(forge, stack, &catchup_opts).await?;
         reject_unusable_for(
             &prs,
@@ -331,7 +336,9 @@ pub async fn sync_stack(
     };
 
     forge
-        .sync_stacks(&stack.pr_chains_for(opts.only_layers.as_ref()))
+        .sync_stacks(
+            &stack.pr_chains_for(opts.only_layer, opts.only_layers.as_ref()),
+        )
         .await?;
     Ok(final_outcomes)
 }
@@ -657,9 +664,7 @@ pub fn decide(
     //   branch as a single clean commit (`rewrite_history[i] = true`).
     let mut resulting_branch_tree: Vec<Oid> = Vec::with_capacity(n);
     for i in 0..n {
-        if let Some(only) = opts.only_layer
-            && i != only
-        {
+        if !opts.is_layer_selected(i) && !push[i] {
             let fallback = prs[i]
                 .as_ref()
                 .and_then(|p| git.tree_of(p.head_oid).ok())

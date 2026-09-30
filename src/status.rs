@@ -83,7 +83,7 @@ pub async fn status(
     config: &Config,
     stack: &Stack,
 ) -> Result<StackStatus> {
-    let trees = stack.all_trees(git)?;
+    let trees = stack.all_trees_lenient(git)?;
     let prs = engine::gather(forge, stack).await?;
     let merge_settings = forge.repo_merge_settings().await?;
     let opts = SyncOptions {
@@ -94,6 +94,24 @@ pub async fn status(
     };
     let decision = engine::decide(git, stack, &prs, &trees, &opts)?;
     from_parts(git, config, stack, &prs, &decision, false)
+}
+
+pub async fn status_for(
+    git: &Git,
+    forge: &dyn Forge,
+    config: &Config,
+    stack: &Stack,
+    opts: &SyncOptions,
+) -> Result<StackStatus> {
+    let trees =
+        stack.trees_for(git, opts.only_layer, opts.only_layers.as_ref())?;
+    let prs = engine::gather_for(forge, stack, opts).await?;
+    let merge_settings = forge.repo_merge_settings().await?;
+    let mut status_opts = opts.clone();
+    status_opts.preserve_commit_history =
+        config.preserve_commit_history.resolve(merge_settings);
+    let decision = engine::decide(git, stack, &prs, &trees, &status_opts)?;
+    from_parts(git, config, stack, &prs, &decision, opts.update_message)
 }
 
 pub fn from_parts(

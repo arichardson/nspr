@@ -4393,3 +4393,70 @@ fn land_all_recovers_when_bottom_pr_was_already_merged_and_lands_remaining_stack
     assert!(!w.forge.branch_exists(&pr2_head));
     assert!(w.discover().layers.is_empty());
 }
+
+#[test]
+fn cherry_pick_diff_succeeds_when_lower_layer_conflicts_with_declared_dependency()
+ {
+    let mut w = World::new(&[("rvi-pseudos-invalid.s", "base\n")]);
+    // Layer 0 modifies `rvi-pseudos-invalid.s` (`Depends-On: main`).
+    w.add_layer(
+        "[RISC-V][MC] Reject x0 as the address/temporary register",
+        &[("rvi-pseudos-invalid.s", "base\nreject_x0_v1\n")],
+    );
+    w.set_trailer(0, crate::trailers::DEPENDS_ON, TRUNK);
+    // Layer 1 is an independent PR on `main` touching a different file.
+    w.add_layer(
+        "[MC] Add baseline test for MCContext::getSubtargetCopy",
+        &[("mc_test.cpp", "test_v1\n")],
+    );
+    w.set_trailer(1, crate::trailers::DEPENDS_ON, TRUNK);
+    // Layer 2 is a fixup commit targeting Layer 0's lines in `rvi-pseudos-invalid.s`,
+    // sitting on top of Layer 1 without a `Depends-On:` trailer (so its declared
+    // dependency is Layer 1, which does not have `reject_x0_v1` in its effective tree).
+    w.add_layer(
+        "fixup! [RISC-V][MC] Reject x0 as the address/temporary register",
+        &[("rvi-pseudos-invalid.s", "base\nreject_x0_v2\n")],
+    );
+    // Layer 3 (`HEAD`) is a later PR targeting `main`.
+    w.add_layer(
+        "[RISC-V][MC][RVY] Update to v0.9.10 specification",
+        &[("rvy.td", "v0_9_10\n")],
+    );
+    w.set_trailer(3, crate::trailers::DEPENDS_ON, TRUNK);
+
+    // Full `all_trees` fails on Layer 2 because Layer 2's change to
+    // `rvi-pseudos-invalid.s` conflicts when merged onto Layer 1's effective tree.
+    let full_err = w.discover().all_trees(&w.git).unwrap_err().to_string();
+    assert!(
+        full_err.contains("does not apply on top of its declared dependency"),
+        "expected full all_trees to fail on Layer 2, got: {full_err}"
+    );
+
+    // Updating Layer 3 via `--cherry-pick` (`only_layer: Some(3)`) or scoped
+    // current-stack diff (`only_layers: Some({3})`) must NOT fail on Layer 2.
+    let outcomes = w.sync_with(SyncOptions {
+        only_layer: Some(3),
+        update_message: true,
+        ..Default::default()
+    });
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].index, 3);
+    assert_eq!(outcomes[0].action, LayerAction::Created);
+
+    // Now amend Layer 3's commit message and update it with `--cherry-pick --update-message`.
+    w.layers[3].message.body = "Updated specification notes.".into();
+    w.rebuild();
+    let outcomes2 = w.sync_with(SyncOptions {
+        only_layer: Some(3),
+        update_message: true,
+        ..Default::default()
+    });
+    assert_eq!(outcomes2.len(), 1);
+    assert_eq!(outcomes2[0].index, 3);
+    assert_eq!(outcomes2[0].action, LayerAction::Updated);
+
+    // `nspr status` (`status::status`) also succeeds without bailing out on Layer 2.
+    let st = w.status();
+    assert_eq!(st.layers.len(), 4);
+    assert_eq!(st.layers[3].state, status::LayerState::Current);
+}
