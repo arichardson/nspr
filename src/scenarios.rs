@@ -4178,3 +4178,118 @@ fn multi_stack_diff_scopes_to_current_stack_ignoring_legacy_spr_in_earlier_stack
     assert!(!patch2.contains("spr.txt"));
     assert!(!patch2.contains("cur1.txt"));
 }
+
+#[test]
+fn upgrade_preserves_github_edits_by_default_and_overwrites_with_update_message()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Local title one", &[("a.txt", "a1")]);
+    w.layers[0].message.body = "Local body one.".into();
+    w.add_layer("Local title two", &[("b.txt", "b1")]);
+    w.layers[1].message.body = "Local body two.".into();
+    w.set_trailer(1, crate::trailers::DEPENDS_ON, "main");
+
+    let stack = w.discover();
+    let trees = stack.all_trees(&w.git).unwrap();
+
+    for (i, branch, pr_title, pr_body) in [
+        (
+            0usize,
+            "spr/main/1111",
+            "Web UI title one",
+            "Web UI body one.",
+        ),
+        (
+            1usize,
+            "spr/main/2222",
+            "Web UI title two",
+            "Web UI body two.",
+        ),
+    ] {
+        let tip = w
+            .git
+            .synthesize_initial_commit(
+                stack.base,
+                trees.effective[i],
+                stack.layers[i].commit,
+                "[spr] initial version",
+            )
+            .unwrap();
+        block_on(
+            w.forge
+                .push(&[crate::forge::PushSpec::fast_forward(branch, tip)]),
+        )
+        .unwrap();
+        let pr_num =
+            block_on(w.forge.create_pull_request(crate::forge::CreatePr {
+                title: pr_title.into(),
+                body: pr_body.into(),
+                base: TRUNK.into(),
+                head: branch.into(),
+                draft: false,
+            }))
+            .unwrap();
+        w.layers[i].message.set(
+            crate::trailers::LEGACY_SPR_PULL_REQUEST,
+            &format!("https://github.com/o/r/pull/{pr_num}"),
+        );
+    }
+    w.rebuild();
+    let pr1_num = w.discover().layers[0].pr.unwrap();
+    let pr2_num = w.discover().layers[1].pr.unwrap();
+
+    // First, upgrade with `update_message = false` (default): GitHub Web UI
+    // titles and descriptions are preserved and warnings are returned.
+    let mut stack = w.discover();
+    let upgraded = block_on(crate::upgrade::upgrade_stack_with_options(
+        &w.git, &w.forge, &w.config, &mut stack, false,
+    ))
+    .unwrap();
+    w.sync_worktree();
+    w.refresh_specs_from_repo();
+
+    assert_eq!(upgraded.len(), 2);
+    assert!(
+        upgraded[0]
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.contains("nspr upgrade --update-message")),
+        "expected message mismatch warning on PR #1, got: {:?}",
+        upgraded[0].warning
+    );
+    let pr1 = block_on(w.forge.get_pull_request(pr1_num)).unwrap();
+    assert_eq!(pr1.title, "Web UI title one");
+    assert_eq!(crate::pr_body::strip_warning(&pr1.body), "Web UI body one.");
+    // The branch commit itself was replaced with the clean local commit message.
+    assert_eq!(
+        w.git.message_of(pr1.head_oid).unwrap().trim(),
+        "Local title one\n\nLocal body one."
+    );
+
+    // Re-mark PR #2 as a legacy `spr` trailer and run `upgrade_stack_with_options(..., true)`:
+    // only PR #2's component is upgraded, and its GitHub title/body are
+    // overwritten from the local commit message without a warning.
+    w.layers[1].message.set(
+        crate::trailers::LEGACY_SPR_PULL_REQUEST,
+        &format!("https://github.com/o/r/pull/{pr2_num}"),
+    );
+    w.rebuild();
+
+    let mut stack = w.discover();
+    let upgraded2 = block_on(crate::upgrade::upgrade_stack_with_options(
+        &w.git, &w.forge, &w.config, &mut stack, true,
+    ))
+    .unwrap();
+    w.sync_worktree();
+    w.refresh_specs_from_repo();
+
+    assert_eq!(upgraded2.len(), 1);
+    assert_eq!(upgraded2[0].number, pr2_num);
+    assert!(upgraded2[0].warning.is_none());
+    let pr2 = block_on(w.forge.get_pull_request(pr2_num)).unwrap();
+    assert_eq!(pr2.title, "Local title two");
+    assert_eq!(crate::pr_body::strip_warning(&pr2.body), "Local body two.");
+    // PR #1 (in the other stack) was not touched by the second upgrade.
+    let pr1_after = block_on(w.forge.get_pull_request(pr1_num)).unwrap();
+    assert_eq!(pr1_after.title, "Web UI title one");
+}

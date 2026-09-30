@@ -39,6 +39,7 @@ pub struct UpgradedLayer {
     pub new_base: String,
     pub deleted_synthetic_base: Option<String>,
     pub tip: Oid,
+    pub warning: Option<String>,
 }
 
 /// True if any commit on `head_oid` down to `stop_oid` carries the tell-tale
@@ -145,36 +146,58 @@ pub fn reject_if_legacy_spr_with_prs(
 }
 
 /// Convert all `spr` pull requests in `stack` into native `nspr` stacked pull
-/// requests.
+/// requests, preserving existing GitHub PR titles and descriptions unless they
+/// are empty.
 pub async fn upgrade_stack(
     git: &Git,
     forge: &dyn Forge,
     config: &Config,
     stack: &mut Stack,
 ) -> Result<Vec<UpgradedLayer>> {
+    upgrade_stack_with_options(git, forge, config, stack, false).await
+}
+
+/// Convert all `spr` pull requests in `stack` into native `nspr` stacked pull
+/// requests. When `update_message` is true, each pull request's title and
+/// description on GitHub are overwritten from the local commit message;
+/// otherwise existing GitHub edits are preserved with a warning.
+pub async fn upgrade_stack_with_options(
+    git: &Git,
+    forge: &dyn Forge,
+    config: &Config,
+    stack: &mut Stack,
+    update_message: bool,
+) -> Result<Vec<UpgradedLayer>> {
     git.check_no_uncommitted_changes()?;
 
     let trees = stack.all_trees(git)?;
     let prs = crate::engine::gather(forge, stack).await?;
-    crate::engine::reject_unusable(&prs)?;
 
-    let mut needs_upgrade = false;
-    for (i, layer) in stack.layers.iter().enumerate() {
-        if layer.message.has_legacy_spr_trailer() {
-            needs_upgrade = true;
-            break;
+    let mut upgrade_layers: HashSet<usize> = HashSet::new();
+    for comp in stack.components() {
+        let mut comp_needs_upgrade = false;
+        for &i in &comp {
+            if stack.layers[i].message.has_legacy_spr_trailer() {
+                comp_needs_upgrade = true;
+                break;
+            }
+            if let Some(pr) = &prs[i]
+                && is_spr_layer(git, stack, i, pr, &prs, config)?
+            {
+                comp_needs_upgrade = true;
+                break;
+            }
         }
-        if let Some(pr) = &prs[i]
-            && is_spr_layer(git, stack, i, pr, &prs, config)?
-        {
-            needs_upgrade = true;
-            break;
+        if comp_needs_upgrade {
+            upgrade_layers.extend(comp);
         }
     }
 
-    if !needs_upgrade {
+    if upgrade_layers.is_empty() {
         return Ok(Vec::new());
     }
+
+    crate::engine::reject_unusable_for(&prs, None, Some(&upgrade_layers))?;
 
     let n = stack.layers.len();
     let head_branches: HashSet<String> =
@@ -193,6 +216,14 @@ pub async fn upgrade_stack(
     let mut pass2_pushes: Vec<PushSpec> = Vec::new();
 
     for (i, pr) in prs.iter().enumerate() {
+        if !upgrade_layers.contains(&i) {
+            base_branches.push(config.trunk.clone());
+            pass1_tips.push(stack.base);
+            final_tips.push(stack.base);
+            branches.push(String::new());
+            continue;
+        }
+
         let (pass1_parent_tip, final_parent_tip, base_branch) = match stack
             .layers[i]
             .dep
@@ -333,6 +364,9 @@ pub async fn upgrade_stack(
 
     if config.draft_while_retargeting {
         for i in 0..n {
+            if !upgrade_layers.contains(&i) {
+                continue;
+            }
             let Some(pr) = &prs[i] else { continue };
             if pr.draft || pr.base == base_branches[i] || retargeted_early[i] {
                 continue;
@@ -356,24 +390,61 @@ pub async fn upgrade_stack(
     let warn_merge_strategy =
         preserve_commit_history && !merge_settings.is_squash_only();
     for (i, pr) in prs.iter().enumerate() {
+        if !upgrade_layers.contains(&i) {
+            continue;
+        }
         let Some(pr) = pr else {
             continue;
         };
         let tip = final_tips[i];
         let base_branch = base_branches[i].clone();
         let subject = stack.layers[i].subject().to_string();
-        let body = crate::pr_body::splice_warning(
-            &stack.layers[i].message.clean_body_for_pr(),
-            warn_merge_strategy,
-        );
         let old_base = pr.base.clone();
 
+        let message_differs = crate::engine::pr_message_differs_from(
+            pr,
+            &stack.layers[i].message,
+        );
+        let pr_body_stripped = crate::pr_body::strip_warning(&pr.body);
+        let mut warning = None;
         let mut update = PullRequestUpdate::default();
-        if pr.title != subject {
-            update.title = Some(subject);
-        }
-        if pr.body != body {
-            update.body = Some(body);
+        if update_message
+            || !message_differs
+            || (pr.title.trim() == subject.trim()
+                && pr_body_stripped.trim().is_empty())
+        {
+            if pr.title != subject {
+                update.title = Some(subject);
+            }
+            let body = crate::pr_body::splice_warning(
+                &stack.layers[i].message.clean_body_for_pr(),
+                warn_merge_strategy,
+            );
+            if pr.body != body {
+                update.body = Some(body);
+            }
+        } else {
+            let what = match (
+                pr.title.trim() != stack.layers[i].message.subject.trim(),
+                pr_body_stripped.trim()
+                    != stack.layers[i].message.clean_body_for_pr().trim(),
+            ) {
+                (true, true) => "title and description",
+                (true, false) => "title",
+                (false, _) => "description",
+            };
+            warning = Some(format!(
+                "#{}'s local commit {} differs from the pull request on GitHub. \
+                 Run `nspr amend` to pull GitHub edits into your commit, or \
+                 `nspr upgrade --update-message` (or `nspr diff --update-message`) \
+                 to overwrite GitHub.",
+                pr.number, what,
+            ));
+            let body =
+                crate::pr_body::splice_warning(&pr.body, warn_merge_strategy);
+            if pr.body != body {
+                update.body = Some(body);
+            }
         }
         if pr.base != base_branch && !retargeted_early[i] {
             update.base = Some(base_branch.clone());
@@ -413,6 +484,7 @@ pub async fn upgrade_stack(
             new_base: base_branch,
             deleted_synthetic_base,
             tip,
+            warning,
         });
     }
 
@@ -427,10 +499,21 @@ pub async fn upgrade_stack(
     }
 
     crate::engine::apply_message_edits(git, stack, &messages)?;
-    forge.sync_stacks(&stack.pr_chains()).await?;
+    forge
+        .sync_stacks(&stack.pr_chains_for(Some(&upgrade_layers)))
+        .await?;
 
     if config.stack_comments {
-        crate::stack_comment::update_all(forge, config, stack).await?;
+        crate::stack_comment::update_for_opts(
+            forge,
+            config,
+            stack,
+            &crate::engine::SyncOptions {
+                only_layers: Some(upgrade_layers),
+                ..Default::default()
+            },
+        )
+        .await?;
     }
 
     Ok(upgraded)
