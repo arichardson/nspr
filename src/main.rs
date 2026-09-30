@@ -112,6 +112,10 @@ struct DiffArgs {
     #[arg(short, long)]
     all: bool,
 
+    /// Show what `nspr diff` would do without mutating local commits or GitHub.
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+
     /// Submit only the HEAD commit as an independent pull request targeting trunk (`Depends-On: main`).
     #[arg(short = 'c', long)]
     cherry_pick: bool,
@@ -268,22 +272,31 @@ impl Session {
         let only_layer = if args.cherry_pick {
             let head_idx = stack.layers.len() - 1;
             if stack.layers[head_idx].dep != nspr::stack::Dep::Main {
-                let mut msg = stack.layers[head_idx].message.clone();
-                msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
-                let pairs: Vec<(git2::Oid, String)> = stack
-                    .layers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        if i == head_idx {
-                            (l.commit, msg.render())
-                        } else {
-                            (l.commit, l.message.render())
-                        }
-                    })
-                    .collect();
-                self.git.rewrite_messages(stack.base, &pairs)?;
-                stack = self.discover()?;
+                if args.dry_run {
+                    stack.layers[head_idx]
+                        .message
+                        .set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
+                    stack.layers[head_idx].dep_spec =
+                        Some(nspr::stack::DepSpec::Main);
+                    stack.layers[head_idx].dep = nspr::stack::Dep::Main;
+                } else {
+                    let mut msg = stack.layers[head_idx].message.clone();
+                    msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
+                    let pairs: Vec<(git2::Oid, String)> = stack
+                        .layers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| {
+                            if i == head_idx {
+                                (l.commit, msg.render())
+                            } else {
+                                (l.commit, l.message.render())
+                            }
+                        })
+                        .collect();
+                    self.git.rewrite_messages(stack.base, &pairs)?;
+                    stack = self.discover()?;
+                }
             }
             Some(head_idx)
         } else if args.new_stack {
@@ -295,22 +308,31 @@ impl Session {
             if target_idx > 0
                 && stack.layers[target_idx].dep != nspr::stack::Dep::Main
             {
-                let mut msg = stack.layers[target_idx].message.clone();
-                msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
-                let pairs: Vec<(git2::Oid, String)> = stack
-                    .layers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        if i == target_idx {
-                            (l.commit, msg.render())
-                        } else {
-                            (l.commit, l.message.render())
-                        }
-                    })
-                    .collect();
-                self.git.rewrite_messages(stack.base, &pairs)?;
-                stack = self.discover()?;
+                if args.dry_run {
+                    stack.layers[target_idx]
+                        .message
+                        .set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
+                    stack.layers[target_idx].dep_spec =
+                        Some(nspr::stack::DepSpec::Main);
+                    stack.layers[target_idx].dep = nspr::stack::Dep::Main;
+                } else {
+                    let mut msg = stack.layers[target_idx].message.clone();
+                    msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
+                    let pairs: Vec<(git2::Oid, String)> = stack
+                        .layers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| {
+                            if i == target_idx {
+                                (l.commit, msg.render())
+                            } else {
+                                (l.commit, l.message.render())
+                            }
+                        })
+                        .collect();
+                    self.git.rewrite_messages(stack.base, &pairs)?;
+                    stack = self.discover()?;
+                }
             }
             None
         } else {
@@ -353,26 +375,32 @@ impl Session {
         let fixed = FixedPrompter(AUTO_UPDATE_MESSAGE.to_string());
         let interactive = InteractivePrompter;
         let prompter: &dyn Prompter =
-            if args.no_prompt || args.message.is_some() {
+            if args.no_prompt || args.message.is_some() || args.dry_run {
                 &fixed
             } else {
                 &interactive
             };
 
-        engine::recover_missing_pr_trailers(
-            &self.git,
-            &self.forge,
-            &self.config,
-            &mut stack,
-            &mut opts,
-            prompter,
-        )
-        .await?;
+        if !args.dry_run {
+            engine::recover_missing_pr_trailers(
+                &self.git,
+                &self.forge,
+                &self.config,
+                &mut stack,
+                &mut opts,
+                prompter,
+            )
+            .await?;
+        }
 
         // A preflight round of queries, before anything is mutated: renders the
         // stack plan up-front and emits guardrail warnings before any prompt or
         // network push runs.
-        self.preflight(&mut stack, &mut opts).await?;
+        let plan = self.preflight(&mut stack, &mut opts, args.dry_run).await?;
+        if args.dry_run {
+            self.report_dry_run(&plan);
+            return Ok(());
+        }
 
         let outcomes = engine::sync_stack(
             &self.git,
@@ -407,7 +435,8 @@ impl Session {
         &self,
         stack: &mut Stack,
         opts: &mut SyncOptions,
-    ) -> Result<()> {
+        dry_run: bool,
+    ) -> Result<status::StackStatus> {
         engine::resolve_external_deps(&self.forge, stack, opts).await?;
         let trees = stack.all_trees(&self.git)?;
         let prs = engine::gather_for(&self.forge, stack, opts).await?;
@@ -458,10 +487,62 @@ impl Session {
                 .layers
                 .iter()
                 .any(|l| l.state == status::LayerState::Modified);
-        if any_will_push {
+        if !dry_run && any_will_push {
             println!();
         }
-        Ok(())
+        Ok(plan)
+    }
+
+    fn report_dry_run(&self, plan: &status::StackStatus) {
+        let created = plan
+            .layers
+            .iter()
+            .filter(|l| l.state == status::LayerState::New)
+            .count();
+        let updated = plan
+            .layers
+            .iter()
+            .filter(|l| l.state == status::LayerState::Modified)
+            .count();
+        let refreshed = plan
+            .layers
+            .iter()
+            .filter(|l| l.state == status::LayerState::NeedsRestack)
+            .count();
+        let retargeted = plan
+            .layers
+            .iter()
+            .filter(|l| l.base.as_deref().is_some_and(|b| b != l.wanted_base))
+            .count();
+
+        let mut parts = Vec::new();
+        if created > 0 {
+            parts.push(format!("{created} to create"));
+        }
+        if updated > 0 {
+            parts.push(format!("{updated} to update"));
+        }
+        if refreshed > 0 {
+            parts.push(format!("{refreshed} to restack"));
+        }
+        if retargeted > 0 {
+            parts.push(format!("{retargeted} to retarget"));
+        }
+
+        if parts.is_empty() {
+            let total = plan.layers.len();
+            let noun = if total == 1 { "PR" } else { "PRs" };
+            println!(
+                "{} Dry run (all {total} {noun} up to date)",
+                style("✓").green().bold()
+            );
+        } else {
+            println!(
+                "{} Dry run ({})",
+                style("✓").green().bold(),
+                parts.join(", ")
+            );
+        }
     }
 
     async fn report(
@@ -1335,6 +1416,27 @@ mod tests {
         let cli = Cli::try_parse_from(["nspr", "diff", "-c"]).unwrap();
         match cli.command {
             Some(Command::Diff(args)) => assert!(args.cherry_pick),
+            _ => panic!("expected Diff"),
+        }
+    }
+
+    #[test]
+    fn cli_diff_accepts_dry_run_and_all_flags() {
+        let cli = Cli::try_parse_from(["nspr", "diff", "--dry-run"]).unwrap();
+        match cli.command {
+            Some(Command::Diff(args)) => {
+                assert!(args.dry_run);
+                assert!(!args.all);
+            }
+            _ => panic!("expected Diff"),
+        }
+
+        let cli = Cli::try_parse_from(["nspr", "diff", "-n", "-a"]).unwrap();
+        match cli.command {
+            Some(Command::Diff(args)) => {
+                assert!(args.dry_run);
+                assert!(args.all);
+            }
             _ => panic!("expected Diff"),
         }
     }
