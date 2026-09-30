@@ -177,21 +177,29 @@ pub async fn upgrade_stack(
         return Ok(Vec::new());
     }
 
+    let n = stack.layers.len();
     let head_branches: HashSet<String> =
         prs.iter().flatten().map(|p| p.head.clone()).collect();
 
     let mut upgraded = Vec::new();
-    let mut tips: Vec<Oid> = Vec::with_capacity(stack.layers.len());
-    let mut branches: Vec<String> = Vec::with_capacity(stack.layers.len());
-    let mut base_branches: Vec<String> = Vec::with_capacity(stack.layers.len());
+    let mut pass1_tips: Vec<Oid> = Vec::with_capacity(n);
+    let mut final_tips: Vec<Oid> = Vec::with_capacity(n);
+    let mut branches: Vec<String> = Vec::with_capacity(n);
+    let mut base_branches: Vec<String> = Vec::with_capacity(n);
+    let mut retargeted_early: Vec<bool> = vec![false; n];
+    let mut undraft: Vec<String> = Vec::new();
     let mut messages: Vec<CommitMessage> =
         stack.layers.iter().map(|l| l.message.clone()).collect();
-    let mut head_pushes: Vec<PushSpec> = Vec::new();
+    let mut pass1_pushes: Vec<PushSpec> = Vec::new();
+    let mut pass2_pushes: Vec<PushSpec> = Vec::new();
 
     for (i, pr) in prs.iter().enumerate() {
-        let (parent_tip, base_branch) = match stack.layers[i].dep {
+        let (pass1_parent_tip, final_parent_tip, base_branch) = match stack
+            .layers[i]
+            .dep
+        {
             Dep::Main | Dep::ExternalPr(_) => {
-                (stack.base, config.trunk.clone())
+                (stack.base, stack.base, config.trunk.clone())
             }
             Dep::Layer(j) => {
                 if branches[j].is_empty() {
@@ -201,31 +209,146 @@ pub async fn upgrade_stack(
                         stack.layers[j].subject(),
                     );
                 }
-                (tips[j], branches[j].clone())
+                (pass1_tips[j], final_tips[j], branches[j].clone())
             }
         };
-        base_branches.push(base_branch);
+        base_branches.push(base_branch.clone());
 
         let Some(pr) = pr else {
-            tips.push(stack.base);
+            pass1_tips.push(stack.base);
+            final_tips.push(stack.base);
             branches.push(String::new());
             continue;
         };
 
+        let fallback_base_tip = match stack.layers[i].dep {
+            Dep::Main | Dep::ExternalPr(_) => stack.base,
+            Dep::Layer(j) => {
+                prs[j].as_ref().map(|p| p.head_oid).unwrap_or(stack.base)
+            }
+        };
+        let current_pr_base_tip = if pr.base_oid != Oid::ZERO_SHA1 {
+            pr.base_oid
+        } else {
+            fallback_base_tip
+        };
+
+        // When retargeting to `trunk` (for example, a root `spacedentist/spr`
+        // pull request whose synthetic base branch `users/<login>/spr/main.<slug>`
+        // sits on an older `main` commit `M_0` while `main` has advanced to
+        // `M_1`), if `merge_base(old_base, pr.head) == merge_base(main, pr.head)`
+        // (both equal `M_0`), retargeting `pr.base` to `main` *before* pushing
+        // is 100% diff-neutral and allows pushing directly to `final_tip` in a
+        // single pass.
+        let retargeted_before_push = if pr.base != base_branch
+            && matches!(stack.layers[i].dep, Dep::Main | Dep::ExternalPr(_))
+            && git.merge_base(current_pr_base_tip, pr.head_oid)?
+                == git.merge_base(stack.base, pr.head_oid)?
+        {
+            if config.draft_while_retargeting && !pr.draft {
+                forge.set_draft(&pr.node_id, true).await?;
+                undraft.push(pr.node_id.clone());
+            }
+            forge
+                .update_pull_request(
+                    pr.number,
+                    PullRequestUpdate {
+                        base: Some(base_branch.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            true
+        } else {
+            false
+        };
+        retargeted_early[i] = retargeted_before_push;
+
+        // Re-anchoring and retargeting cannot happen atomically: if `pr.head`
+        // were pushed onto `new_base_tip` while `pr.base` on GitHub still
+        // pointed at an older `spr` synthetic base branch (as happened on
+        // llvm/llvm-project#203599), GitHub would compute the three-dot diff
+        // across every upstream `main` commit between the old synthetic base
+        // and the new `main`, immediately subscribing all `CODEOWNERS` across
+        // the repository. Park `pr.head` at `merge_base(old_base, new_base)`
+        // first, retarget `pr.base`, and only then advance `pr.head` to
+        // `final_tip`.
+        let effective_old_base_tip = if let Some((_, pushed_tip)) = branches
+            .iter()
+            .zip(&pass1_tips)
+            .find(|(b, _)| *b == &pr.base)
+        {
+            git.merge_base(current_pr_base_tip, *pushed_tip)?
+        } else {
+            current_pr_base_tip
+        };
+        let raw_anchor = if retargeted_before_push {
+            pass1_parent_tip
+        } else {
+            crate::engine::safe_retarget_anchor(
+                git,
+                pr,
+                &base_branch,
+                effective_old_base_tip,
+                pass1_parent_tip,
+            )?
+            .unwrap_or(pass1_parent_tip)
+        };
+
         let clean_msg = stack.layers[i].message.clean_for_branch();
-        let tip = git.synthesize_initial_commit(
-            parent_tip,
+        let final_tip = git.synthesize_initial_commit(
+            final_parent_tip,
             trees.effective[i],
             stack.layers[i].commit,
             &clean_msg,
         )?;
-        head_pushes.push(PushSpec::forced(&pr.head, tip));
-        tips.push(tip);
+        let pass1_tip = if raw_anchor == final_parent_tip {
+            final_tip
+        } else {
+            let staged_tree = crate::engine::stage_tree_onto(
+                git,
+                trees.dep[i],
+                raw_anchor,
+                trees.effective[i],
+            )?;
+            git.synthesize_initial_commit(
+                raw_anchor,
+                staged_tree,
+                stack.layers[i].commit,
+                &clean_msg,
+            )?
+        };
+
+        let pr_label = format!("#{}", pr.number);
+        pass1_pushes
+            .push(PushSpec::forced(&pr.head, pass1_tip).with_label(&pr_label));
+        if pass1_tip != final_tip {
+            pass2_pushes.push(
+                PushSpec::forced(&pr.head, final_tip).with_label(&pr_label),
+            );
+        }
+        pass1_tips.push(pass1_tip);
+        final_tips.push(final_tip);
         branches.push(pr.head.clone());
     }
 
-    if !head_pushes.is_empty() {
-        forge.push(&head_pushes).await?;
+    if config.draft_while_retargeting {
+        for i in 0..n {
+            let Some(pr) = &prs[i] else { continue };
+            if pr.draft || pr.base == base_branches[i] || retargeted_early[i] {
+                continue;
+            }
+            forge.set_draft(&pr.node_id, true).await?;
+            undraft.push(pr.node_id.clone());
+        }
+    }
+
+    if !pass1_pushes.is_empty() {
+        if !pass2_pushes.is_empty() {
+            pass1_pushes[0].context =
+                Some("1/2, staging before retarget".to_string());
+        }
+        forge.push(&pass1_pushes).await?;
     }
 
     let merge_settings = forge.repo_merge_settings().await?;
@@ -237,7 +360,7 @@ pub async fn upgrade_stack(
         let Some(pr) = pr else {
             continue;
         };
-        let tip = tips[i];
+        let tip = final_tips[i];
         let base_branch = base_branches[i].clone();
         let subject = stack.layers[i].subject().to_string();
         let body = crate::pr_body::splice_warning(
@@ -253,7 +376,7 @@ pub async fn upgrade_stack(
         if pr.body != body {
             update.body = Some(body);
         }
-        if pr.base != base_branch {
+        if pr.base != base_branch && !retargeted_early[i] {
             update.base = Some(base_branch.clone());
         }
         if !update.is_empty() {
@@ -292,6 +415,16 @@ pub async fn upgrade_stack(
             deleted_synthetic_base,
             tip,
         });
+    }
+
+    if !pass2_pushes.is_empty() {
+        pass2_pushes[0].context =
+            Some("2/2, restacking after retarget".to_string());
+        forge.push(&pass2_pushes).await?;
+    }
+
+    for node_id in undraft {
+        forge.set_draft(&node_id, false).await?;
     }
 
     crate::engine::apply_message_edits(git, stack, &messages)?;

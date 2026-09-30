@@ -332,7 +332,7 @@ mod tests {
 
         let remote = GitRemote::new(
             repo,
-            "git@github.com:o/r.git".into(),
+            "ssh://git@127.0.0.1:1/o/r.git".into(),
             "fake-token".into(),
         )
         .with_ssh_agent_socket(missing_sock)
@@ -341,7 +341,7 @@ mod tests {
         let err = remote.branches().unwrap_err().to_string();
         assert!(
             err.contains(
-                "SSH authentication failed connecting to git@github.com:o/r.git"
+                "SSH authentication failed connecting to ssh://git@127.0.0.1:1/o/r.git"
             ),
             "expected SSH authentication error, got: {err}"
         );
@@ -373,7 +373,7 @@ mod tests {
 
         let remote = GitRemote::new(
             repo,
-            "git@github.com:o/r.git".into(),
+            "ssh://git@127.0.0.1:1/o/r.git".into(),
             "fake-token".into(),
         )
         .with_ssh_agent_socket(hung_sock)
@@ -405,7 +405,10 @@ mod tests {
         let repo = t.open();
         let mut config = repo.config().unwrap();
         config
-            .set_str("url.git@github.com:.pushInsteadOf", "https://github.com/")
+            .set_str(
+                "url.ssh://git@127.0.0.1:1/.pushInsteadOf",
+                "https://127.0.0.1:1/",
+            )
             .unwrap();
         drop(config);
 
@@ -413,7 +416,7 @@ mod tests {
             PathBuf::from("/tmp/nspr-test-nonexistent-rewrite.sock");
         let remote = GitRemote::new(
             Arc::new(repo),
-            "https://github.com/o/r.git".into(),
+            "https://127.0.0.1:1/o/r.git".into(),
             "fake-token".into(),
         )
         .with_ssh_agent_socket(missing_sock)
@@ -425,7 +428,7 @@ mod tests {
             .to_string();
         assert!(
             err.contains(
-                "rewritten from 'https://github.com/o/r.git' via git config"
+                "rewritten from 'https://127.0.0.1:1/o/r.git' via git config"
             ),
             "expected rewrite explanation, got: {err}"
         );

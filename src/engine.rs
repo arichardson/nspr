@@ -784,7 +784,7 @@ fn would_conflict_or_diverge_on_forge(
 /// happen.
 ///
 /// Returns `None` when no staging is needed.
-fn safe_retarget_anchor(
+pub(crate) fn safe_retarget_anchor(
     git: &Git,
     pr: &PullRequest,
     new_base_branch: &str,
@@ -812,7 +812,7 @@ fn safe_retarget_anchor(
 ///
 /// Returns `None` if the three-way merge conflicts, which is the caller's cue
 /// to give up on staging rather than to fail.
-fn rebase_tree_onto(
+pub(crate) fn rebase_tree_onto(
     git: &Git,
     ancestor_tree: Oid,
     onto: Oid,
@@ -836,6 +836,58 @@ fn rebase_tree_onto_tree(
         return Ok(None);
     }
     Ok(Some(git.write_index(index)?))
+}
+
+/// Construct a temporary staging tree on top of `onto` whose diff against
+/// `tree(onto)` touches only paths modified between `ancestor_tree` and
+/// `desired`.
+///
+/// When `merge_trees(ancestor_tree, tree(onto), desired)` has conflicts (which
+/// happens when `onto..parent` modified the same file as the layer itself), any
+/// conflicted path is necessarily a path modified by this layer (`ancestor_tree`
+/// != `desired`), because paths untouched by the layer resolve trivially to
+/// `tree(onto)`. Resolving conflicted entries in favor of `desired` (the layer's
+/// side) produces a conflict-free tree that differs from `tree(onto)` strictly
+/// on paths modified by this layer, so parking at `onto` before retargeting the
+/// pull request's base branch never exposes unrelated upstream files to GitHub's
+/// `CODEOWNERS`.
+pub(crate) fn stage_tree_onto(
+    git: &Git,
+    ancestor_tree: Oid,
+    onto: Oid,
+    desired: Oid,
+) -> Result<Oid> {
+    let ours_tree = git.tree_of(onto)?;
+    if ours_tree == ancestor_tree {
+        return Ok(desired);
+    }
+    let mut index = git.merge_trees(ancestor_tree, ours_tree, desired)?;
+    if index.has_conflicts() {
+        let conflicts: Vec<_> = index
+            .conflicts()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for conflict in conflicts {
+            if let Some(mut their) = conflict.their {
+                let path = std::path::Path::new(
+                    std::str::from_utf8(&their.path).unwrap_or_default(),
+                );
+                index.conflict_remove(path)?;
+                // Clear git index stage bits (bits 12..13) to mark resolved (stage 0).
+                their.flags &= !0x3000;
+                index.add(&their)?;
+            } else if let Some(ancestor_or_our) =
+                conflict.our.or(conflict.ancestor)
+            {
+                let path = std::path::Path::new(
+                    std::str::from_utf8(&ancestor_or_our.path)
+                        .unwrap_or_default(),
+                );
+                index.conflict_remove(path)?;
+                let _ = index.remove_path(path);
+            }
+        }
+    }
+    git.write_index(index)
 }
 
 /// Check whether keeping a pull request anchored at `anchor` (while its base
@@ -1093,7 +1145,7 @@ async fn execute(
                     .unwrap_or(parent_tip)
                 };
 
-                let rebased_onto_anchor = rebase_tree_onto(
+                let staged_onto_anchor = stage_tree_onto(
                     git,
                     trees.dep[i],
                     raw_anchor,
@@ -1105,10 +1157,7 @@ async fn execute(
                 // check whether `pr.head_oid` on the remote is *already* safely
                 // anchored at `current_pr_base_tip` (so retargeting `pr.base`
                 // to `base_branches[i]` in Phase 3 is immediately diff-neutral
-                // without pushing a temporary commit in Pass 1), or whether
-                // `rebase_tree_onto` conflicted (so pushing `parent_tip` in
-                // Pass 1 would risk making a newly-lowered PR an ancestor of
-                // its old base branch and triggering GitHub's auto-merge).
+                // without pushing a temporary commit in Pass 1).
                 let parent_deferred = matches!(
                     stack.layers[i].dep,
                     Dep::Layer(j) if deferred_to_stage2[j]
@@ -1132,9 +1181,7 @@ async fn execute(
                     && !decision.message_changed[i];
                 let defer_push_to_stage2 = no_auto_merge_hazard
                     && (already_parked_on_remote
-                        || (parent_deferred && pr.base == base_branches[i])
-                        || (raw_anchor != parent_tip
-                            && rebased_onto_anchor.is_none()));
+                        || (parent_deferred && pr.base == base_branches[i]));
 
                 if defer_push_to_stage2 {
                     *staged = true;
@@ -1150,14 +1197,7 @@ async fn execute(
                 // because `parent_tip` is already the parked tip in that case,
                 // a layer stacked on a parked dependency as well: without the
                 // replay it would carry content its own base does not have.
-                //
-                // Replaying can conflict where the forward move would not.
-                // Nothing is lost by declining, it just means taking the
-                // ordinary path.
-                let (anchor, desired_tree) = match rebased_onto_anchor {
-                    Some(tree) => (raw_anchor, tree),
-                    None => (parent_tip, desired_tree),
-                };
+                let (anchor, desired_tree) = (raw_anchor, staged_onto_anchor);
                 if anchor != parent_tip {
                     *staged = true;
                 }
