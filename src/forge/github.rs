@@ -173,7 +173,11 @@ impl Forge for GitHubForge {
             pr.mergeable,
             pr.merge_state
         );
-        self.remote.fetch_objects(&[pr.base_oid, pr.head_oid])?;
+        let mut to_fetch = vec![pr.base_oid, pr.head_oid];
+        if let Some(mc) = pr.merge_commit {
+            to_fetch.push(mc);
+        }
+        self.remote.fetch_objects(&to_fetch)?;
         Ok(pr)
     }
 
@@ -293,25 +297,80 @@ impl Forge for GitHubForge {
                 Ok(merge) => break merge,
                 Err(e) => {
                     let code = status_code(&e);
-                    if matches!(code, Some(405 | 409))
-                        && let Some(&delay_ms) = retry_delays_ms.get(attempt)
-                        && let Ok(pr) = self.get_pull_request(number).await
-                        && pr.state == PrState::Open
-                        && (pr.head_oid != req.expected_head
-                            || pr.mergeable == Mergeable::Unknown
-                            || code == Some(409)
-                            || attempt < 4)
-                    {
-                        debug!(
-                            "merge #{number} got HTTP {code:?} (head_oid={}, mergeable={:?}, merge_state={:?}); retrying in {delay_ms}ms",
-                            pr.head_oid, pr.mergeable, pr.merge_state
-                        );
-                        attempt += 1;
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            delay_ms,
-                        ))
-                        .await;
-                        continue;
+                    let is_transport_or_5xx = code.is_none()
+                        || matches!(code, Some(500 | 502 | 503 | 504));
+                    match self.get_pull_request(number).await {
+                        Ok(pr) if pr.state == PrState::Merged => {
+                            debug!(
+                                "merge #{number} request returned error ({e}), but PR is Merged on GitHub"
+                            );
+                            return self.resolve_merged_pr_oid(&pr).await;
+                        }
+                        Ok(pr)
+                            if pr.state == PrState::Open
+                                && (is_transport_or_5xx
+                                    || (matches!(code, Some(405 | 409))
+                                        && (pr.head_oid
+                                            != req.expected_head
+                                            || pr.mergeable
+                                                == Mergeable::Unknown
+                                            || code == Some(409)
+                                            || attempt < 4))) =>
+                        {
+                            if let Some(&delay_ms) =
+                                retry_delays_ms.get(attempt)
+                            {
+                                debug!(
+                                    "merge #{number} got error (code={code:?}, head_oid={}, mergeable={:?}, merge_state={:?}); retrying in {delay_ms}ms",
+                                    pr.head_oid, pr.mergeable, pr.merge_state
+                                );
+                                attempt += 1;
+                                tokio::time::sleep(
+                                    std::time::Duration::from_millis(delay_ms),
+                                )
+                                .await;
+                                if is_transport_or_5xx
+                                    && let Ok(pr_after) =
+                                        self.get_pull_request(number).await
+                                    && pr_after.state == PrState::Merged
+                                {
+                                    debug!(
+                                        "merge #{number} completed on GitHub while recovering from previous error"
+                                    );
+                                    return self
+                                        .resolve_merged_pr_oid(&pr_after)
+                                        .await;
+                                }
+                                continue;
+                            }
+                        }
+                        Err(probe_err) if is_transport_or_5xx => {
+                            if let Some(&delay_ms) =
+                                retry_delays_ms.get(attempt)
+                            {
+                                debug!(
+                                    "merge #{number} and follow-up probe failed ({probe_err}); retrying in {delay_ms}ms"
+                                );
+                                attempt += 1;
+                                tokio::time::sleep(
+                                    std::time::Duration::from_millis(delay_ms),
+                                )
+                                .await;
+                                if let Ok(pr_after) =
+                                    self.get_pull_request(number).await
+                                    && pr_after.state == PrState::Merged
+                                {
+                                    debug!(
+                                        "merge #{number} completed on GitHub while recovering from previous error"
+                                    );
+                                    return self
+                                        .resolve_merged_pr_oid(&pr_after)
+                                        .await;
+                                }
+                                continue;
+                            }
+                        }
+                        _ => {}
                     }
                     let advice = match code {
                         Some(409) => {
@@ -805,6 +864,35 @@ impl Forge for GitHubForge {
 }
 
 impl GitHubForge {
+    async fn resolve_merged_pr_oid(&self, pr: &PullRequest) -> Result<Oid> {
+        if let Some(oid) = pr.merge_commit {
+            debug!("  -> merged #{} as squash commit {oid}", pr.number);
+            return Ok(oid);
+        }
+        for delay_ms in [200_u64, 500, 1000] {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                .await;
+            if let Ok(refreshed) = self.get_pull_request(pr.number).await
+                && let Some(oid) = refreshed.merge_commit
+            {
+                debug!("  -> merged #{} as squash commit {oid}", pr.number);
+                return Ok(oid);
+            }
+        }
+        if let Some(oid) = self.branch_oid(&pr.base).await? {
+            debug!(
+                "  -> merged #{}; falling back to {} tip {oid}",
+                pr.number, pr.base
+            );
+            return Ok(oid);
+        }
+        bail!(
+            "#{} was merged on GitHub, but the resulting commit could not be \
+             determined. Run `nspr sync`.",
+            pr.number
+        )
+    }
+
     async fn list_remote_stacks(&self) -> Result<Option<Vec<RemoteStack>>> {
         let route =
             format!("/repos/{}/{}/stacks?per_page=100", self.owner, self.repo);
@@ -1007,6 +1095,8 @@ struct PullRequestNode {
     /// auto-merge is armed.
     #[serde(default)]
     auto_merge_request: Option<serde_json::Value>,
+    #[serde(default)]
+    merge_commit: Option<OidNode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1114,6 +1204,10 @@ fn error_suffix(errors: &[String]) -> String {
 }
 
 fn pull_request_from(node: PullRequestNode) -> Result<PullRequest> {
+    let merge_commit = match node.merge_commit {
+        Some(c) => Some(Oid::from_str(&c.oid)?),
+        None => None,
+    };
     Ok(PullRequest {
         number: node.number,
         node_id: node.id,
@@ -1124,6 +1218,7 @@ fn pull_request_from(node: PullRequestNode) -> Result<PullRequest> {
         head: node.head_ref_name,
         base_oid: Oid::from_str(&node.base_ref_oid)?,
         head_oid: Oid::from_str(&node.head_ref_oid)?,
+        merge_commit,
         mergeable: mergeable_from(node.mergeable.as_deref()),
         merge_state: merge_state_from(node.merge_state_status.as_deref()),
         auto_merge: node.auto_merge_request.is_some(),

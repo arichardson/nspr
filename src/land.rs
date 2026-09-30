@@ -107,7 +107,25 @@ pub async fn land_layer(
     opts: &LandOptions,
 ) -> Result<LandOutcome> {
     git.check_no_uncommitted_changes()?;
-    crate::upgrade::reject_if_legacy_spr(git, forge, config, stack).await?;
+    let comp_set: HashSet<usize> =
+        stack.component_of(index).into_iter().collect();
+    let prs_for_check = crate::engine::gather_for(
+        forge,
+        stack,
+        &crate::engine::SyncOptions {
+            only_layers: Some(comp_set.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    crate::upgrade::reject_if_legacy_spr_with_prs(
+        git,
+        config,
+        stack,
+        &prs_for_check,
+        None,
+        Some(&comp_set),
+    )?;
 
     let layer = &stack.layers[index];
     if let Dep::Layer(parent_idx) = layer.dep {
@@ -143,15 +161,10 @@ pub async fn land_layer(
         )
     })?;
     let pr = get_synced_pull_request(git, forge, number, true).await?;
-    match pr.state {
-        PrState::Merged => bail!(
-            "#{number} has already been merged. Run `nspr sync` to bring the \
-             local stack up to date."
-        ),
-        PrState::Closed => bail!("#{number} is closed."),
-        PrState::Open => {}
+    if pr.state == PrState::Closed {
+        bail!("#{number} is closed.");
     }
-    if pr.draft {
+    if pr.state == PrState::Open && pr.draft {
         bail!("#{number} is still a draft; mark it ready for review first.");
     }
 
@@ -161,7 +174,27 @@ pub async fn land_layer(
         .ok_or_else(|| eyre!("no `{}` branch on the remote", config.trunk))?;
     forge.fetch_commit(trunk_tip).await?;
 
-    check_merge_equals_cherrypick(git, layer.commit, trunk_tip, pr.head_oid)?;
+    if pr.state == PrState::Merged {
+        let squash_candidate = pr.merge_commit.unwrap_or(trunk_tip);
+        forge.fetch_commit(squash_candidate).await?;
+        check_already_merged_matches_local(
+            git,
+            layer,
+            number,
+            pr.base_oid,
+            pr.head_oid,
+            squash_candidate,
+            trunk_tip,
+            &config.trunk,
+        )?;
+    } else {
+        check_merge_equals_cherrypick(
+            git,
+            layer.commit,
+            trunk_tip,
+            pr.head_oid,
+        )?;
+    }
 
     let mut warnings = Vec::new();
     let dependents =
@@ -190,24 +223,28 @@ pub async fn land_layer(
 
     // --- Step 2: squash merge, with a compare-and-swap guard. ---------------
     let (title, message) = squash_message(layer, number, opts);
-    let merged = forge
-        .merge_pull_request(
-            number,
-            SquashMerge {
-                title: title.clone(),
-                message,
-                expected_head: pr.head_oid,
-            },
-        )
-        .await;
+    let squash = if pr.state == PrState::Merged {
+        pr.merge_commit.unwrap_or(trunk_tip)
+    } else {
+        let merged = forge
+            .merge_pull_request(
+                number,
+                SquashMerge {
+                    title: title.clone(),
+                    message,
+                    expected_head: pr.head_oid,
+                },
+            )
+            .await;
 
-    let squash = match merged {
-        Ok(oid) => oid,
-        Err(e) => {
-            // Put the dependents back where they were, so a failed land is not
-            // also a mess.
-            rollback(forge, &retargeted).await;
-            return Err(e).wrap_err(format!("could not merge #{number}"));
+        match merged {
+            Ok(oid) => oid,
+            Err(e) => {
+                // Put the dependents back where they were, so a failed land is not
+                // also a mess.
+                rollback(forge, &retargeted).await;
+                return Err(e).wrap_err(format!("could not merge #{number}"));
+            }
         }
     };
     forge.fetch_commit(squash).await?;
@@ -232,6 +269,14 @@ pub async fn land_layer(
         };
         let old_root = old_tip_of[&dep];
         let new_root = new_tip_of[&dep];
+
+        if old_root == Oid::ZERO_SHA1
+            || git.is_ancestor(new_root, d.tip).unwrap_or(false)
+        {
+            new_tip_of.insert(d.layer, d.tip);
+            old_tip_of.insert(d.layer, d.tip);
+            continue;
+        }
 
         let clean_msg = stack.layers[d.layer].message.clean_for_branch();
         let revisions = branch_revisions(git, d.tip, old_root)?;
@@ -302,19 +347,45 @@ pub async fn land_layer(
     crate::refs::remove(git, number)?;
 
     // --- Local cleanup: the landed commit becomes empty and drops out. ------
+    let rebase_onto = if git.is_ancestor(squash, trunk_tip)? {
+        trunk_tip
+    } else {
+        squash
+    };
     if !opts.keep_local {
-        stack
-            .rebase_without(git, &HashSet::from([index]), squash, false)
-            .wrap_err(
-                "#{number} landed, but the local stack could not be rebased onto \
-                 it. Run `git rebase --onto <trunk>` manually, then `nspr sync`.",
-            )?;
+        let removed = HashSet::from([index]);
+        if let Err(rebase_err) =
+            stack.rebase_without(git, &removed, rebase_onto, false)
+        {
+            if rebase_onto != stack.base && dependents.is_empty() {
+                stack
+                    .rebase_without(git, &removed, stack.base, false)
+                    .wrap_err(
+                        "#{number} landed, but the local stack could not be rebased onto \
+                         it. Run `git rebase --onto <trunk>` manually, then `nspr sync`.",
+                    )?;
+                warnings.push(format!(
+                    "#{number} landed and was removed from your local branch, \
+                     but rebasing the remaining commits onto `{}` failed \
+                     ({rebase_err}); left the remaining commits on their \
+                     current base `{}`. Run `nspr sync` when ready.",
+                    config.trunk,
+                    git.short_id(stack.base)?,
+                ));
+            } else {
+                return Err(rebase_err).wrap_err(format!(
+                    "#{number} landed, but the local stack could not be rebased onto \
+                     it. Run `git rebase --onto {}` manually, then `nspr sync`.",
+                    config.trunk
+                ));
+            }
+        }
     }
 
     Ok(LandOutcome {
         number,
         title,
-        squash,
+        squash: rebase_onto,
         repaired,
         warnings,
     })
@@ -326,7 +397,9 @@ struct LayerPrState {
     number: u64,
     branch: String,
     base: String,
+    base_oid: Oid,
     tip: Oid,
+    merge_commit: Option<Oid>,
     state: PrState,
     draft: bool,
     auto_merge_warning: Option<String>,
@@ -347,7 +420,23 @@ pub async fn land_all(
     opts: &LandOptions,
 ) -> Result<Vec<LandOutcome>> {
     git.check_no_uncommitted_changes()?;
-    crate::upgrade::reject_if_legacy_spr(git, forge, config, stack).await?;
+    let prs_for_check = crate::engine::gather_for(
+        forge,
+        stack,
+        &crate::engine::SyncOptions {
+            only_layers: opts.only_layers.clone(),
+            ..Default::default()
+        },
+    )
+    .await?;
+    crate::upgrade::reject_if_legacy_spr_with_prs(
+        git,
+        config,
+        stack,
+        &prs_for_check,
+        None,
+        opts.only_layers.as_ref(),
+    )?;
 
     if stack.layers.is_empty() {
         bail!("nothing to land: no commits ahead of `{}`", config.trunk);
@@ -367,6 +456,11 @@ pub async fn land_all(
     // Snapshot pull requests for all layers up front before mutating anything.
     let mut pr_states: HashMap<usize, LayerPrState> = HashMap::new();
     for (i, layer) in stack.layers.iter().enumerate() {
+        if let Some(allowed) = &opts.only_layers
+            && !allowed.contains(&i)
+        {
+            continue;
+        }
         if let Some(number) = layer.pr {
             let pr =
                 get_synced_pull_request(git, forge, number, i == 0).await?;
@@ -381,7 +475,9 @@ pub async fn land_all(
                     number,
                     branch: pr.head,
                     base: pr.base,
+                    base_oid: pr.base_oid,
                     tip: pr.head_oid,
+                    merge_commit: pr.merge_commit,
                     state: pr.state,
                     draft: pr.draft,
                     auto_merge_warning,
@@ -442,13 +538,62 @@ pub async fn land_all(
 
         match state.state {
             PrState::Merged => {
-                if first_error.is_none() {
-                    first_error = Some(eyre!(
-                        "#{} has already been merged. Run `nspr sync` to bring \
-                         the local stack up to date.",
-                        state.number
-                    ));
+                let squash = state.merge_commit.unwrap_or(current_trunk);
+                forge.fetch_commit(squash).await?;
+                if let Err(e) = check_already_merged_matches_local(
+                    git,
+                    &stack.layers[index],
+                    state.number,
+                    state.base_oid,
+                    state.tip,
+                    squash,
+                    current_trunk,
+                    &config.trunk,
+                ) {
+                    let msg = format!("{e:#}");
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    stop_warning =
+                        Some(format!("stopped at #{}: {msg}", state.number));
+                    continue;
                 }
+                for d_layer in stack.direct_dependents_of(index) {
+                    if let Some(d_state) = pr_states.get(&d_layer)
+                        && d_state.state == PrState::Open
+                        && d_state.base != config.trunk
+                    {
+                        let d_num = d_state.number;
+                        forge
+                            .update_pull_request(
+                                d_num,
+                                PullRequestUpdate {
+                                    base: Some(config.trunk.clone()),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        pr_states.get_mut(&d_layer).unwrap().base =
+                            config.trunk.clone();
+                    }
+                }
+                let (title, _) =
+                    squash_message(&stack.layers[index], state.number, opts);
+                print_landed(git, state.number, &title, squash)?;
+                forge.delete_branch(&state.branch).await?;
+                crate::refs::remove(git, state.number)?;
+
+                landed_layers.insert(index);
+                if !git.is_ancestor(squash, current_trunk)? {
+                    current_trunk = squash;
+                }
+                outcomes.push(LandOutcome {
+                    number: state.number,
+                    title,
+                    squash: current_trunk,
+                    repaired: Vec::new(),
+                    warnings: Vec::new(),
+                });
                 continue;
             }
             PrState::Closed => {
@@ -907,6 +1052,52 @@ fn check_merge_equals_cherrypick(
     Ok(())
 }
 
+/// Verify that when a pull request is already `Merged` on the forge, the local
+/// commit has no unmerged changes beyond what was in the pull request.
+#[allow(clippy::too_many_arguments)]
+fn check_already_merged_matches_local(
+    git: &Git,
+    layer: &crate::stack::Layer,
+    number: u64,
+    base_oid: Oid,
+    head_oid: Oid,
+    squash: Oid,
+    trunk_tip: Oid,
+    trunk_name: &str,
+) -> Result<()> {
+    for target in [squash, trunk_tip] {
+        if let Ok(idx) = git.cherrypick(layer.commit, target)
+            && !idx.has_conflicts()
+            && git.write_index(idx).ok() == git.tree_of(target).ok()
+        {
+            return Ok(());
+        }
+    }
+
+    if head_oid != Oid::ZERO_SHA1
+        && git.repo().find_commit(head_oid).is_ok()
+        && base_oid != Oid::ZERO_SHA1
+        && git.repo().find_commit(base_oid).is_ok()
+    {
+        let local_patch = crate::patch_id::tree_patch_id(
+            git.repo(),
+            git.tree_of(layer.parent)?,
+            git.tree_of(layer.commit)?,
+        )?;
+        let pr_patch = displayed_patch_id(git.repo(), base_oid, head_oid)?;
+        if local_patch == pr_patch {
+            return Ok(());
+        }
+    }
+
+    bail!(
+        "#{number} has already been merged on GitHub, but the local commit has \
+         additional changes that are not on `{trunk_name}`. Remove its \
+         `Pull-Request:` trailer to submit them as a new pull request, or run \
+         `nspr sync`."
+    );
+}
+
 /// Read a pull request from the forge, waiting briefly if `pr.head_oid` is
 /// lagging behind a branch tip that `nspr` itself just pushed.
 ///
@@ -924,6 +1115,12 @@ async fn get_synced_pull_request(
 ) -> Result<crate::forge::PullRequest> {
     let mut pr = forge.get_pull_request(number).await?;
     if pr.state != PrState::Open {
+        if pr.head_oid != Oid::ZERO_SHA1 {
+            let _ = forge.fetch_commit(pr.head_oid).await;
+        }
+        if let Some(mc) = pr.merge_commit {
+            let _ = forge.fetch_commit(mc).await;
+        }
         return Ok(pr);
     }
     if let Some(recorded_oid) = crate::refs::get(git, number)

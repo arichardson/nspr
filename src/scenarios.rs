@@ -4292,3 +4292,104 @@ fn upgrade_preserves_github_edits_by_default_and_overwrites_with_update_message(
     let pr1_after = block_on(w.forge.get_pull_request(pr1_num)).unwrap();
     assert_eq!(pr1_after.title, "Web UI title one");
 }
+
+#[test]
+fn land_layer_completes_cleanup_when_pr_was_already_merged_by_interrupted_land()
+{
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+    let pr1_info = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    let pr1_head = pr1_info.head.clone();
+
+    // Simulate a previous `nspr land` where `PUT /pulls/{number}/merge`
+    // succeeded on GitHub's backend (committing the squash merge onto `main`),
+    // but the HTTP response connection dropped before `nspr` could delete the
+    // PR branch, repair Layer two, or rebase the local branch.
+    let squash = block_on(w.forge.merge_pull_request(
+        prs[0],
+        crate::forge::SquashMerge {
+            title: "Layer one (#101)".into(),
+            message: String::new(),
+            expected_head: pr1_info.head_oid,
+        },
+    ))
+    .unwrap();
+    assert!(
+        w.forge.branch_exists(&pr1_head),
+        "interrupted land left remote PR branch behind"
+    );
+
+    // Re-running `nspr land` must recover idempotently: delete the remote
+    // branch, repair Layer two onto `squash`, remove local refs, and drop
+    // Layer one from the local branch.
+    let outcome = w.land(0);
+    assert_eq!(outcome.number, prs[0]);
+    assert_eq!(outcome.squash, squash);
+    assert!(!w.forge.branch_exists(&pr1_head));
+    assert_eq!(outcome.repaired.len(), 1);
+    assert_eq!(outcome.repaired[0].number, prs[1]);
+    assert_eq!(w.discover().layers.len(), 1);
+    assert_eq!(w.discover().layers[0].pr, Some(prs[1]));
+    w.assert_invariants();
+}
+
+#[test]
+fn land_layer_refuses_already_merged_pr_when_local_commit_has_unmerged_amends()
+{
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.sync();
+    let pr1 = w.pr_numbers()[0];
+
+    // PR #1 is merged on the forge, and then the user amends Layer one locally
+    // without realizing it was already merged.
+    let _squash = w.forge.external_squash_merge(pr1).unwrap();
+    w.amend_layer(0, &[("a.txt", "a2_unpushed")]);
+
+    let err = w.try_land(0).unwrap_err().to_string();
+    assert!(
+        err.contains("already been merged")
+            && err.contains("additional changes"),
+        "expected refusal to discard unmerged local changes, got: {err}"
+    );
+    assert_eq!(w.discover().layers.len(), 1);
+}
+
+#[test]
+fn land_all_recovers_when_bottom_pr_was_already_merged_and_lands_remaining_stack()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+    let pr1_info = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    let pr1_head = pr1_info.head.clone();
+    let pr2_head = block_on(w.forge.get_pull_request(prs[1])).unwrap().head;
+
+    // Simulate Layer one's merge succeeding on the forge before a dropped
+    // connection interrupted `nspr land --all`.
+    let _squash1 = block_on(w.forge.merge_pull_request(
+        prs[0],
+        crate::forge::SquashMerge {
+            title: "Layer one (#101)".into(),
+            message: String::new(),
+            expected_head: pr1_info.head_oid,
+        },
+    ))
+    .unwrap();
+
+    // Re-running `land_all` finishes cleaning up Layer one, re-anchors and
+    // merges Layer two on top, deletes both remote branches, and leaves the
+    // local branch clean at the new trunk tip.
+    let outcomes = w.land_all();
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0].number, prs[0]);
+    assert_eq!(outcomes[1].number, prs[1]);
+    assert!(!w.forge.branch_exists(&pr1_head));
+    assert!(!w.forge.branch_exists(&pr2_head));
+    assert!(w.discover().layers.is_empty());
+}
