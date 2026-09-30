@@ -248,6 +248,19 @@ impl RepoMergeSettings {
 #[async_trait(?Send)]
 pub trait Forge {
     async fn get_pull_request(&self, number: u64) -> Result<PullRequest>;
+    /// Fetch multiple pull requests in order. Forges that talk over the
+    /// network override this to batch the query and any missing-object fetch
+    /// into a single round trip.
+    async fn get_pull_requests(
+        &self,
+        numbers: &[u64],
+    ) -> Result<Vec<PullRequest>> {
+        let mut out = Vec::with_capacity(numbers.len());
+        for &n in numbers {
+            out.push(self.get_pull_request(n).await?);
+        }
+        Ok(out)
+    }
     async fn create_pull_request(&self, req: CreatePr) -> Result<u64>;
     async fn update_pull_request(
         &self,
@@ -280,6 +293,14 @@ pub trait Forge {
     /// layers onto it. Forges that share the local repository override this
     /// with a no-op.
     async fn fetch_commit(&self, oid: Oid) -> Result<()>;
+    /// Make all `oids` available in the local object database in a single
+    /// transport round trip.
+    async fn fetch_commits(&self, oids: &[Oid]) -> Result<()> {
+        for &oid in oids {
+            self.fetch_commit(oid).await?;
+        }
+        Ok(())
+    }
     /// Comments nspr itself posted on a pull request.
     ///
     /// Only the authenticated user's own comments are of interest, since the

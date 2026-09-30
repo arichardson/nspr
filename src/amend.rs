@@ -37,8 +37,12 @@ pub async fn amend(
     let mut rewrites = Vec::with_capacity(stack.layers.len());
     let mut changed = Vec::new();
 
-    for layer in &stack.layers {
-        let mut message = CommitMessage::parse(&git.message_of(layer.commit)?);
+    let mut messages = Vec::with_capacity(stack.layers.len());
+    let mut pr_indices = Vec::new();
+    let mut pr_numbers = Vec::new();
+
+    for (i, layer) in stack.layers.iter().enumerate() {
+        let message = CommitMessage::parse(&git.message_of(layer.commit)?);
         if message.has_legacy_spr_trailer() {
             let pr_label = match layer.pr {
                 Some(n) => format!("#{n} (`{}`)", layer.subject()),
@@ -49,31 +53,39 @@ pub async fn amend(
                  `nspr` will not modify `spr` pull requests automatically. Run `nspr upgrade` to convert them to native stacked pull requests."
             );
         }
-
         if let Some(number) = layer.pr {
-            let pr = forge.get_pull_request(number).await?;
-            forge.fetch_commit(pr.head_oid).await?;
-            if crate::upgrade::has_spr_commit(git, pr.head_oid, stack.base)? {
-                color_eyre::eyre::bail!(
-                    "pull request #{number} (`{}`) was created by `spr` (detected `[spr]` commit).\n\
-                     `nspr` will not modify `spr` pull requests automatically. Run `nspr upgrade` to convert them to native stacked pull requests.",
-                    layer.subject(),
-                );
-            }
-            let body =
-                crate::pr_body::strip_warning(&pr.body).trim().to_string();
-            if pr.title != message.subject
-                || body != message.clean_body_for_pr()
-            {
-                changed.push(Amended {
-                    number,
-                    old_subject: message.subject.clone(),
-                    new_subject: pr.title.clone(),
-                });
-                message.update_from_pr(&pr.title, &body);
-            }
+            pr_indices.push(i);
+            pr_numbers.push(number);
         }
+        messages.push(message);
+    }
 
+    let prs = forge.get_pull_requests(&pr_numbers).await?;
+    let head_oids: Vec<_> = prs.iter().map(|pr| pr.head_oid).collect();
+    forge.fetch_commits(&head_oids).await?;
+    for (i, pr) in pr_indices.into_iter().zip(prs) {
+        let layer = &stack.layers[i];
+        let number = pr.number;
+        let message = &mut messages[i];
+        if crate::upgrade::has_spr_commit(git, pr.head_oid, stack.base)? {
+            color_eyre::eyre::bail!(
+                "pull request #{number} (`{}`) was created by `spr` (detected `[spr]` commit).\n\
+                 `nspr` will not modify `spr` pull requests automatically. Run `nspr upgrade` to convert them to native stacked pull requests.",
+                layer.subject(),
+            );
+        }
+        let body = crate::pr_body::strip_warning(&pr.body).trim().to_string();
+        if pr.title != message.subject || body != message.clean_body_for_pr() {
+            changed.push(Amended {
+                number,
+                old_subject: message.subject.clone(),
+                new_subject: pr.title.clone(),
+            });
+            message.update_from_pr(&pr.title, &body);
+        }
+    }
+
+    for (layer, message) in stack.layers.iter().zip(messages) {
         // Every layer is listed, changed or not: `rewrite_messages` needs the
         // whole chain because rewriting one commit reparents everything above
         // it.

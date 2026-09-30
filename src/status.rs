@@ -86,11 +86,15 @@ pub async fn status(
 ) -> Result<StackStatus> {
     let trees = stack.all_trees_lenient(git)?;
     let prs = engine::gather(forge, stack).await?;
-    let merge_settings = forge.repo_merge_settings().await?;
-    let opts = SyncOptions {
-        preserve_commit_history: config
+    let preserve_commit_history = match config.preserve_commit_history {
+        crate::config::PreserveCommitHistory::Auto => config
             .preserve_commit_history
-            .resolve(merge_settings),
+            .resolve(forge.repo_merge_settings().await?),
+        crate::config::PreserveCommitHistory::True => true,
+        crate::config::PreserveCommitHistory::False => false,
+    };
+    let opts = SyncOptions {
+        preserve_commit_history,
         ..Default::default()
     };
     let decision = engine::decide(git, stack, &prs, &trees, &opts)?;
@@ -107,10 +111,14 @@ pub async fn status_for(
     let trees =
         stack.trees_for(git, opts.only_layer, opts.only_layers.as_ref())?;
     let prs = engine::gather_for(forge, stack, opts).await?;
-    let merge_settings = forge.repo_merge_settings().await?;
     let mut status_opts = opts.clone();
-    status_opts.preserve_commit_history =
-        config.preserve_commit_history.resolve(merge_settings);
+    status_opts.preserve_commit_history = match config.preserve_commit_history {
+        crate::config::PreserveCommitHistory::Auto => config
+            .preserve_commit_history
+            .resolve(forge.repo_merge_settings().await?),
+        crate::config::PreserveCommitHistory::True => true,
+        crate::config::PreserveCommitHistory::False => false,
+    };
     let decision = engine::decide(git, stack, &prs, &trees, &status_opts)?;
     from_parts(git, config, stack, &prs, &decision, opts.update_message)
 }
@@ -588,7 +596,8 @@ impl StackStatus {
 
                 let (checks_plain, checks_styled) = match layer.checks {
                     Some(c) if c.total() > 0 => {
-                        let plain = format!("{}/{} checks", c.passed, c.total());
+                        let plain =
+                            format!("{}/{} checks", c.passed, c.total());
                         let styled = if use_color {
                             if c.failed > 0 {
                                 style(&plain).red().bold().to_string()

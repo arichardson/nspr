@@ -257,7 +257,9 @@ pub async fn upgrade_stack_with_options(
                 prs[j].as_ref().map(|p| p.head_oid).unwrap_or(stack.base)
             }
         };
-        let current_pr_base_tip = if pr.base_oid != Oid::ZERO_SHA1 {
+        let current_pr_base_tip = if pr.base_oid != Oid::ZERO_SHA1
+            && git.repo().find_commit(pr.base_oid).is_ok()
+        {
             pr.base_oid
         } else {
             fallback_base_tip

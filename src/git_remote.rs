@@ -197,11 +197,20 @@ impl GitRemote {
         })
     }
 
+    pub fn repo(&self) -> &Repository {
+        &self.repo
+    }
+
     /// Make `oids` readable from the local object database.
     pub fn fetch_objects(&self, oids: &[Oid]) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
         let wanted: Vec<String> = oids
             .iter()
-            .filter(|&&oid| !self.has_object(oid))
+            .filter(|&&oid| {
+                oid != Oid::ZERO_SHA1
+                    && seen.insert(oid)
+                    && !self.has_object(oid)
+            })
             .map(Oid::to_string)
             .collect();
         if wanted.is_empty() {
@@ -221,7 +230,7 @@ impl GitRemote {
         })?;
 
         for &oid in oids {
-            if !self.has_object(oid) {
+            if oid != Oid::ZERO_SHA1 && !self.has_object(oid) {
                 bail!(
                     "{oid} is not reachable on {}. If it was just merged, \
                      wait a moment and run `nspr sync`.",
@@ -232,7 +241,7 @@ impl GitRemote {
         Ok(())
     }
 
-    fn has_object(&self, oid: Oid) -> bool {
+    pub fn has_object(&self, oid: Oid) -> bool {
         self.repo.find_object(oid, None).is_ok()
     }
 

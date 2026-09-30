@@ -205,7 +205,9 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let mut session = Session::open(&cli.remote).await?;
+    let fetch_remote_trunk =
+        !matches!(cli.command, Some(Command::Status | Command::List(_)));
+    let mut session = Session::open(&cli.remote, fetch_remote_trunk).await?;
     match cli.command.unwrap_or(Command::Diff(DiffArgs::default())) {
         Command::Diff(args) => session.diff(args, cli.verbose).await,
         Command::Status => session.status().await,
@@ -234,7 +236,7 @@ struct Session {
 }
 
 impl Session {
-    async fn open(remote: &str) -> Result<Self> {
+    async fn open(remote: &str, fetch_remote_trunk: bool) -> Result<Self> {
         let repo = git2::Repository::discover(".").map_err(|e| {
             eyre!("cannot open a git repository here: {}", e.message())
         })?;
@@ -243,13 +245,37 @@ impl Session {
         // The slug has to come from local config: we need it to build the API
         // client that would otherwise tell us the login.
         let (owner, name) = config::detect_repo(&git, remote)?;
+        let trunk = config::detect_trunk(&git, remote)?;
         let token = auth::github_token()?;
         let forge = GitHubForge::new(git.repo().clone(), &owner, &name, token)?;
-        let login = forge.viewer_login().await?;
-        let config = config::detect(&git, login, remote)?;
 
-        let trunk_oid =
-            sync::resolve_trunk(&git, &forge, remote, &config.trunk).await?;
+        let trunk_ref = format!("refs/remotes/{remote}/{trunk}");
+        let local_trunk = git.resolve_reference(&trunk_ref).ok();
+
+        let (login, trunk_oid) = match (!fetch_remote_trunk, local_trunk) {
+            (true, Some(oid)) => {
+                // For read-only commands (`nspr status`, `nspr list`), use the
+                // local tracking ref (`refs/remotes/<remote>/<trunk>`) rather
+                // than running a full `git fetch` on `<trunk>` every time a new
+                // commit lands upstream, and defer `viewer_login()` until a
+                // command actually needs the authenticated username.
+                (String::new(), oid)
+            }
+            _ => {
+                let (login, remote_oid) =
+                    forge.viewer_login_and_branch_oid(&trunk).await?;
+                let oid = sync::resolve_trunk_from_remote_oid(
+                    &git,
+                    &forge,
+                    remote,
+                    &trunk,
+                    Ok(remote_oid),
+                )
+                .await?;
+                (login, oid)
+            }
+        };
+        let config = config::detect(&git, login, remote)?;
 
         Ok(Self {
             git,
@@ -962,10 +988,14 @@ impl Session {
     }
 
     async fn list(&self, args: ListArgs) -> Result<()> {
+        let login;
         let author = if args.all {
             None
-        } else {
+        } else if !self.config.login.is_empty() {
             Some(self.config.login.as_str())
+        } else {
+            login = self.forge.viewer_login().await?;
+            Some(login.as_str())
         };
         let prs = self.forge.list_pull_requests(author).await?;
         let stacks = list::build_stacks(prs, &self.config.trunk);
