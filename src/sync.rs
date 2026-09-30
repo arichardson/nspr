@@ -66,9 +66,23 @@ pub async fn resolve_trunk(
     remote: &str,
     trunk: &str,
 ) -> Result<Oid> {
+    let remote_oid = forge.branch_oid(trunk).await;
+    resolve_trunk_from_remote_oid(git, forge, remote, trunk, remote_oid).await
+}
+
+/// Like [`resolve_trunk`], using a pre-fetched `branch_oid(trunk)` result so
+/// callers that combined the branch lookup with another GraphQL query do not
+/// issue a second round-trip.
+pub async fn resolve_trunk_from_remote_oid(
+    git: &Git,
+    forge: &dyn Forge,
+    remote: &str,
+    trunk: &str,
+    remote_oid: Result<Option<Oid>>,
+) -> Result<Oid> {
     let trunk_ref = format!("refs/remotes/{remote}/{trunk}");
 
-    match forge.branch_oid(trunk).await {
+    match remote_oid {
         Ok(Some(oid)) => {
             forge.fetch_commit(oid).await?;
             git.set_reference(&trunk_ref, oid, "nspr: observed trunk")?;
@@ -116,9 +130,19 @@ pub async fn sync_trunk(
     let mut warnings = Vec::new();
     let trunk_tree = git.tree_of(trunk)?;
 
+    let mut needed_indices = Vec::new();
+    let mut needed_numbers = Vec::new();
     for (i, layer) in stack.layers.iter().enumerate() {
-        let Some(number) = layer.pr else { continue };
-        let pr = forge.get_pull_request(number).await?;
+        if let Some(number) = layer.pr {
+            needed_indices.push(i);
+            needed_numbers.push(number);
+        }
+    }
+    let prs = forge.get_pull_requests(&needed_numbers).await?;
+
+    for (i, pr) in needed_indices.into_iter().zip(prs) {
+        let layer = &stack.layers[i];
+        let number = pr.number;
         match pr.state {
             PrState::Merged => {
                 merged.push(number);

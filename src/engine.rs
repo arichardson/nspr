@@ -373,23 +373,21 @@ pub async fn gather_for(
         }
     }
 
-    let mut prs = Vec::with_capacity(n);
+    let mut needed_indices = Vec::with_capacity(n);
+    let mut needed_numbers = Vec::with_capacity(n);
     for (i, layer) in stack.layers.iter().enumerate() {
-        if !needed[i] {
-            prs.push(None);
-            continue;
+        if needed[i]
+            && let Some(number) = layer.pr
+        {
+            needed_indices.push(i);
+            needed_numbers.push(number);
         }
-        match layer.pr {
-            None => prs.push(None),
-            Some(number) => {
-                let pr = forge.get_pull_request(number).await?;
-                forge.fetch_commit(pr.head_oid).await?;
-                if pr.base_oid != Oid::ZERO_SHA1 {
-                    forge.fetch_commit(pr.base_oid).await?;
-                }
-                prs.push(Some(pr));
-            }
-        }
+    }
+
+    let fetched = forge.get_pull_requests(&needed_numbers).await?;
+    let mut prs = vec![None; n];
+    for (i, pr) in needed_indices.into_iter().zip(fetched) {
+        prs[i] = Some(pr);
     }
     Ok(prs)
 }
@@ -520,14 +518,18 @@ pub fn decide(
             // meaningful to compare against.
             None => true,
             Some(base_tip) => {
-                let current_pr_base_tip = if pr.base_oid != Oid::ZERO_SHA1 {
-                    pr.base_oid
-                } else {
-                    base_tip
-                };
-                let first_oid = find_root_commit(git, pr, current_pr_base_tip);
+                let has_base_oid = pr.base_oid != Oid::ZERO_SHA1
+                    && git.repo().find_commit(pr.base_oid).is_ok();
+                let fallback_base_tip =
+                    if has_base_oid { pr.base_oid } else { base_tip };
+                let first_oid = find_root_commit(git, pr, fallback_base_tip);
                 current_anchor[i] =
                     first_oid.and_then(|r| git.parent_of(r).ok());
+                let current_pr_base_tip = if has_base_oid {
+                    pr.base_oid
+                } else {
+                    current_anchor[i].unwrap_or(base_tip)
+                };
                 if let Some(first_oid) = first_oid {
                     let current_msg = git.message_of(first_oid)?;
                     let branch_commit_msg = CommitMessage::parse(&current_msg);
@@ -1127,7 +1129,9 @@ async fn execute(
                 // if we already retargeted the PR before the push, its base is
                 // `base_branches[i]`; otherwise its base is still `pr.base` at
                 // `pr.base_oid`.
-                let current_pr_base_tip = if pr.base_oid != Oid::ZERO_SHA1 {
+                let current_pr_base_tip = if pr.base_oid != Oid::ZERO_SHA1
+                    && git.repo().find_commit(pr.base_oid).is_ok()
+                {
                     pr.base_oid
                 } else {
                     old_root_parent

@@ -138,6 +138,102 @@ impl GitHubForge {
         *self.login.borrow_mut() = Some(login.clone());
         Ok(login)
     }
+
+    /// Fetch the authenticated user's login and a branch tip OID in a single
+    /// GraphQL request, caching the login for subsequent calls.
+    pub async fn viewer_login_and_branch_oid(
+        &self,
+        branch: &str,
+    ) -> Result<(String, Option<Oid>)> {
+        let cached = self.login.borrow().clone();
+        if let Some(login) = cached {
+            let oid = self.branch_oid(branch).await?;
+            return Ok((login, oid));
+        }
+
+        debug!("API POST /graphql ViewerAndRef(refs/heads/{branch})");
+        let body = serde_json::json!({
+            "query": VIEWER_AND_BRANCH_OID_QUERY,
+            "variables": {
+                "owner": self.owner,
+                "repo": self.repo,
+                "qualifiedName": format!("refs/heads/{branch}"),
+            },
+        });
+        let response: GqlResponse<ViewerAndRefQueryData> =
+            self.api.post("/graphql", Some(&body)).await.wrap_err(
+                "could not identify the authenticated user. The token may be \
+                 expired; run `gh auth login`.",
+            )?;
+        let errors: Vec<String> =
+            response.errors.into_iter().map(|e| e.message).collect();
+        let Some(data) = response.data else {
+            bail!(
+                "could not identify the authenticated user{}. The token may be \
+                 expired; run `gh auth login`.",
+                error_suffix(&errors)
+            );
+        };
+        let Some(viewer) = data.viewer else {
+            bail!(
+                "could not identify the authenticated user{}. The token may be \
+                 expired; run `gh auth login`.",
+                error_suffix(&errors)
+            );
+        };
+        let login = viewer.login;
+        *self.login.borrow_mut() = Some(login.clone());
+
+        let oid = match data
+            .repository
+            .and_then(|r| r.git_ref)
+            .and_then(|g| g.target)
+            .map(|t| t.oid)
+        {
+            Some(oid_str) => {
+                debug!("  -> branch {branch} = {oid_str}");
+                Some(Oid::from_str(&oid_str)?)
+            }
+            None => {
+                debug!("  -> branch {branch} not found");
+                None
+            }
+        };
+        Ok((login, oid))
+    }
+
+    /// True if `pr.base_oid` is missing locally, `pr.head_oid` is already in
+    /// the local object database, and `refs/nspr/root/<pr.number>` records a
+    /// local root commit for this pull request's branch so the engine can
+    /// derive the branch's merge-base from the root's parent without fetching
+    /// an advanced remote base tip.
+    fn can_skip_base_oid_fetch(&self, pr: &PullRequest) -> bool {
+        if self.remote.has_object(pr.base_oid) {
+            return true;
+        }
+        let repo = self.remote.repo();
+        if repo.find_commit(pr.head_oid).is_err() {
+            return false;
+        }
+        let root_ref = crate::refs::root_ref_name(pr.number);
+        let Some(root_oid) =
+            repo.find_reference(&root_ref).ok().and_then(|r| r.target())
+        else {
+            return false;
+        };
+        if let Ok(root_commit) = repo.find_commit(root_oid)
+            && root_commit.parent_count() == 1
+            && let Ok(parent_oid) = root_commit.parent_id(0)
+            && repo.find_commit(parent_oid).is_ok()
+        {
+            root_oid == pr.head_oid
+                || repo
+                    .graph_descendant_of(pr.head_oid, root_oid)
+                    .unwrap_or(false)
+        } else {
+            false
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -173,12 +269,72 @@ impl Forge for GitHubForge {
             pr.mergeable,
             pr.merge_state
         );
-        let mut to_fetch = vec![pr.base_oid, pr.head_oid];
+        let mut to_fetch = vec![pr.head_oid];
+        if pr.base_oid != Oid::ZERO_SHA1 && !self.can_skip_base_oid_fetch(&pr) {
+            to_fetch.push(pr.base_oid);
+        }
         if let Some(mc) = pr.merge_commit {
             to_fetch.push(mc);
         }
         self.remote.fetch_objects(&to_fetch)?;
         Ok(pr)
+    }
+
+    async fn get_pull_requests(
+        &self,
+        numbers: &[u64],
+    ) -> Result<Vec<PullRequest>> {
+        if numbers.is_empty() {
+            return Ok(Vec::new());
+        }
+        if numbers.len() == 1 {
+            return Ok(vec![self.get_pull_request(numbers[0]).await?]);
+        }
+
+        debug!("API POST /graphql PullRequests(numbers={numbers:?})");
+        let query = build_batch_pull_requests_query(numbers);
+        let body = serde_json::json!({
+            "query": query,
+            "variables": {
+                "owner": self.owner,
+                "name": self.repo,
+            },
+        });
+        let response: GqlResponse<BatchQueryData> = self
+            .api
+            .post("/graphql", Some(&body))
+            .await
+            .wrap_err("could not read pull requests from GitHub")?;
+
+        let nodes = batch_pull_request_nodes(response, numbers)?;
+        let mut prs = Vec::with_capacity(nodes.len());
+        let mut to_fetch = Vec::with_capacity(nodes.len() * 2);
+        for node in nodes {
+            let pr = pull_request_from(node)?;
+            debug!(
+                "  -> #{}: state={:?} base={} ({}) head={} ({}) mergeable={:?} merge_state={:?}",
+                pr.number,
+                pr.state,
+                pr.base,
+                pr.base_oid,
+                pr.head,
+                pr.head_oid,
+                pr.mergeable,
+                pr.merge_state
+            );
+            to_fetch.push(pr.head_oid);
+            if pr.base_oid != Oid::ZERO_SHA1
+                && !self.can_skip_base_oid_fetch(&pr)
+            {
+                to_fetch.push(pr.base_oid);
+            }
+            if let Some(mc) = pr.merge_commit {
+                to_fetch.push(mc);
+            }
+            prs.push(pr);
+        }
+        self.remote.fetch_objects(&to_fetch)?;
+        Ok(prs)
     }
 
     async fn create_pull_request(&self, req: CreatePr) -> Result<u64> {
@@ -560,6 +716,10 @@ impl Forge for GitHubForge {
 
     async fn fetch_commit(&self, oid: Oid) -> Result<()> {
         self.remote.fetch_objects(&[oid])
+    }
+
+    async fn fetch_commits(&self, oids: &[Oid]) -> Result<()> {
+        self.remote.fetch_objects(oids)
     }
 
     async fn list_own_comments(&self, number: u64) -> Result<Vec<Comment>> {
@@ -1050,6 +1210,12 @@ struct QueryData {
 }
 
 #[derive(Debug, Deserialize)]
+struct BatchQueryData {
+    repository:
+        Option<std::collections::HashMap<String, Option<PullRequestNode>>>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RefQueryData {
     repository: Option<RefRepositoryNode>,
 }
@@ -1070,8 +1236,34 @@ struct OidNode {
     oid: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ViewerAndRefQueryData {
+    viewer: Option<ViewerNode>,
+    repository: Option<RefRepositoryNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ViewerNode {
+    login: String,
+}
+
 const BRANCH_OID_QUERY: &str = r#"
 query($owner: String!, $repo: String!, $qualifiedName: String!) {
+  repository(owner: $owner, name: $repo) {
+    ref(qualifiedName: $qualifiedName) {
+      target {
+        oid
+      }
+    }
+  }
+}
+"#;
+
+const VIEWER_AND_BRANCH_OID_QUERY: &str = r#"
+query($owner: String!, $repo: String!, $qualifiedName: String!) {
+  viewer {
+    login
+  }
   repository(owner: $owner, name: $repo) {
     ref(qualifiedName: $qualifiedName) {
       target {
@@ -1261,6 +1453,100 @@ fn pull_request_node(
         debug!("partial GraphQL errors: {}", errors.join("; "));
     }
     Ok(node)
+}
+
+const PULL_REQUEST_FIELDS: &str = r#"{
+      id
+      number
+      state
+      title
+      body
+      isDraft
+      baseRefName
+      headRefName
+      baseRefOid
+      headRefOid
+      mergeable
+      mergeStateStatus
+      autoMergeRequest {
+        enabledAt
+      }
+      mergeCommit {
+        oid
+      }
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              contexts {
+                checkRunCountsByState {
+                  state
+                  count
+                }
+                statusContextCountsByState {
+                  state
+                  count
+                }
+              }
+            }
+          }
+        }
+      }
+    }"#;
+
+fn build_batch_pull_requests_query(numbers: &[u64]) -> String {
+    let mut query = String::from(
+        "query PullRequests($owner: String!, $name: String!) {\n  repository(owner: $owner, name: $name) {\n",
+    );
+    for (idx, number) in numbers.iter().enumerate() {
+        query.push_str(&format!(
+            "    pr_{idx}: pullRequest(number: {number}) {PULL_REQUEST_FIELDS}\n"
+        ));
+    }
+    query.push_str("  }\n}\n");
+    query
+}
+
+fn batch_pull_request_nodes(
+    response: GqlResponse<BatchQueryData>,
+    numbers: &[u64],
+) -> Result<Vec<PullRequestNode>> {
+    let errors: Vec<String> =
+        response.errors.into_iter().map(|e| e.message).collect();
+
+    let Some(data) = response.data else {
+        bail!(
+            "GitHub's reply had no `data` member{}. Unless GitHub is having \
+             an outage this is an nspr bug: the GraphQL envelope was not the \
+             shape we expected.",
+            error_suffix(&errors)
+        );
+    };
+    let Some(mut repository) = data.repository else {
+        bail!(
+            "GitHub did not return the repository{}. Check that the remote \
+             points where you think it does and that your token can read it.",
+            error_suffix(&errors)
+        );
+    };
+
+    let mut out = Vec::with_capacity(numbers.len());
+    for (idx, &number) in numbers.iter().enumerate() {
+        let key = format!("pr_{idx}");
+        let Some(node) = repository.remove(&key).flatten() else {
+            bail!(
+                "GitHub has no pull request #{number} in this repository{}. \
+                 Check the `Pull-Request:` trailer on the commit.",
+                error_suffix(&errors)
+            );
+        };
+        out.push(node);
+    }
+
+    if !errors.is_empty() {
+        debug!("partial GraphQL errors: {}", errors.join("; "));
+    }
+    Ok(out)
 }
 
 /// `": a; b"`, or nothing at all when there is nothing to report.
@@ -1608,5 +1894,35 @@ mod tests {
             }
         );
         assert_eq!(counts.total(), 15);
+    }
+
+    #[test]
+    fn deserialises_a_batched_payload() {
+        let q = build_batch_pull_requests_query(&[101, 202]);
+        assert!(q.contains("pr_0: pullRequest(number: 101)"), "{q}");
+        assert!(q.contains("pr_1: pullRequest(number: 202)"), "{q}");
+
+        let sample_val: serde_json::Value =
+            serde_json::from_str(SAMPLE).unwrap();
+        let pr0 = sample_val["data"]["repository"]["pullRequest"].clone();
+        let mut pr1 = pr0.clone();
+        pr1["number"] = serde_json::json!(4243);
+        pr1["title"] = serde_json::json!("Second PR");
+
+        let batch_json = serde_json::json!({
+            "data": {
+                "repository": {
+                    "pr_0": pr0,
+                    "pr_1": pr1,
+                }
+            }
+        });
+        let resp: GqlResponse<BatchQueryData> =
+            serde_json::from_value(batch_json).unwrap();
+        let nodes = batch_pull_request_nodes(resp, &[4242, 4243]).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].number, 4242);
+        assert_eq!(nodes[1].number, 4243);
+        assert_eq!(nodes[1].title, "Second PR");
     }
 }

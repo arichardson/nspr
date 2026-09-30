@@ -157,6 +157,26 @@ pub fn detect_repo(
     parse_remote_url(&url)
 }
 
+/// Determine the trunk branch name (`nspr.trunk`, `refs/remotes/<remote>/HEAD`,
+/// or `"main"`).
+pub fn detect_trunk(git: &crate::git::Git, remote: &str) -> Result<String> {
+    let cfg = git.repo().config()?;
+    if let Ok(trunk) = cfg.get_string("nspr.trunk")
+        && !trunk.is_empty()
+    {
+        return Ok(trunk);
+    }
+    let head = format!("refs/remotes/{remote}/HEAD");
+    if let Ok(reference) = git.repo().find_reference(&head)
+        && let Ok(Some(target)) = reference.symbolic_target()
+        && let Some(stripped) =
+            target.strip_prefix(&format!("refs/remotes/{remote}/"))
+    {
+        return Ok(stripped.to_string());
+    }
+    Ok("main".to_string())
+}
+
 /// Work out the configuration from the repository, so the common case needs no
 /// setup at all.
 ///
@@ -172,23 +192,7 @@ pub fn detect(
     let get = |key: &str| cfg.get_string(key).ok().filter(|v| !v.is_empty());
 
     let (owner, repo) = detect_repo(git, remote)?;
-
-    // Prefer what the remote says its default branch is over guessing `main`:
-    // plenty of repositories are still on `master`, and some use neither.
-    let trunk = get("nspr.trunk")
-        .or_else(|| {
-            let head = format!("refs/remotes/{remote}/HEAD");
-            let reference = git.repo().find_reference(&head).ok()?;
-            // git2 0.21 reports a non-UTF-8 target as an error rather than
-            // folding it into `None`; either way we have nothing usable.
-            reference
-                .symbolic_target()
-                .ok()
-                .flatten()?
-                .strip_prefix(&format!("refs/remotes/{remote}/"))
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "main".to_string());
+    let trunk = detect_trunk(git, remote)?;
 
     let mut config = Config::new(owner, repo, trunk, login);
     if let Some(prefix) = get("nspr.branchPrefix") {
