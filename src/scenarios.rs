@@ -3791,3 +3791,277 @@ fn multiple_independent_stacks_in_single_branch_status_comments_and_land() {
     );
     assert_eq!(rendered_after, expected_after);
 }
+
+#[test]
+fn upgrade_after_trunk_advances_never_displays_upstream_commits_even_with_file_conflict()
+ {
+    let mut w = World::new(&[
+        ("root.txt", "root"),
+        ("shared.td", "line1 = v0\nline2 = v0\n"),
+    ]);
+    w.add_layer("Layer one (like #203598)", &[("a.txt", "a1")]);
+    w.add_layer(
+        "Layer two (like #203599)",
+        &[
+            ("b.txt", "b1"),
+            ("shared.td", "line1 = v0\nline2 = pr203599\n"),
+        ],
+    );
+
+    // Simulate `spacedentist/spr` creating synthetic base branches
+    // `users/tester/spr/main.<slug>` for BOTH the root PR and the stacked PR on
+    // the old `main`.
+    let old_main = w.base_oid;
+    let stack = w.discover();
+    let trees = stack.all_trees(&w.git).unwrap();
+
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/main.layer-one",
+        old_main,
+    )]))
+    .unwrap();
+    let spr_tip_1 = w
+        .git
+        .synthesize_initial_commit(
+            old_main,
+            trees.effective[0],
+            stack.layers[0].commit,
+            "[spr] initial version",
+        )
+        .unwrap();
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/layer-one",
+        spr_tip_1,
+    )]))
+    .unwrap();
+    let pr1_num =
+        block_on(w.forge.create_pull_request(crate::forge::CreatePr {
+            title: "Layer one (like #203598)".into(),
+            body: String::new(),
+            base: "users/tester/spr/main.layer-one".into(),
+            head: "users/tester/spr/layer-one".into(),
+            draft: false,
+        }))
+        .unwrap();
+
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/main.layer-two",
+        spr_tip_1,
+    )]))
+    .unwrap();
+    let spr_tip_2 = w
+        .git
+        .synthesize_initial_commit(
+            spr_tip_1,
+            trees.effective[1],
+            stack.layers[1].commit,
+            "[spr] initial version",
+        )
+        .unwrap();
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/layer-two",
+        spr_tip_2,
+    )]))
+    .unwrap();
+    let pr2_num =
+        block_on(w.forge.create_pull_request(crate::forge::CreatePr {
+            title: "Layer two (like #203599)".into(),
+            body: String::new(),
+            base: "users/tester/spr/main.layer-two".into(),
+            head: "users/tester/spr/layer-two".into(),
+            draft: false,
+        }))
+        .unwrap();
+
+    w.layers[0].message.set(
+        crate::trailers::LEGACY_SPR_PULL_REQUEST,
+        &format!("https://github.com/o/r/pull/{pr1_num}"),
+    );
+    w.layers[1].message.set(
+        crate::trailers::LEGACY_SPR_PULL_REQUEST,
+        &format!("https://github.com/o/r/pull/{pr2_num}"),
+    );
+    w.rebuild();
+
+    // Now advance `main` with unrelated upstream commits (`upstream_codeowners.cpp`)
+    // AND an overlapping edit to `shared.td` that would conflict if 3-way
+    // merged back onto `old_main` without conflict resolution.
+    w.advance_trunk_and_pull(&[
+        ("upstream_codeowners.cpp", "unrelated upstream work"),
+        (
+            "shared.td",
+            "line1 = upstream_v1\nline2 = upstream_conflict\n",
+        ),
+    ]);
+    // Drop Layer one locally so Layer two is rebased directly onto the new `main`
+    // (exactly matching how #203599 was rebased onto `main` and upgraded alone).
+    w.drop_layer(0);
+    w.amend_layer(
+        0,
+        &[
+            ("b.txt", "b1"),
+            ("shared.td", "line1 = upstream_v1\nline2 = pr203599\n"),
+        ],
+    );
+
+    w.forge.clear_diff_observations();
+    let mut stack = w.discover();
+    let upgraded = block_on(crate::upgrade::upgrade_stack(
+        &w.git, &w.forge, &w.config, &mut stack,
+    ))
+    .unwrap();
+    w.sync_worktree();
+    w.refresh_specs_from_repo();
+
+    assert_eq!(upgraded.len(), 1);
+    assert_eq!(upgraded[0].number, pr2_num);
+    assert_eq!(upgraded[0].old_base, "users/tester/spr/main.layer-two");
+    assert_eq!(upgraded[0].new_base, TRUNK);
+    assert_eq!(
+        upgraded[0].deleted_synthetic_base.as_deref(),
+        Some("users/tester/spr/main.layer-two")
+    );
+
+    // Crucial: at NO point during `upgrade_stack` was `upstream_codeowners.cpp`
+    // or Layer one's `a.txt` ever part of PR #2's displayed diff on GitHub!
+    assert_only_ever_displayed(&w, pr2_num, &["b.txt", "shared.td"]);
+    w.assert_invariants();
+}
+
+#[test]
+fn upgrade_multi_layer_spr_stack_after_trunk_advances_never_displays_upstream_commits()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
+
+    let old_main = w.base_oid;
+    let stack = w.discover();
+    let trees = stack.all_trees(&w.git).unwrap();
+
+    // Create 3-layer `spacedentist/spr` stack anchored on `old_main`, where
+    // every PR has its own `users/tester/spr/main.<slug>` synthetic base branch.
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/main.one",
+        old_main,
+    )]))
+    .unwrap();
+    let tip1 = w
+        .git
+        .synthesize_initial_commit(
+            old_main,
+            trees.effective[0],
+            stack.layers[0].commit,
+            "[spr] initial version",
+        )
+        .unwrap();
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/one",
+        tip1,
+    )]))
+    .unwrap();
+    let pr1 = block_on(w.forge.create_pull_request(crate::forge::CreatePr {
+        title: "Layer one".into(),
+        body: String::new(),
+        base: "users/tester/spr/main.one".into(),
+        head: "users/tester/spr/one".into(),
+        draft: false,
+    }))
+    .unwrap();
+
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/main.two",
+        tip1,
+    )]))
+    .unwrap();
+    let tip2 = w
+        .git
+        .synthesize_initial_commit(
+            tip1,
+            trees.effective[1],
+            stack.layers[1].commit,
+            "[spr] initial version",
+        )
+        .unwrap();
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/two",
+        tip2,
+    )]))
+    .unwrap();
+    let pr2 = block_on(w.forge.create_pull_request(crate::forge::CreatePr {
+        title: "Layer two".into(),
+        body: String::new(),
+        base: "users/tester/spr/main.two".into(),
+        head: "users/tester/spr/two".into(),
+        draft: false,
+    }))
+    .unwrap();
+
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/main.three",
+        tip2,
+    )]))
+    .unwrap();
+    let tip3 = w
+        .git
+        .synthesize_initial_commit(
+            tip2,
+            trees.effective[2],
+            stack.layers[2].commit,
+            "[spr] initial version",
+        )
+        .unwrap();
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/three",
+        tip3,
+    )]))
+    .unwrap();
+    let pr3 = block_on(w.forge.create_pull_request(crate::forge::CreatePr {
+        title: "Layer three".into(),
+        body: String::new(),
+        base: "users/tester/spr/main.three".into(),
+        head: "users/tester/spr/three".into(),
+        draft: false,
+    }))
+    .unwrap();
+
+    for (i, pr) in [pr1, pr2, pr3].into_iter().enumerate() {
+        w.layers[i].message.set(
+            crate::trailers::LEGACY_SPR_PULL_REQUEST,
+            &format!("https://github.com/o/r/pull/{pr}"),
+        );
+    }
+    w.rebuild();
+
+    // Advance trunk and rebase the 3-layer stack locally before running `nspr upgrade`.
+    w.advance_trunk_and_pull(&[("upstream.txt", "u1")]);
+
+    let pushes_before = w.push_count();
+    w.forge.clear_diff_observations();
+    let mut stack = w.discover();
+    let upgraded = block_on(crate::upgrade::upgrade_stack(
+        &w.git, &w.forge, &w.config, &mut stack,
+    ))
+    .unwrap();
+    w.sync_worktree();
+    w.refresh_specs_from_repo();
+
+    assert_eq!(upgraded.len(), 3);
+    // Root PR (`pr1`) retargeted its synthetic base (`old_main`) to `main`
+    // BEFORE Pass 1 push because `merge_base(old_base, head) == merge_base(main, head) == old_main`,
+    // so `pr1` was pushed only once!
+    let pr1_pushes = w.forge.pushes.borrow()[pushes_before..]
+        .iter()
+        .filter(|p| p.branch == "users/tester/spr/one")
+        .count();
+    assert_eq!(
+        pr1_pushes, 1,
+        "root spr PR whose synthetic base is on old_main should retarget before push and push only once"
+    );
+
+    assert_only_ever_displayed(&w, pr1, &["a.txt"]);
+    assert_only_ever_displayed(&w, pr2, &["b.txt"]);
+    assert_only_ever_displayed(&w, pr3, &["c.txt"]);
+    w.assert_invariants();
+}
