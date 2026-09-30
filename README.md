@@ -227,7 +227,7 @@ For **branching DAG stacks**, `nspr` automatically switches to hierarchical tree
 | **`nspr amend`** | `nspr amend` | Pull PR titles and descriptions edited in the GitHub web UI back into your local git commit messages (automatically stripping UI warning banners). |
 | **`nspr patch`** | `nspr patch <PR> [-b <branch>]` | Fetch a PR and its entire upstream stack chain into a local branch (`pr/<number>` by default) for local testing or review. |
 | **`nspr close`** | `nspr close <PR>` | Close a pull request on GitHub, drop its commit from your stack, and restack dependent layers onto its parent. |
-| **`nspr upgrade`** | `nspr upgrade` | Convert existing `spr` pull requests (`[spr]` branch commits, `Pull Request:` trailers, and `spr/main/master.*` synthetic bases) in-place into native `nspr` stacked pull requests. |
+| **`nspr upgrade`** | `nspr upgrade [--update-message]` | Convert existing `spr` pull requests (`[spr]` branch commits, `Pull Request:` trailers, and `spr/main/master.*` synthetic bases) in-place into native `nspr` stacked pull requests. |
 
 ### Migrating Existing `spr` Stacks (`nspr upgrade`)
 If you have an existing branch with open pull requests created by `spr` (`spacedentist/spr` or `ejoffe/spr`):
@@ -235,6 +235,7 @@ If you have an existing branch with open pull requests created by `spr` (`spaced
 2. Running `nspr status` flags un-upgraded layers as `spr (run 'nspr upgrade')`, and `nspr diff` refuses to overwrite them until you migrate.
 3. Run `nspr upgrade` to convert the entire stack in-place while keeping your existing PR numbers, comments, and approvals:
    - Rewrites each PR's head branch onto its parent PR's head branch using your real commit message (replacing `[spr] initial version`).
+   - Preserves any title/description edits made in the GitHub Web UI by default (warning if they differ from the local commit), or overwrites GitHub with the local commit message when `--update-message` is passed.
    - Retargets each PR's `base` branch on GitHub from `spr`'s synthetic base branch to the parent PR's head branch.
    - Deletes `spr`'s orphaned synthetic base branches (`spr/main/master.*`) from the remote.
    - Normalizes local `Pull Request:` trailers to `Pull-Request:`.

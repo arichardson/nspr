@@ -66,7 +66,14 @@ enum Command {
     /// Fetch a pull request and its stack dependencies into a local branch.
     Patch(PatchArgs),
     /// Convert existing `spr` pull requests (`[spr]` commits / `Pull Request:` trailers) to native `nspr` stacked pull requests.
-    Upgrade,
+    Upgrade(UpgradeArgs),
+}
+
+#[derive(Args, Default)]
+struct UpgradeArgs {
+    /// Overwrite each pull request's title and body on GitHub from the local commit.
+    #[arg(long)]
+    update_message: bool,
 }
 
 #[derive(Args, Default)]
@@ -208,7 +215,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Close(args) => session.close(args).await,
         Command::List(args) => session.list(args).await,
         Command::Patch(args) => session.patch(args).await,
-        Command::Upgrade => session.upgrade().await,
+        Command::Upgrade(args) => session.upgrade(args).await,
     }
 }
 
@@ -789,13 +796,14 @@ impl Session {
         Ok(())
     }
 
-    async fn upgrade(&self) -> Result<()> {
+    async fn upgrade(&self, args: UpgradeArgs) -> Result<()> {
         let mut stack = self.discover()?;
-        let upgraded = nspr::upgrade::upgrade_stack(
+        let upgraded = nspr::upgrade::upgrade_stack_with_options(
             &self.git,
             &self.forge,
             &self.config,
             &mut stack,
+            args.update_message,
         )
         .await?;
 
@@ -824,6 +832,9 @@ impl Session {
                     "             deleted synthetic spr base branch {}",
                     deleted
                 );
+            }
+            if let Some(warning) = &item.warning {
+                eprintln!("{} {warning}", style("warning:").yellow().bold());
             }
         }
         Ok(())
@@ -860,6 +871,7 @@ impl Session {
                 println!("Restacking...");
                 self.diff(
                     DiffArgs {
+                        all: true,
                         no_prompt: true,
                         ..Default::default()
                     },
@@ -1438,6 +1450,22 @@ mod tests {
                 assert!(args.all);
             }
             _ => panic!("expected Diff"),
+        }
+    }
+
+    #[test]
+    fn cli_upgrade_accepts_update_message_flag() {
+        let cli = Cli::try_parse_from(["nspr", "upgrade"]).unwrap();
+        match cli.command {
+            Some(Command::Upgrade(args)) => assert!(!args.update_message),
+            _ => panic!("expected Upgrade"),
+        }
+
+        let cli = Cli::try_parse_from(["nspr", "upgrade", "--update-message"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Upgrade(args)) => assert!(args.update_message),
+            _ => panic!("expected Upgrade"),
         }
     }
 }
