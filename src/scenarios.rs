@@ -4066,3 +4066,115 @@ fn upgrade_multi_layer_spr_stack_after_trunk_advances_never_displays_upstream_co
     assert_only_ever_displayed(&w, pr3, &["c.txt"]);
     w.assert_invariants();
 }
+
+#[test]
+fn multi_stack_diff_scopes_to_current_stack_ignoring_legacy_spr_in_earlier_stack()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Legacy spr commit", &[("spr.txt", "s1")]);
+    w.add_layer(
+        "Current stack base\n\nDepends-On: main",
+        &[("cur1.txt", "c1")],
+    );
+    w.add_layer("Current stack top", &[("cur2.txt", "c2")]);
+
+    let stack = w.discover();
+    let trees = stack.all_trees(&w.git).unwrap();
+
+    // Set up layer 0 as a legacy `spr` PR.
+    let tip0 = w
+        .git
+        .synthesize_initial_commit(
+            stack.base,
+            trees.effective[0],
+            stack.layers[0].commit,
+            "[spr] initial version",
+        )
+        .unwrap();
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/spr/legacy",
+        tip0,
+    )]))
+    .unwrap();
+    let pr_spr =
+        block_on(w.forge.create_pull_request(crate::forge::CreatePr {
+            title: "Legacy spr commit".into(),
+            body: String::new(),
+            base: "main".into(),
+            head: "users/tester/spr/legacy".into(),
+            draft: false,
+        }))
+        .unwrap();
+    w.layers[0].message.set(
+        crate::trailers::LEGACY_SPR_PULL_REQUEST,
+        &format!("https://github.com/o/r/pull/{pr_spr}"),
+    );
+    w.rebuild();
+
+    // Syncing all stacks (`only_layers: None`, corresponding to `nspr diff --all`)
+    // must reject the legacy `spr` PR in stack 0.
+    let mut full_stack = w.discover();
+    let err = block_on(crate::engine::sync_stack(
+        &w.git,
+        &w.forge,
+        &w.config,
+        &mut full_stack,
+        &SyncOptions::default(),
+        &crate::engine::FixedPrompter("update".into()),
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains(&format!("pull request #{pr_spr}"))
+            && err.contains("nspr upgrade"),
+        "expected legacy spr rejection when syncing all stacks, got: {err}"
+    );
+
+    // Scoping to the current stack at HEAD (`only_layers: Some({1, 2})`, the
+    // default when multiple stacks exist) must succeed and create PRs only for
+    // layers 1 and 2 without touching layer 0.
+    let stack = w.discover();
+    let head_comp: std::collections::HashSet<usize> = stack
+        .component_of(stack.layers.len() - 1)
+        .into_iter()
+        .collect();
+    assert_eq!(head_comp, std::collections::HashSet::from([1usize, 2usize]));
+
+    let outcomes = w.sync_with(SyncOptions {
+        only_layers: Some(head_comp),
+        ..Default::default()
+    });
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0].index, 1);
+    assert_eq!(outcomes[0].action, LayerAction::Created);
+    assert_eq!(outcomes[1].index, 2);
+    assert_eq!(outcomes[1].action, LayerAction::Created);
+
+    // Layer 0 still has its legacy `spr` commit untouched, while layers 1 and 2
+    // have clean `nspr` PRs.
+    let after = w.discover();
+    assert_eq!(after.layers[0].pr, Some(pr_spr));
+    let pr1_num = after.layers[1].pr.unwrap();
+    let pr2_num = after.layers[2].pr.unwrap();
+    let pr1 = block_on(w.forge.get_pull_request(pr1_num)).unwrap();
+    let pr2 = block_on(w.forge.get_pull_request(pr2_num)).unwrap();
+    let repo = w.t.open();
+    let patch1 = review_diff::displayed_patch(
+        &repo,
+        w.forge.branch(&pr1.base).unwrap(),
+        pr1.head_oid,
+    )
+    .unwrap();
+    assert!(patch1.contains("cur1.txt"));
+    assert!(!patch1.contains("spr.txt"));
+    assert!(!patch1.contains("cur2.txt"));
+    let patch2 = review_diff::displayed_patch(
+        &repo,
+        w.forge.branch(&pr2.base).unwrap(),
+        pr2.head_oid,
+    )
+    .unwrap();
+    assert!(patch2.contains("cur2.txt"));
+    assert!(!patch2.contains("spr.txt"));
+    assert!(!patch2.contains("cur1.txt"));
+}
