@@ -170,7 +170,6 @@ pub async fn upgrade_stack_with_options(
 ) -> Result<Vec<UpgradedLayer>> {
     git.check_no_uncommitted_changes()?;
 
-    let trees = stack.all_trees(git)?;
     let prs = crate::engine::gather(forge, stack).await?;
 
     let mut upgrade_layers: HashSet<usize> = HashSet::new();
@@ -197,6 +196,7 @@ pub async fn upgrade_stack_with_options(
         return Ok(Vec::new());
     }
 
+    let trees = stack.trees_for(git, None, Some(&upgrade_layers))?;
     crate::engine::reject_unusable_for(&prs, None, Some(&upgrade_layers))?;
 
     let n = stack.layers.len();
@@ -500,7 +500,7 @@ pub async fn upgrade_stack_with_options(
 
     crate::engine::apply_message_edits(git, stack, &messages)?;
     forge
-        .sync_stacks(&stack.pr_chains_for(Some(&upgrade_layers)))
+        .sync_stacks(&stack.pr_chains_for(None, Some(&upgrade_layers)))
         .await?;
 
     if config.stack_comments {

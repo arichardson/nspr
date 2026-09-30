@@ -445,7 +445,11 @@ impl Session {
         dry_run: bool,
     ) -> Result<status::StackStatus> {
         engine::resolve_external_deps(&self.forge, stack, opts).await?;
-        let trees = stack.all_trees(&self.git)?;
+        let trees = stack.trees_for(
+            &self.git,
+            opts.only_layer,
+            opts.only_layers.as_ref(),
+        )?;
         let prs = engine::gather_for(&self.forge, stack, opts).await?;
         engine::reject_unusable_for(
             &prs,
@@ -574,9 +578,14 @@ impl Session {
         let retargeted = outcomes.iter().filter(|o| o.retargeted).count();
 
         if verbose {
-            let mut report =
-                status::status(&self.git, &self.forge, &self.config, stack)
-                    .await?;
+            let mut report = status::status_for(
+                &self.git,
+                &self.forge,
+                &self.config,
+                stack,
+                opts,
+            )
+            .await?;
             report.layers.retain(|l| opts.is_layer_selected(l.index));
             print!("{}", report.render_diff(outcomes));
         } else {

@@ -335,12 +335,71 @@ impl Stack {
     /// Computed with a single shared cache, so a deep DAG costs one merge per
     /// layer rather than one per layer per query.
     pub fn all_trees(&self, git: &Git) -> Result<Trees> {
+        self.trees_for(git, None, None)
+    }
+
+    /// Effective tree and dependency tree for the layers selected by
+    /// `only_layer` / `only_layers` (and their transitive `Dep::Layer`
+    /// ancestors). Unselected layers that no selected layer depends on are
+    /// filled with their raw local commit/parent trees so a conflict in an
+    /// unrelated layer lower in the branch does not block `--cherry-pick` or
+    /// updating another stack.
+    pub fn trees_for(
+        &self,
+        git: &Git,
+        only_layer: Option<usize>,
+        only_layers: Option<&HashSet<usize>>,
+    ) -> Result<Trees> {
+        let n = self.layers.len();
+        let mut needed = vec![false; n];
+        for i in (0..n).rev() {
+            if Self::is_layer_selected(i, only_layer, only_layers) || needed[i]
+            {
+                needed[i] = true;
+                if let Dep::Layer(j) = self.layers[i].dep {
+                    needed[j] = true;
+                }
+            }
+        }
+
         let mut cache = HashMap::new();
-        let mut effective = Vec::with_capacity(self.layers.len());
-        let mut dep = Vec::with_capacity(self.layers.len());
-        for i in 0..self.layers.len() {
-            dep.push(self.base_tree_cached(git, i, &mut cache)?);
-            effective.push(self.effective_tree_cached(git, i, &mut cache)?);
+        let mut effective = Vec::with_capacity(n);
+        let mut dep = Vec::with_capacity(n);
+        for i in 0..n {
+            if needed[i] {
+                dep.push(self.base_tree_cached(git, i, &mut cache)?);
+                effective.push(self.effective_tree_cached(git, i, &mut cache)?);
+            } else {
+                dep.push(git.tree_of(self.layers[i].parent)?);
+                effective.push(git.tree_of(self.layers[i].commit)?);
+            }
+        }
+        Ok(Trees { effective, dep })
+    }
+
+    /// Like [`Self::all_trees`], but falls back to raw local parent/commit
+    /// trees for any layer that fails to merge onto its declared dependency, so
+    /// read-only `nspr status` can still render the stack table.
+    pub fn all_trees_lenient(&self, git: &Git) -> Result<Trees> {
+        let n = self.layers.len();
+        let mut cache = HashMap::new();
+        let mut effective = Vec::with_capacity(n);
+        let mut dep = Vec::with_capacity(n);
+        for i in 0..n {
+            let d = match self.base_tree_cached(git, i, &mut cache) {
+                Ok(tree) => tree,
+                Err(_) => git.tree_of(self.layers[i].parent)?,
+            };
+            let eff = match self.effective_tree_cached(git, i, &mut cache) {
+                Ok(tree) => tree,
+                Err(_) => {
+                    let own = git.tree_of(self.layers[i].commit)?;
+                    cache.insert(i, own);
+                    own
+                }
+            };
+            dep.push(d);
+            effective.push(eff);
         }
         Ok(Trees { effective, dep })
     }
@@ -395,13 +454,14 @@ impl Stack {
     /// Ordered bottom-to-top pull request number chains (`len >= 2`) suitable
     /// for registering with GitHub's native Stacks API (`/repos/{owner}/{repo}/stacks`).
     pub fn pr_chains(&self) -> Vec<Vec<u64>> {
-        self.pr_chains_for(None)
+        self.pr_chains_for(None, None)
     }
 
     /// Ordered bottom-to-top pull request number chains (`len >= 2`), optionally
-    /// restricted to components that intersect `only_layers`.
+    /// restricted to layers selected by `only_layer` / `only_layers`.
     pub fn pr_chains_for(
         &self,
+        only_layer: Option<usize>,
         only_layers: Option<&HashSet<usize>>,
     ) -> Vec<Vec<u64>> {
         let mut visited = vec![false; self.layers.len()];
@@ -410,9 +470,7 @@ impl Stack {
             if visited[start] || self.layers[start].pr.is_none() {
                 continue;
             }
-            if let Some(set) = only_layers
-                && !set.contains(&start)
-            {
+            if !Self::is_layer_selected(start, only_layer, only_layers) {
                 continue;
             }
             let is_root = match self.layers[start].dep {
