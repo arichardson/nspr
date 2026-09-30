@@ -271,7 +271,10 @@ impl Forge for GitHubForge {
         // and can return transient HTTP 405 ("Base branch was modified" /
         // `mergeable == UNKNOWN`) or 409 ("Head branch was modified") for a
         // couple of seconds.
-        let retry_delays_ms = [300_u64, 700, 1200, 2000, 3000, 4000, 5000];
+        let retry_delays_ms = [
+            500_u64, 1000, 1500, 2000, 2500, 3000, 3000, 3000, 3000, 3000,
+            3000, 3000,
+        ];
         let mut attempt = 0;
         let merge = loop {
             debug!(
@@ -299,6 +302,12 @@ impl Forge for GitHubForge {
                     let code = status_code(&e);
                     let is_transport_or_5xx = code.is_none()
                         || matches!(code, Some(500 | 502 | 503 | 504));
+                    let is_merge_in_progress = github_error_message(&e)
+                        .is_some_and(|m| {
+                            m.to_ascii_lowercase()
+                                .contains("merge already in progress")
+                        });
+
                     match self.get_pull_request(number).await {
                         Ok(pr) if pr.state == PrState::Merged => {
                             debug!(
@@ -309,6 +318,7 @@ impl Forge for GitHubForge {
                         Ok(pr)
                             if pr.state == PrState::Open
                                 && (is_transport_or_5xx
+                                    || is_merge_in_progress
                                     || (matches!(code, Some(405 | 409))
                                         && (pr.head_oid
                                             != req.expected_head
@@ -329,13 +339,12 @@ impl Forge for GitHubForge {
                                     std::time::Duration::from_millis(delay_ms),
                                 )
                                 .await;
-                                if is_transport_or_5xx
-                                    && let Ok(pr_after) =
-                                        self.get_pull_request(number).await
+                                if let Ok(pr_after) =
+                                    self.get_pull_request(number).await
                                     && pr_after.state == PrState::Merged
                                 {
                                     debug!(
-                                        "merge #{number} completed on GitHub while recovering from previous error"
+                                        "merge #{number} completed on GitHub while waiting to retry"
                                     );
                                     return self
                                         .resolve_merged_pr_oid(&pr_after)
@@ -344,7 +353,9 @@ impl Forge for GitHubForge {
                                 continue;
                             }
                         }
-                        Err(probe_err) if is_transport_or_5xx => {
+                        Err(probe_err)
+                            if is_transport_or_5xx || is_merge_in_progress =>
+                        {
                             if let Some(&delay_ms) =
                                 retry_delays_ms.get(attempt)
                             {
@@ -372,18 +383,23 @@ impl Forge for GitHubForge {
                         }
                         _ => {}
                     }
-                    let advice = match code {
-                        Some(409) => {
-                            "the head branch moved since nspr read it, or the \
-                             pull request no longer merges cleanly. Run `nspr \
-                             diff`, then try again."
+                    let advice = if is_merge_in_progress {
+                        "a merge of this pull request is already in progress on \
+                         GitHub. Run `nspr land` again in a few seconds."
+                    } else {
+                        match code {
+                            Some(409) => {
+                                "the head branch moved since nspr read it, or the \
+                                 pull request no longer merges cleanly. Run `nspr \
+                                 diff`, then try again."
+                            }
+                            Some(405) => {
+                                "GitHub declined: squash merging may be disabled for \
+                                 this repository, or a required review or check is \
+                                 still outstanding."
+                            }
+                            _ => "the merge request failed.",
                         }
-                        Some(405) => {
-                            "GitHub declined: squash merging may be disabled for \
-                             this repository, or a required review or check is \
-                             still outstanding."
-                        }
-                        _ => "the merge request failed.",
                     };
                     return Err(Error::from(e)).wrap_err(format!(
                         "could not squash-merge #{number}: {advice}"
@@ -984,6 +1000,13 @@ fn status_code(error: &octocrab::Error) -> Option<u16> {
         octocrab::Error::GitHub { source, .. } => {
             Some(source.status_code.as_u16())
         }
+        _ => None,
+    }
+}
+
+fn github_error_message(error: &octocrab::Error) -> Option<&str> {
+    match error {
+        octocrab::Error::GitHub { source, .. } => Some(source.message.as_str()),
         _ => None,
     }
 }
