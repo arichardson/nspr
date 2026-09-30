@@ -19,6 +19,24 @@ query PullRequest($owner: String!, $name: String!, $number: Int!) {
       mergeCommit {
         oid
       }
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              contexts {
+                checkRunCountsByState {
+                  state
+                  count
+                }
+                statusContextCountsByState {
+                  state
+                  count
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

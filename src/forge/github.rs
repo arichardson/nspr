@@ -34,9 +34,9 @@ use octocrab::params::pulls::{MergeMethod, State};
 use serde::Deserialize;
 
 use super::{
-    Comment, CreatePr, Forge, ListedPr, MergeState, Mergeable, PrState,
-    Protection, PullRequest, PullRequestUpdate, PushSpec, RepoMergeSettings,
-    ReviewDecision, SquashMerge,
+    CheckCounts, Comment, CreatePr, Forge, ListedPr, MergeState, Mergeable,
+    PrState, Protection, PullRequest, PullRequestUpdate, PushSpec,
+    RepoMergeSettings, ReviewDecision, SquashMerge,
 };
 use crate::git_remote::GitRemote;
 
@@ -1120,6 +1120,52 @@ struct PullRequestNode {
     auto_merge_request: Option<serde_json::Value>,
     #[serde(default)]
     merge_commit: Option<OidNode>,
+    #[serde(default)]
+    commits: Option<CommitConnectionNode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitConnectionNode {
+    #[serde(default)]
+    nodes: Vec<Option<PullRequestCommitNode>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestCommitNode {
+    #[serde(default)]
+    commit: Option<CommitNode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitNode {
+    #[serde(default)]
+    status_check_rollup: Option<StatusCheckRollupNode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusCheckRollupNode {
+    #[serde(default)]
+    contexts: Option<StatusCheckRollupContextConnection>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusCheckRollupContextConnection {
+    #[serde(default)]
+    check_run_counts_by_state: Vec<StateCountNode>,
+    #[serde(default)]
+    status_context_counts_by_state: Vec<StateCountNode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StateCountNode {
+    state: String,
+    count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1231,6 +1277,7 @@ fn pull_request_from(node: PullRequestNode) -> Result<PullRequest> {
         Some(c) => Some(Oid::from_str(&c.oid)?),
         None => None,
     };
+    let checks = checks_from(node.commits);
     Ok(PullRequest {
         number: node.number,
         node_id: node.id,
@@ -1246,7 +1293,49 @@ fn pull_request_from(node: PullRequestNode) -> Result<PullRequest> {
         merge_state: merge_state_from(node.merge_state_status.as_deref()),
         auto_merge: node.auto_merge_request.is_some(),
         draft: node.is_draft,
+        checks,
     })
+}
+
+fn checks_from(commits: Option<CommitConnectionNode>) -> Option<CheckCounts> {
+    let contexts = commits?
+        .nodes
+        .into_iter()
+        .flatten()
+        .last()?
+        .commit?
+        .status_check_rollup?
+        .contexts?;
+
+    let mut counts = CheckCounts::default();
+    for entry in contexts.check_run_counts_by_state {
+        match entry.state.as_str() {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" | "COMPLETED" => {
+                counts.passed += entry.count;
+            }
+            "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+            | "STALE" => {
+                counts.failed += entry.count;
+            }
+            "IN_PROGRESS" | "QUEUED" | "PENDING" | "WAITING" | "REQUESTED" => {
+                counts.pending += entry.count;
+            }
+            // Excluded so cancelled runs from `cancel-in-progress` workflows
+            // neither inflate the denominator nor show up as failures.
+            "CANCELLED" => {}
+            _ => {}
+        }
+    }
+    for entry in contexts.status_context_counts_by_state {
+        match entry.state.as_str() {
+            "SUCCESS" => counts.passed += entry.count,
+            "FAILURE" | "ERROR" => counts.failed += entry.count,
+            "PENDING" | "EXPECTED" => counts.pending += entry.count,
+            _ => {}
+        }
+    }
+
+    (counts.total() > 0).then_some(counts)
 }
 
 fn pr_state_from(state: &str) -> PrState {
@@ -1481,5 +1570,43 @@ mod tests {
         assert_eq!(pr.head, "users/alice/widget");
         assert_eq!(pr.review_decision, Some(ReviewDecision::Approved));
         assert_eq!(pr.url, "https://github.com/o/r/pull/42");
+    }
+
+    #[test]
+    fn parses_status_check_rollup_counts_by_state() {
+        let json = r#"{
+            "nodes": [{
+                "commit": {
+                    "statusCheckRollup": {
+                        "contexts": {
+                            "checkRunCountsByState": [
+                                { "state": "SUCCESS", "count": 7 },
+                                { "state": "SKIPPED", "count": 1 },
+                                { "state": "NEUTRAL", "count": 1 },
+                                { "state": "IN_PROGRESS", "count": 1 },
+                                { "state": "FAILURE", "count": 2 },
+                                { "state": "CANCELLED", "count": 3 }
+                            ],
+                            "statusContextCountsByState": [
+                                { "state": "SUCCESS", "count": 1 },
+                                { "state": "PENDING", "count": 1 },
+                                { "state": "ERROR", "count": 1 }
+                            ]
+                        }
+                    }
+                }
+            }]
+        }"#;
+        let commits: CommitConnectionNode = serde_json::from_str(json).unwrap();
+        let counts = checks_from(Some(commits)).unwrap();
+        assert_eq!(
+            counts,
+            CheckCounts {
+                passed: 10,
+                failed: 3,
+                pending: 2,
+            }
+        );
+        assert_eq!(counts.total(), 15);
     }
 }

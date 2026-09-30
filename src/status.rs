@@ -9,7 +9,7 @@ use color_eyre::eyre::Result;
 
 use crate::config::Config;
 use crate::engine::{self, SyncOptions};
-use crate::forge::{Forge, MergeState, Mergeable, PrState};
+use crate::forge::{CheckCounts, Forge, MergeState, Mergeable, PrState};
 use crate::git::Git;
 use crate::stack::{Dep, Stack};
 
@@ -69,6 +69,7 @@ pub struct LayerStatus {
     pub landable: bool,
     /// The layer this one is stacked on, if any.
     pub dep: Dep,
+    pub checks: Option<CheckCounts>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +198,7 @@ pub fn from_parts(
             github_message_edited: decision.github_message_edited[i],
             landable: layer.dep == Dep::Main && layer.pr.is_some(),
             dep: layer.dep,
+            checks: prs[i].as_ref().and_then(|p| p.checks),
         });
     }
 
@@ -358,6 +360,8 @@ impl StackStatus {
             num_plain: String,
             glyph: String,
             state_styled: String,
+            checks_plain: String,
+            checks_styled: String,
             badges_joined: String,
         }
 
@@ -582,11 +586,32 @@ impl StackStatus {
                     });
                 }
 
+                let (checks_plain, checks_styled) = match layer.checks {
+                    Some(c) if c.total() > 0 => {
+                        let plain = format!("{}/{} checks", c.passed, c.total());
+                        let styled = if use_color {
+                            if c.failed > 0 {
+                                style(&plain).red().bold().to_string()
+                            } else if c.pending > 0 {
+                                style(&plain).yellow().to_string()
+                            } else {
+                                style(&plain).green().to_string()
+                            }
+                        } else {
+                            plain.clone()
+                        };
+                        (plain, styled)
+                    }
+                    _ => (String::new(), String::new()),
+                };
+
                 rows.push(RowData {
                     layer,
                     num_plain,
                     glyph,
                     state_styled,
+                    checks_plain,
+                    checks_styled,
                     badges_joined: badges.join("  "),
                 });
             }
@@ -606,6 +631,12 @@ impl StackStatus {
             .map(|r| measure_text_width(&r.state_styled))
             .max()
             .unwrap_or(2);
+        let max_checks_width = component_rows
+            .iter()
+            .flatten()
+            .map(|r| measure_text_width(&r.checks_plain))
+            .max()
+            .unwrap_or(0);
         let max_badges_width = component_rows
             .iter()
             .flatten()
@@ -674,26 +705,31 @@ impl StackStatus {
                     None,
                 );
 
-                let (badges_col, prefix_width) = if max_badges_width > 0 {
+                let mut prefix_width =
+                    2 + 1 + 2 + num_width + 2 + state_width + 2;
+                let checks_col = if max_checks_width > 0 {
+                    let padded_checks = pad_str(
+                        &row.checks_styled,
+                        max_checks_width,
+                        Alignment::Right,
+                        None,
+                    );
+                    prefix_width += max_checks_width + 2;
+                    format!("  {padded_checks}")
+                } else {
+                    String::new()
+                };
+                let badges_col = if max_badges_width > 0 {
                     let padded_badges = pad_str(
                         &row.badges_joined,
                         max_badges_width,
                         Alignment::Left,
                         None,
                     );
-                    (
-                        format!("  {padded_badges}"),
-                        2 + 1
-                            + 2
-                            + num_width
-                            + 2
-                            + state_width
-                            + 2
-                            + max_badges_width
-                            + 2,
-                    )
+                    prefix_width += max_badges_width + 2;
+                    format!("  {padded_badges}")
                 } else {
-                    (String::new(), 2 + 1 + 2 + num_width + 2 + state_width + 2)
+                    String::new()
                 };
 
                 let subject = if let Some(cols) = term_width
@@ -714,7 +750,7 @@ impl StackStatus {
                 };
 
                 out.push_str(&format!(
-                    "  {glyph}  {styled_num}  {padded_state}{badges_col}  {styled_subject}\n"
+                    "  {glyph}  {styled_num}  {padded_state}{checks_col}{badges_col}  {styled_subject}\n"
                 ));
             }
             out.push_str(&format!("  {trunk_connector} {styled_trunk}\n"));
@@ -750,6 +786,7 @@ mod tests {
                     github_message_edited: false,
                     landable: true,
                     dep: Dep::Main,
+                    checks: None,
                 },
                 LayerStatus {
                     index: 1,
@@ -769,6 +806,7 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(0),
+                    checks: None,
                 },
                 LayerStatus {
                     index: 2,
@@ -788,6 +826,7 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(1),
+                    checks: None,
                 },
             ],
         };
@@ -825,6 +864,7 @@ mod tests {
                     github_message_edited: false,
                     landable: true,
                     dep: Dep::Main,
+                    checks: None,
                 },
                 LayerStatus {
                     index: 1,
@@ -844,6 +884,7 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(0),
+                    checks: None,
                 },
                 LayerStatus {
                     index: 2,
@@ -863,6 +904,7 @@ mod tests {
                     github_message_edited: false,
                     landable: true,
                     dep: Dep::Main,
+                    checks: None,
                 },
                 LayerStatus {
                     index: 3,
@@ -882,6 +924,7 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(2),
+                    checks: None,
                 },
             ],
         };
@@ -897,5 +940,139 @@ mod tests {
             "  ┴─ main\n",
         );
         assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn render_displays_and_colors_checks_column() {
+        console::set_colors_enabled(true);
+        let status = StackStatus {
+            trunk: "main".to_string(),
+            layers: vec![
+                LayerStatus {
+                    index: 0,
+                    subject: "All passing".into(),
+                    number: Some(101),
+                    url: None,
+                    branch: Some("users/me/1".into()),
+                    base: Some("main".into()),
+                    wanted_base: "main".into(),
+                    wanted_base_label: "main".into(),
+                    state: LayerState::Current,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    message_differs: false,
+                    github_message_edited: false,
+                    landable: true,
+                    dep: Dep::Main,
+                    checks: Some(CheckCounts {
+                        passed: 10,
+                        failed: 0,
+                        pending: 0,
+                    }),
+                },
+                LayerStatus {
+                    index: 1,
+                    subject: "One pending".into(),
+                    number: Some(102),
+                    url: None,
+                    branch: Some("users/me/2".into()),
+                    base: Some("users/me/1".into()),
+                    wanted_base: "users/me/1".into(),
+                    wanted_base_label: "#101".into(),
+                    state: LayerState::Current,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    message_differs: false,
+                    github_message_edited: false,
+                    landable: false,
+                    dep: Dep::Layer(0),
+                    checks: Some(CheckCounts {
+                        passed: 9,
+                        failed: 0,
+                        pending: 1,
+                    }),
+                },
+                LayerStatus {
+                    index: 2,
+                    subject: "One failing".into(),
+                    number: Some(103),
+                    url: None,
+                    branch: Some("users/me/3".into()),
+                    base: Some("users/me/2".into()),
+                    wanted_base: "users/me/2".into(),
+                    wanted_base_label: "#102".into(),
+                    state: LayerState::Current,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    message_differs: false,
+                    github_message_edited: false,
+                    landable: false,
+                    dep: Dep::Layer(1),
+                    checks: Some(CheckCounts {
+                        passed: 9,
+                        failed: 1,
+                        pending: 0,
+                    }),
+                },
+                LayerStatus {
+                    index: 3,
+                    subject: "Unsubmitted commit".into(),
+                    number: None,
+                    url: None,
+                    branch: None,
+                    base: None,
+                    wanted_base: "users/me/3".into(),
+                    wanted_base_label: "#103".into(),
+                    state: LayerState::New,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    message_differs: false,
+                    github_message_edited: false,
+                    landable: false,
+                    dep: Dep::Layer(2),
+                    checks: None,
+                },
+            ],
+        };
+
+        let plain = status.render_with_options(true, false, None);
+        let expected_plain = concat!(
+            "  ○     —  new                          Unsubmitted commit\n",
+            "  ●  #103  ok    9/10 checks            One failing\n",
+            "  ●  #102  ok    9/10 checks            One pending\n",
+            "  ●  #101  ok   10/10 checks  landable  All passing\n",
+            "  ┴─ main\n",
+        );
+        assert_eq!(plain, expected_plain);
+
+        let colored = status.render_with_options(true, true, None);
+        let lines: Vec<&str> = colored.lines().collect();
+        assert!(
+            lines[1].contains(
+                &console::style("9/10 checks").red().bold().to_string()
+            ),
+            "failing checks must be bold red: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2]
+                .contains(&console::style("9/10 checks").yellow().to_string()),
+            "pending checks must be yellow: {}",
+            lines[2]
+        );
+        assert!(
+            lines[3]
+                .contains(&console::style("10/10 checks").green().to_string()),
+            "passing checks must be green: {}",
+            lines[3]
+        );
     }
 }
