@@ -41,6 +41,20 @@ pub enum MergeState {
     Unknown,
 }
 
+/// Summary of CI check runs and status contexts on a pull request's head commit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckCounts {
+    pub passed: usize,
+    pub failed: usize,
+    pub pending: usize,
+}
+
+impl CheckCounts {
+    pub fn total(&self) -> usize {
+        self.passed + self.failed + self.pending
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequest {
     pub number: u64,
@@ -62,6 +76,7 @@ pub struct PullRequest {
     /// silently flattening a stack. Surfaced as a guardrail warning.
     pub auto_merge: bool,
     pub draft: bool,
+    pub checks: Option<CheckCounts>,
 }
 
 impl PullRequest {

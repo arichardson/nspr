@@ -17,9 +17,9 @@ use color_eyre::eyre::{Result, bail};
 use git2::{Oid, Repository};
 
 use super::{
-    Comment, CreatePr, Forge, ListedPr, MergeState, Mergeable, PrState,
-    Protection, PullRequest, PullRequestUpdate, PushSpec, RepoMergeSettings,
-    ReviewDecision, SquashMerge,
+    CheckCounts, Comment, CreatePr, Forge, ListedPr, MergeState, Mergeable,
+    PrState, Protection, PullRequest, PullRequestUpdate, PushSpec,
+    RepoMergeSettings, ReviewDecision, SquashMerge,
 };
 
 #[derive(Debug, Clone)]
@@ -34,6 +34,7 @@ struct FakePr {
     merge_commit: Option<Oid>,
     auto_merge: bool,
     draft: bool,
+    checks: Option<CheckCounts>,
 }
 
 pub struct FakeForge {
@@ -132,6 +133,17 @@ impl FakeForge {
             .find(|p| p.number == number)
         {
             pr.auto_merge = on;
+        }
+    }
+
+    pub fn set_checks(&self, number: u64, checks: CheckCounts) {
+        if let Some(pr) = self
+            .prs
+            .borrow_mut()
+            .iter_mut()
+            .find(|p| p.number == number)
+        {
+            pr.checks = Some(checks);
         }
     }
 
@@ -353,6 +365,7 @@ impl Forge for FakeForge {
             merge_state,
             auto_merge: pr.auto_merge,
             draft: pr.draft,
+            checks: pr.checks,
         })
     }
 
@@ -372,6 +385,7 @@ impl Forge for FakeForge {
             merge_commit: None,
             auto_merge: false,
             draft: req.draft,
+            checks: None,
         });
         Ok(number)
     }
