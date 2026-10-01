@@ -36,7 +36,7 @@ use serde::Deserialize;
 use super::{
     CheckCounts, Comment, CreatePr, Forge, ListedPr, MergeState, Mergeable,
     PrState, Protection, PullRequest, PullRequestUpdate, PushSpec,
-    RepoMergeSettings, ReviewDecision, SquashMerge,
+    RepoMergeSettings, ReviewDecision, ReviewSummary, SquashMerge,
 };
 use crate::git_remote::GitRemote;
 
@@ -1313,7 +1313,32 @@ struct PullRequestNode {
     #[serde(default)]
     merge_commit: Option<OidNode>,
     #[serde(default)]
+    latest_opinionated_reviews: Option<ReviewConnectionNode>,
+    #[serde(default)]
     commits: Option<CommitConnectionNode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewConnectionNode {
+    #[serde(default)]
+    nodes: Vec<Option<ReviewNode>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewNode {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    author: Option<ReviewAuthorNode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewAuthorNode {
+    #[serde(default)]
+    login: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1351,6 +1376,8 @@ struct StatusCheckRollupContextConnection {
     check_run_counts_by_state: Vec<StateCountNode>,
     #[serde(default)]
     status_context_counts_by_state: Vec<StateCountNode>,
+    #[serde(default)]
+    nodes: Vec<Option<CheckContextNode>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1358,6 +1385,23 @@ struct StatusCheckRollupContextConnection {
 struct StateCountNode {
     state: String,
     count: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckContextNode {
+    /// Present on `CheckRun`.
+    #[serde(default)]
+    name: Option<String>,
+    /// Present on `CheckRun`.
+    #[serde(default)]
+    conclusion: Option<String>,
+    /// Present on `StatusContext`.
+    #[serde(default)]
+    context: Option<String>,
+    /// Present on `StatusContext`.
+    #[serde(default)]
+    state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1474,11 +1518,19 @@ const PULL_REQUEST_FIELDS: &str = r#"{
       mergeCommit {
         oid
       }
+      latestOpinionatedReviews(last: 50) {
+        nodes {
+          state
+          author {
+            login
+          }
+        }
+      }
       commits(last: 1) {
         nodes {
           commit {
             statusCheckRollup {
-              contexts {
+              contexts(first: 100) {
                 checkRunCountsByState {
                   state
                   count
@@ -1486,6 +1538,16 @@ const PULL_REQUEST_FIELDS: &str = r#"{
                 statusContextCountsByState {
                   state
                   count
+                }
+                nodes {
+                  ... on CheckRun {
+                    name
+                    conclusion
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                  }
                 }
               }
             }
@@ -1564,6 +1626,7 @@ fn pull_request_from(node: PullRequestNode) -> Result<PullRequest> {
         None => None,
     };
     let checks = checks_from(node.commits);
+    let reviews = reviews_from(node.latest_opinionated_reviews);
     Ok(PullRequest {
         number: node.number,
         node_id: node.id,
@@ -1580,7 +1643,36 @@ fn pull_request_from(node: PullRequestNode) -> Result<PullRequest> {
         auto_merge: node.auto_merge_request.is_some(),
         draft: node.is_draft,
         checks,
+        reviews,
     })
+}
+
+fn reviews_from(reviews: Option<ReviewConnectionNode>) -> ReviewSummary {
+    let mut summary = ReviewSummary::default();
+    let Some(reviews) = reviews else {
+        return summary;
+    };
+    for node in reviews.nodes.into_iter().flatten() {
+        let login = node
+            .author
+            .map(|a| a.login)
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| "ghost".to_string());
+        match node.state.as_str() {
+            "APPROVED" => {
+                if !summary.approved_by.contains(&login) {
+                    summary.approved_by.push(login);
+                }
+            }
+            "CHANGES_REQUESTED" => {
+                if !summary.changes_requested_by.contains(&login) {
+                    summary.changes_requested_by.push(login);
+                }
+            }
+            _ => {}
+        }
+    }
+    summary
 }
 
 fn checks_from(commits: Option<CommitConnectionNode>) -> Option<CheckCounts> {
@@ -1618,6 +1710,26 @@ fn checks_from(commits: Option<CommitConnectionNode>) -> Option<CheckCounts> {
             "FAILURE" | "ERROR" => counts.failed += entry.count,
             "PENDING" | "EXPECTED" => counts.pending += entry.count,
             _ => {}
+        }
+    }
+    for node in contexts.nodes.into_iter().flatten() {
+        if let (Some(name), Some(conclusion)) = (node.name, node.conclusion) {
+            if matches!(
+                conclusion.as_str(),
+                "FAILURE"
+                    | "TIMED_OUT"
+                    | "ACTION_REQUIRED"
+                    | "STARTUP_FAILURE"
+                    | "STALE"
+            ) && !counts.failed_names.contains(&name)
+            {
+                counts.failed_names.push(name);
+            }
+        } else if let (Some(context), Some(state)) = (node.context, node.state)
+            && matches!(state.as_str(), "FAILURE" | "ERROR")
+            && !counts.failed_names.contains(&context)
+        {
+            counts.failed_names.push(context);
         }
     }
 
@@ -1877,6 +1989,12 @@ mod tests {
                                 { "state": "SUCCESS", "count": 1 },
                                 { "state": "PENDING", "count": 1 },
                                 { "state": "ERROR", "count": 1 }
+                            ],
+                            "nodes": [
+                                { "name": "linux-x64", "conclusion": "SUCCESS" },
+                                { "name": "clang-debian", "conclusion": "FAILURE" },
+                                { "name": "win-x64", "conclusion": "TIMED_OUT" },
+                                { "context": "bazel-build", "state": "ERROR" }
                             ]
                         }
                     }
@@ -1891,9 +2009,34 @@ mod tests {
                 passed: 10,
                 failed: 3,
                 pending: 2,
+                failed_names: vec![
+                    "clang-debian".to_string(),
+                    "win-x64".to_string(),
+                    "bazel-build".to_string(),
+                ],
             }
         );
         assert_eq!(counts.total(), 15);
+    }
+
+    #[test]
+    fn parses_latest_opinionated_reviews() {
+        let json = r#"{
+            "nodes": [
+                { "state": "APPROVED", "author": { "login": "alice" } },
+                { "state": "CHANGES_REQUESTED", "author": { "login": "bob" } },
+                { "state": "APPROVED", "author": { "login": "carol" } }
+            ]
+        }"#;
+        let conn: ReviewConnectionNode = serde_json::from_str(json).unwrap();
+        let summary = reviews_from(Some(conn));
+        assert_eq!(
+            summary,
+            ReviewSummary {
+                approved_by: vec!["alice".to_string(), "carol".to_string()],
+                changes_requested_by: vec!["bob".to_string()],
+            }
+        );
     }
 
     #[test]
