@@ -572,6 +572,15 @@ pub fn decide(
                 };
                 let recorded_msg = crate::refs::get_message(git, pr.number)
                     .map(|m| CommitMessage::parse(&m));
+                let msg_differs =
+                    pr_message_differs_from(pr, &stack.layers[i].message);
+                if !msg_differs && recorded_msg.is_none() {
+                    let _ = crate::refs::update_message(
+                        git,
+                        pr.number,
+                        &stack.layers[i].message.clean_for_branch(),
+                    );
+                }
                 if let Some(first_oid) = first_oid {
                     let current_msg = git.message_of(first_oid)?;
                     let trimmed_current = current_msg.trim();
@@ -584,12 +593,14 @@ pub fn decide(
                     } else {
                         stack.layers[i].message.clone()
                     };
-                    github_message_edited[i] =
-                        pr_was_edited_on_forge(pr, &baseline_msg);
+                    github_message_edited[i] = if msg_differs {
+                        pr_was_edited_on_forge(pr, &baseline_msg)
+                    } else {
+                        false
+                    };
 
                     if opts.preserve_commit_history {
-                        if pr_message_differs_from(pr, &stack.layers[i].message)
-                        {
+                        if msg_differs {
                             message_changed[i] = true;
                         }
                     } else {
@@ -598,10 +609,7 @@ pub fn decide(
                         if trimmed_current != desired_msg.trim() {
                             message_changed[i] = true;
                             rewrite_history[i] = true;
-                        } else if pr_message_differs_from(
-                            pr,
-                            &stack.layers[i].message,
-                        ) {
+                        } else if msg_differs {
                             message_changed[i] = true;
                         }
                     }
@@ -619,9 +627,12 @@ pub fn decide(
                 } else {
                     let baseline_msg = recorded_msg
                         .unwrap_or_else(|| stack.layers[i].message.clone());
-                    github_message_edited[i] =
-                        pr_was_edited_on_forge(pr, &baseline_msg);
-                    if pr_message_differs_from(pr, &stack.layers[i].message) {
+                    github_message_edited[i] = if msg_differs {
+                        pr_was_edited_on_forge(pr, &baseline_msg)
+                    } else {
+                        false
+                    };
+                    if msg_differs {
                         message_changed[i] = true;
                     }
                 }
@@ -1383,7 +1394,7 @@ async fn execute(
                         git,
                         &revisions,
                         anchor,
-                        INITIAL_COMMIT_MESSAGE,
+                        None,
                         Some(layer_commit),
                     )? {
                         Some(t) => t,

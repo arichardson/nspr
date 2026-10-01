@@ -326,12 +326,14 @@ pub async fn land_layer(
             preserve_commit_history,
             &stack.layers[d.layer].message,
         );
+        let initial_msg =
+            (!preserve_commit_history).then_some(clean_msg.as_str());
         let revisions = branch_revisions(git, d.tip, old_root)?;
         let (new_tip, collapsed) = match replay(
             git,
             &revisions,
             new_root,
-            &clean_msg,
+            initial_msg,
             Some(stack.layers[d.layer].commit),
         )? {
             Some(tip) => (tip, false),
@@ -1143,6 +1145,8 @@ async fn repair_remaining_dependents(
             preserve_commit_history,
             &stack.layers[d_layer].message,
         );
+        let initial_msg =
+            (!preserve_commit_history).then_some(clean_msg.as_str());
         let revisions = branch_revisions(git, d_state.tip, old_root)?;
         let d_snap = Dependent {
             layer: d_layer,
@@ -1155,7 +1159,7 @@ async fn repair_remaining_dependents(
             git,
             &revisions,
             new_root,
-            &clean_msg,
+            initial_msg,
             Some(stack.layers[d_layer].commit),
         )? {
             Some(tip) => (tip, false),
@@ -1604,7 +1608,7 @@ pub(crate) fn replay(
     git: &Git,
     revisions: &[Oid],
     onto: Oid,
-    initial_message: &str,
+    initial_message: Option<&str>,
     attribution_commit: Option<Oid>,
 ) -> Result<Option<Oid>> {
     let repo = git.repo();
@@ -1634,7 +1638,12 @@ pub(crate) fn replay(
 
         let msg = if first {
             first = false;
-            initial_message.to_string()
+            match initial_message {
+                Some(m) => m.to_string(),
+                None => {
+                    String::from_utf8_lossy(commit.message_bytes()).into_owned()
+                }
+            }
         } else {
             String::from_utf8_lossy(commit.message_bytes()).into_owned()
         };
