@@ -628,10 +628,14 @@ impl Session {
                     .map(|l| l.subject())
                     .unwrap_or("");
                 let url = self.config.pull_request_url(o.number);
+                let num = self.config.pull_request_link(
+                    o.number,
+                    style(format!("#{}", o.number)).bold(),
+                );
                 println!(
                     "  {} {}  {}  {}",
                     style("○").green().bold(),
-                    style(format!("#{}", o.number)).bold(),
+                    num,
                     subject,
                     style(url).dim(),
                 );
@@ -752,9 +756,12 @@ impl Session {
                 .await?;
             let _ = nspr::refs::remove(&self.git, args.number);
             println!(
-                "{} #{} {}",
+                "{} {} {}",
                 style("closed").red().bold(),
-                args.number,
+                self.config.pull_request_link(
+                    args.number,
+                    format!("#{}", args.number)
+                ),
                 pr.title
             );
             if retargeted_any {
@@ -784,9 +791,12 @@ impl Session {
         .await?;
 
         println!(
-            "{} #{} {}",
+            "{} {} {}",
             style("closed").red().bold(),
-            outcome.number,
+            self.config.pull_request_link(
+                outcome.number,
+                format!("#{}", outcome.number)
+            ),
             outcome.title
         );
         for warning in &outcome.warnings {
@@ -821,7 +831,13 @@ impl Session {
             return Ok(());
         }
         for a in &changed {
-            println!("  #{}  {} -> {}", a.number, a.old_subject, a.new_subject);
+            println!(
+                "  {}  {} -> {}",
+                self.config
+                    .pull_request_link(a.number, format!("#{}", a.number)),
+                a.old_subject,
+                a.new_subject
+            );
         }
         Ok(())
     }
@@ -895,15 +911,19 @@ impl Session {
             eprintln!("{} {warning}", style("warning:").yellow().bold());
         }
         if !report.merged.is_empty() {
-            let list: Vec<String> =
-                report.merged.iter().map(|n| format!("#{n}")).collect();
+            let list: Vec<String> = report
+                .merged
+                .iter()
+                .map(|&n| self.config.pull_request_link(n, format!("#{n}")))
+                .collect();
             println!("Merged elsewhere: {}", list.join(", "));
         }
-        for number in &report.stranded {
+        for &number in &report.stranded {
             eprintln!(
-                "{} #{number} was merged, but your local commit for it still \
+                "{} {} was merged, but your local commit for it still \
                  has changes. Drop it by hand once you have salvaged them.",
-                style("warning:").yellow().bold()
+                style("warning:").yellow().bold(),
+                self.config.pull_request_link(number, format!("#{number}")),
             );
         }
         if report.rebased {
