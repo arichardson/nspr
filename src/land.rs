@@ -174,7 +174,7 @@ pub async fn land_layer(
         .ok_or_else(|| eyre!("no `{}` branch on the remote", config.trunk))?;
     forge.fetch_commit(trunk_tip).await?;
 
-    if pr.state == PrState::Merged {
+    let already_landed_on_trunk = if pr.state == PrState::Merged {
         let squash_candidate = pr.merge_commit.unwrap_or(trunk_tip);
         forge.fetch_commit(squash_candidate).await?;
         check_already_merged_matches_local(
@@ -187,14 +187,33 @@ pub async fn land_layer(
             trunk_tip,
             &config.trunk,
         )?;
+        None
+    } else if let Some(landed_oid) = find_landed_commit_on_trunk(
+        git.repo(),
+        trunk_tip,
+        Oid::ZERO_SHA1,
+        number,
+    )? {
+        check_already_merged_matches_local(
+            git,
+            layer,
+            number,
+            pr.base_oid,
+            pr.head_oid,
+            landed_oid,
+            trunk_tip,
+            &config.trunk,
+        )?;
+        Some(landed_oid)
     } else {
         check_merge_equals_cherrypick(
             git,
-            layer.commit,
+            layer,
             trunk_tip,
+            Oid::ZERO_SHA1,
             pr.head_oid,
-        )?;
-    }
+        )?
+    };
 
     let mut warnings = Vec::new();
     let dependents =
@@ -225,6 +244,24 @@ pub async fn land_layer(
     let (title, message) = squash_message(layer, number, opts);
     let squash = if pr.state == PrState::Merged {
         pr.merge_commit.unwrap_or(trunk_tip)
+    } else if let Some(landed_oid) = already_landed_on_trunk {
+        forge
+            .update_pull_request(
+                number,
+                PullRequestUpdate {
+                    state: Some(PrState::Closed),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        warnings.push(format!(
+            "#{number} was still open on GitHub, but its changes were already \
+             on `{}` ({}); closed #{number} without creating a duplicate \
+             commit.",
+            config.trunk,
+            git.short_id(landed_oid)?,
+        ));
+        landed_oid
     } else {
         let merged = forge
             .merge_pull_request(
@@ -620,6 +657,89 @@ pub async fn land_all(
             }
             PrState::Open => {}
         }
+
+        if let Some(landed_oid) = find_landed_commit_on_trunk(
+            git.repo(),
+            current_trunk,
+            Oid::ZERO_SHA1,
+            state.number,
+        )? {
+            if let Err(e) = check_already_merged_matches_local(
+                git,
+                &stack.layers[index],
+                state.number,
+                state.base_oid,
+                state.tip,
+                landed_oid,
+                current_trunk,
+                &config.trunk,
+            ) {
+                let msg = format!("{e:#}");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+                stop_warning =
+                    Some(format!("stopped at #{}: {msg}", state.number));
+                continue;
+            }
+            for d_layer in stack.direct_dependents_of(index) {
+                if let Some(d_state) = pr_states.get(&d_layer)
+                    && d_state.state == PrState::Open
+                    && d_state.base != config.trunk
+                {
+                    let d_num = d_state.number;
+                    forge
+                        .update_pull_request(
+                            d_num,
+                            PullRequestUpdate {
+                                base: Some(config.trunk.clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    pr_states.get_mut(&d_layer).unwrap().base =
+                        config.trunk.clone();
+                }
+            }
+            forge
+                .update_pull_request(
+                    state.number,
+                    PullRequestUpdate {
+                        state: Some(PrState::Closed),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let (title, _) =
+                squash_message(&stack.layers[index], state.number, opts);
+            print_landed(git, config, state.number, &title, landed_oid)?;
+            forge.delete_branch(&state.branch).await?;
+            crate::refs::remove(git, state.number)?;
+
+            landed_layers.insert(index);
+            pr_states.get_mut(&index).unwrap().state = PrState::Closed;
+            if !git.is_ancestor(landed_oid, current_trunk)? {
+                current_trunk = landed_oid;
+            }
+            let warning = format!(
+                "#{} was still open on GitHub, but its changes were already \
+                 on `{}` ({}); closed #{} without creating a duplicate \
+                 commit.",
+                state.number,
+                config.trunk,
+                git.short_id(landed_oid)?,
+                state.number,
+            );
+            outcomes.push(LandOutcome {
+                number: state.number,
+                title,
+                squash: current_trunk,
+                repaired: Vec::new(),
+                warnings: vec![warning],
+            });
+            continue;
+        }
+
         if state.draft {
             if first_error.is_none() {
                 first_error = Some(eyre!(
@@ -627,6 +747,20 @@ pub async fn land_all(
                     state.number
                 ));
             }
+            continue;
+        }
+
+        if git.tree_of(stack.layers[index].commit)?
+            == git.tree_of(stack.layers[index].parent)?
+        {
+            let msg = format!(
+                "`{}` has no file changes relative to its parent; nothing to land.",
+                stack.layers[index].subject()
+            );
+            if first_error.is_none() {
+                first_error = Some(eyre!("{msg}"));
+            }
+            stop_warning = Some(format!("stopped at #{}: {msg}", state.number));
             continue;
         }
 
@@ -688,31 +822,34 @@ pub async fn land_all(
                 continue;
             }
 
-            log::debug!(
-                "land_all: #{} patch matches local commit; repairing remaining branches onto trunk {}",
-                state.number,
-                current_trunk
-            );
-            let last_outcome = outcomes
-                .last_mut()
-                .expect("anchor_tip implies an earlier layer landed");
-            let repaired = repair_remaining_dependents(
-                git,
-                forge,
-                config,
-                stack,
-                &landed_layers,
-                current_trunk,
-                &mut pr_states,
-                &mut last_outcome.warnings,
-            )
-            .await?;
-            last_outcome.repaired.extend(repaired);
+            if cherrypicked != git.tree_of(current_trunk)? {
+                log::debug!(
+                    "land_all: #{} patch matches local commit; repairing remaining branches onto trunk {}",
+                    state.number,
+                    current_trunk
+                );
+                let last_outcome = outcomes
+                    .last_mut()
+                    .expect("anchor_tip implies an earlier layer landed");
+                let repaired = repair_remaining_dependents(
+                    git,
+                    forge,
+                    config,
+                    stack,
+                    &landed_layers,
+                    current_trunk,
+                    &mut pr_states,
+                    &mut last_outcome.warnings,
+                )
+                .await?;
+                last_outcome.repaired.extend(repaired);
 
-            let synced_pr =
-                get_synced_pull_request(git, forge, state.number, true).await?;
-            current_tip = synced_pr.head_oid;
-            pr_states.get_mut(&index).unwrap().tip = current_tip;
+                let synced_pr =
+                    get_synced_pull_request(git, forge, state.number, true)
+                        .await?;
+                current_tip = synced_pr.head_oid;
+                pr_states.get_mut(&index).unwrap().tip = current_tip;
+            }
         } else {
             log::debug!(
                 "land_all: #{} (tip {}) 3-way merges directly onto trunk {} without restacking",
@@ -720,6 +857,69 @@ pub async fn land_all(
                 current_tip,
                 current_trunk
             );
+        }
+
+        if cherrypicked == git.tree_of(current_trunk)? {
+            let landed_oid = find_matching_patch_on_trunk(
+                git,
+                &stack.layers[index],
+                current_trunk,
+                Oid::ZERO_SHA1,
+            )?
+            .unwrap_or(current_trunk);
+            for d_layer in stack.direct_dependents_of(index) {
+                if let Some(d_state) = pr_states.get(&d_layer)
+                    && d_state.state == PrState::Open
+                    && d_state.base != config.trunk
+                {
+                    let d_num = d_state.number;
+                    forge
+                        .update_pull_request(
+                            d_num,
+                            PullRequestUpdate {
+                                base: Some(config.trunk.clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    pr_states.get_mut(&d_layer).unwrap().base =
+                        config.trunk.clone();
+                }
+            }
+            forge
+                .update_pull_request(
+                    state.number,
+                    PullRequestUpdate {
+                        state: Some(PrState::Closed),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let (title, _) =
+                squash_message(&stack.layers[index], state.number, opts);
+            print_landed(git, config, state.number, &title, landed_oid)?;
+            forge.delete_branch(&state.branch).await?;
+            crate::refs::remove(git, state.number)?;
+
+            landed_layers.insert(index);
+            pr_states.get_mut(&index).unwrap().state = PrState::Closed;
+            let warning = format!(
+                "#{} was still open on GitHub, but its changes were already \
+                 on `{}` ({}); closed #{} without creating a duplicate \
+                 commit.",
+                state.number,
+                config.trunk,
+                git.short_id(landed_oid)?,
+                state.number,
+            );
+            outcomes.push(LandOutcome {
+                number: state.number,
+                title,
+                squash: current_trunk,
+                repaired: Vec::new(),
+                warnings: vec![warning],
+            });
+            continue;
         }
 
         // Retarget this layer (if needed) and its direct open dependents to
@@ -1044,18 +1244,105 @@ pub fn next_landable(stack: &Stack) -> Option<usize> {
         .position(|l| l.dep == Dep::Main && l.pr.is_some())
 }
 
-/// Refuse to land something the reviewers have not seen.
+/// Search the first-parent history of `trunk_tip` (stopping at `stop_at` or
+/// after 500 commits) for a commit that already landed `#{number}`.
+///
+/// GitHub's `PUT /pulls/{number}/merge` endpoint can occasionally create the
+/// squash commit on the base branch and advance `refs/heads/<trunk>` before
+/// failing to mark the pull request as `Merged` in GitHub's database, leaving
+/// the pull request in `PrState::Open`.
+pub(crate) fn find_landed_commit_on_trunk(
+    repo: &git2::Repository,
+    trunk_tip: Oid,
+    stop_at: Oid,
+    number: u64,
+) -> Result<Option<Oid>> {
+    let suffix = format!(" (#{number})");
+    let mut cur = trunk_tip;
+    for _ in 0..500 {
+        if cur == stop_at {
+            break;
+        }
+        let Ok(commit) = repo.find_commit(cur) else {
+            break;
+        };
+        let raw = String::from_utf8_lossy(commit.message_bytes());
+        let parsed = crate::trailers::CommitMessage::parse(&raw);
+        if parsed
+            .get(crate::trailers::PULL_REQUEST)
+            .and_then(crate::stack::parse_pr_ref)
+            == Some(number)
+            || parsed.subject.trim_end().ends_with(&suffix)
+        {
+            return Ok(Some(cur));
+        }
+        match commit.parent_id(0) {
+            Ok(parent) => cur = parent,
+            Err(_) => break,
+        }
+    }
+    Ok(None)
+}
+
+/// Search the first-parent history of `trunk_tip` (stopping at `stop_at` or
+/// after 200 commits) for a commit whose tree patch-id matches `layer`.
+pub(crate) fn find_matching_patch_on_trunk(
+    git: &Git,
+    layer: &crate::stack::Layer,
+    trunk_tip: Oid,
+    stop_at: Oid,
+) -> Result<Option<Oid>> {
+    let repo = git.repo();
+    let local_patch = crate::patch_id::tree_patch_id(
+        repo,
+        git.tree_of(layer.parent)?,
+        git.tree_of(layer.commit)?,
+    )?;
+    let mut cur = trunk_tip;
+    for _ in 0..200 {
+        if cur == stop_at {
+            break;
+        }
+        let Ok(commit) = repo.find_commit(cur) else {
+            break;
+        };
+        let Ok(parent) = commit.parent(0) else {
+            break;
+        };
+        let commit_patch = crate::patch_id::tree_patch_id(
+            repo,
+            parent.tree_id(),
+            commit.tree_id(),
+        )?;
+        if commit_patch == local_patch {
+            return Ok(Some(cur));
+        }
+        cur = parent.id();
+    }
+    Ok(None)
+}
+
+/// Refuse to land something the reviewers have not seen, and detect when all of
+/// the layer's changes are already present on `trunk_tip` (so squash-merging
+/// would create a duplicate 0-file empty commit).
 ///
 /// Derived from spr's equivalent check. Cherry-picking the local commit onto
 /// the trunk and merging the pull request into the trunk must produce the same
 /// tree; if they differ, the local commit has moved on since the last push.
 fn check_merge_equals_cherrypick(
     git: &Git,
-    local_commit: Oid,
+    layer: &crate::stack::Layer,
     trunk_tip: Oid,
+    stop_at: Oid,
     head_oid: Oid,
-) -> Result<()> {
-    let index = git.cherrypick(local_commit, trunk_tip)?;
+) -> Result<Option<Oid>> {
+    if git.tree_of(layer.commit)? == git.tree_of(layer.parent)? {
+        bail!(
+            "`{}` has no file changes relative to its parent; nothing to land.",
+            layer.subject()
+        );
+    }
+    let index = git.cherrypick(layer.commit, trunk_tip)?;
     if index.has_conflicts() {
         bail!(
             "this commit no longer applies on top of the trunk. Run \
@@ -1080,7 +1367,13 @@ fn check_merge_equals_cherrypick(
              `nspr diff` first."
         );
     }
-    Ok(())
+    if cherrypicked == git.tree_of(trunk_tip)? {
+        let landed =
+            find_matching_patch_on_trunk(git, layer, trunk_tip, stop_at)?
+                .unwrap_or(trunk_tip);
+        return Ok(Some(landed));
+    }
+    Ok(None)
 }
 
 /// Verify that when a pull request is already `Merged` on the forge, the local

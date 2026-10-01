@@ -163,7 +163,48 @@ pub async fn sync_trunk(
                  fresh pull request.",
                 layer.subject(),
             )),
-            PrState::Open => {}
+            PrState::Open => {
+                let mut landed_oid = crate::land::find_landed_commit_on_trunk(
+                    git.repo(),
+                    trunk,
+                    Oid::ZERO_SHA1,
+                    number,
+                )?;
+                let patch_on_trunk = git
+                    .cherrypick(layer.commit, trunk)
+                    .ok()
+                    .filter(|idx| !idx.has_conflicts())
+                    .and_then(|idx| git.write_index(idx).ok())
+                    == Some(trunk_tree);
+                if landed_oid.is_none() && patch_on_trunk && trunk != stack.base
+                {
+                    landed_oid = crate::land::find_matching_patch_on_trunk(
+                        git, layer, trunk, stack.base,
+                    )?;
+                }
+                if let Some(landed_oid) = landed_oid {
+                    merged.push(number);
+                    if patch_on_trunk {
+                        cleanly_merged.insert(i);
+                        let _ = forge
+                            .update_pull_request(
+                                number,
+                                crate::forge::PullRequestUpdate {
+                                    state: Some(PrState::Closed),
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                        warnings.push(format!(
+                            "#{number} was still open on GitHub, but its \
+                             changes were already on `{}` ({}); closed \
+                             #{number}.",
+                            config.trunk,
+                            git.short_id(landed_oid)?,
+                        ));
+                    }
+                }
+            }
         }
     }
 

@@ -491,20 +491,34 @@ impl Forge for GitHubForge {
                             );
                             return self.resolve_merged_pr_oid(&pr).await;
                         }
-                        Ok(pr)
-                            if pr.state == PrState::Open
-                                && (is_transport_or_5xx
-                                    || is_merge_in_progress
-                                    || (matches!(code, Some(405 | 409))
-                                        && (pr.head_oid
-                                            != req.expected_head
-                                            || pr.mergeable
-                                                == Mergeable::Unknown
-                                            || code == Some(409)
-                                            || attempt < 4))) =>
-                        {
-                            if let Some(&delay_ms) =
-                                retry_delays_ms.get(attempt)
+                        Ok(pr) if pr.state == PrState::Open => {
+                            if let Some(landed_oid) =
+                                self.detect_partial_merge_on_base(&pr).await
+                            {
+                                debug!(
+                                    "merge #{number} request returned error ({e}), but squash commit {landed_oid} is already on `{}`; closing #{number} without retrying merge",
+                                    pr.base
+                                );
+                                let _ = self
+                                    .update_pull_request(
+                                        number,
+                                        PullRequestUpdate {
+                                            state: Some(PrState::Closed),
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await;
+                                return Ok(landed_oid);
+                            }
+                            if (is_transport_or_5xx
+                                || is_merge_in_progress
+                                || (matches!(code, Some(405 | 409))
+                                    && (pr.head_oid != req.expected_head
+                                        || pr.mergeable == Mergeable::Unknown
+                                        || code == Some(409)
+                                        || attempt < 4)))
+                                && let Some(&delay_ms) =
+                                    retry_delays_ms.get(attempt)
                             {
                                 debug!(
                                     "merge #{number} got error (code={code:?}, head_oid={}, mergeable={:?}, merge_state={:?}); retrying in {delay_ms}ms",
@@ -517,14 +531,39 @@ impl Forge for GitHubForge {
                                 .await;
                                 if let Ok(pr_after) =
                                     self.get_pull_request(number).await
-                                    && pr_after.state == PrState::Merged
                                 {
-                                    debug!(
-                                        "merge #{number} completed on GitHub while waiting to retry"
-                                    );
-                                    return self
-                                        .resolve_merged_pr_oid(&pr_after)
-                                        .await;
+                                    if pr_after.state == PrState::Merged {
+                                        debug!(
+                                            "merge #{number} completed on GitHub while waiting to retry"
+                                        );
+                                        return self
+                                            .resolve_merged_pr_oid(&pr_after)
+                                            .await;
+                                    }
+                                    if pr_after.state == PrState::Open
+                                        && let Some(landed_oid) = self
+                                            .detect_partial_merge_on_base(
+                                                &pr_after,
+                                            )
+                                            .await
+                                    {
+                                        debug!(
+                                            "merge #{number} committed {landed_oid} to `{}` while waiting to retry, though PR stayed Open; closing #{number}",
+                                            pr_after.base
+                                        );
+                                        let _ = self
+                                            .update_pull_request(
+                                                number,
+                                                PullRequestUpdate {
+                                                    state: Some(
+                                                        PrState::Closed,
+                                                    ),
+                                                    ..Default::default()
+                                                },
+                                            )
+                                            .await;
+                                        return Ok(landed_oid);
+                                    }
                                 }
                                 continue;
                             }
@@ -545,14 +584,39 @@ impl Forge for GitHubForge {
                                 .await;
                                 if let Ok(pr_after) =
                                     self.get_pull_request(number).await
-                                    && pr_after.state == PrState::Merged
                                 {
-                                    debug!(
-                                        "merge #{number} completed on GitHub while recovering from previous error"
-                                    );
-                                    return self
-                                        .resolve_merged_pr_oid(&pr_after)
-                                        .await;
+                                    if pr_after.state == PrState::Merged {
+                                        debug!(
+                                            "merge #{number} completed on GitHub while recovering from previous error"
+                                        );
+                                        return self
+                                            .resolve_merged_pr_oid(&pr_after)
+                                            .await;
+                                    }
+                                    if pr_after.state == PrState::Open
+                                        && let Some(landed_oid) = self
+                                            .detect_partial_merge_on_base(
+                                                &pr_after,
+                                            )
+                                            .await
+                                    {
+                                        debug!(
+                                            "merge #{number} committed {landed_oid} to `{}` while recovering from previous error, though PR stayed Open; closing #{number}",
+                                            pr_after.base
+                                        );
+                                        let _ = self
+                                            .update_pull_request(
+                                                number,
+                                                PullRequestUpdate {
+                                                    state: Some(
+                                                        PrState::Closed,
+                                                    ),
+                                                    ..Default::default()
+                                                },
+                                            )
+                                            .await;
+                                        return Ok(landed_oid);
+                                    }
                                 }
                                 continue;
                             }
@@ -1129,6 +1193,24 @@ impl GitHubForge {
              determined. Run `nspr sync`.",
             pr.number
         )
+    }
+
+    /// Check whether `refs/heads/<pr.base>` already contains the squash commit
+    /// for `pr.number` even though GitHub still reports `pr.state == Open`.
+    async fn detect_partial_merge_on_base(
+        &self,
+        pr: &PullRequest,
+    ) -> Option<Oid> {
+        let base_tip = self.branch_oid(&pr.base).await.ok().flatten()?;
+        self.remote.fetch_objects(&[base_tip]).ok()?;
+        crate::land::find_landed_commit_on_trunk(
+            self.remote.repo(),
+            base_tip,
+            Oid::ZERO_SHA1,
+            pr.number,
+        )
+        .ok()
+        .flatten()
     }
 
     async fn list_remote_stacks(&self) -> Result<Option<Vec<RemoteStack>>> {

@@ -4668,3 +4668,199 @@ fn diff_and_land_preserve_commit_authors_and_detect_author_amendments() {
         )
     );
 }
+
+#[test]
+fn land_recovers_when_previous_squash_merge_committed_to_trunk_but_left_pr_open()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Simulate the LLVM PR #227512 incident:
+    // A previous `PUT /pulls/{number}/merge` created the squash commit on
+    // `main` (`ce33479e6440`) and advanced `main`, followed by other upstream
+    // commits landing on `main`, while GitHub's backend failed before marking
+    // PR #1 as `Merged` (leaving PR #1 `Open` and its branch intact).
+    let squash1 = w
+        .forge
+        .partial_squash_merge_leaving_pr_open(prs[0], None)
+        .unwrap();
+    let trunk_after_other = w.t.commit(
+        "Unrelated upstream commit (#999)",
+        &[
+            ("root.txt", "root"),
+            ("a.txt", "a1"),
+            ("other.txt", "other"),
+        ],
+        &[squash1],
+    );
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        TRUNK,
+        trunk_after_other,
+    )]))
+    .unwrap();
+
+    let pr1_before = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    assert_eq!(pr1_before.state, crate::forge::PrState::Open);
+
+    // Re-running `nspr land` on Layer one must NOT call `merge_pull_request`
+    // a second time (which would create a 0-file empty commit `e1bcf9823396`
+    // on `main`). Instead, it must detect `squash1` on `main`, close PR #1,
+    // repair PR #2 onto `main`, delete PR #1's branch, rebase the local stack,
+    // and emit a warning.
+    let outcome = w.land(0);
+    assert_eq!(outcome.number, prs[0]);
+    assert_eq!(
+        outcome.squash, trunk_after_other,
+        "trunk tip must remain at trunk_after_other with no duplicate empty squash commit"
+    );
+    let short_squash1 = w.git.short_id(squash1).unwrap();
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|msg| msg.contains(&short_squash1)),
+        "expected warning mentioning existing trunk commit {short_squash1}, got: {:?}",
+        outcome.warnings
+    );
+
+    let pr1_after = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    assert_eq!(pr1_after.state, crate::forge::PrState::Closed);
+    assert!(
+        w.forge.branch(&pr1_after.head).is_none(),
+        "PR #1's head branch must be deleted"
+    );
+
+    let pr2_after = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    assert_eq!(pr2_after.base, TRUNK);
+    w.assert_invariants();
+}
+
+#[test]
+fn land_all_recovers_when_previous_squash_merge_committed_to_trunk_but_left_pr_open()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    let squash1 = w
+        .forge
+        .partial_squash_merge_leaving_pr_open(prs[0], None)
+        .unwrap();
+    let trunk_after_other = w.t.commit(
+        "Unrelated upstream commit (#999)",
+        &[
+            ("root.txt", "root"),
+            ("a.txt", "a1"),
+            ("other.txt", "other"),
+        ],
+        &[squash1],
+    );
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        TRUNK,
+        trunk_after_other,
+    )]))
+    .unwrap();
+
+    // `nspr land --all` must recover PR #1 without creating an empty commit on
+    // `main`, and then land PR #2 cleanly on top of `trunk_after_other`.
+    let outcomes = w.land_all();
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0].number, prs[0]);
+    let short_squash1 = w.git.short_id(squash1).unwrap();
+    assert!(
+        outcomes[0]
+            .warnings
+            .iter()
+            .any(|msg| msg.contains(&short_squash1)),
+        "expected warning mentioning {short_squash1}, got: {:?}",
+        outcomes[0].warnings
+    );
+    assert_eq!(outcomes[1].number, prs[1]);
+
+    // Verify `outcomes[1].squash` is a direct child of `trunk_after_other`
+    // (no intermediate empty commit for PR #1).
+    let repo = w.t.open();
+    let squash2_commit = repo.find_commit(outcomes[1].squash).unwrap();
+    assert_eq!(squash2_commit.parent_id(0).unwrap(), trunk_after_other);
+
+    let pr1_after = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    assert_eq!(pr1_after.state, crate::forge::PrState::Closed);
+    let pr2_after = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    assert_eq!(pr2_after.state, crate::forge::PrState::Merged);
+}
+
+#[test]
+fn land_recovers_when_changes_cherry_picked_to_trunk_without_pr_number() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Someone cherry-picked Layer one's exact changes onto `main` with a
+    // commit message that does NOT mention `(#1)` or `Pull-Request: ...`.
+    let manual_commit = w.t.commit(
+        "Manually pushed equivalent change without PR reference",
+        &[("root.txt", "root"), ("a.txt", "a1")],
+        &[w.base_oid],
+    );
+    block_on(
+        w.forge.push(&[crate::forge::PushSpec::fast_forward(
+            TRUNK,
+            manual_commit,
+        )]),
+    )
+    .unwrap();
+
+    // `nspr land` must detect that cherry-picking Layer one onto `main`
+    // produces `main`'s identical tree (0-file diff), refuse to create an
+    // empty squash commit, close PR #1, and repair PR #2 onto `main`.
+    let outcome = w.land(0);
+    assert_eq!(outcome.number, prs[0]);
+    assert_eq!(outcome.squash, manual_commit);
+    let short_manual = w.git.short_id(manual_commit).unwrap();
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|msg| msg.contains(&short_manual)),
+        "expected warning mentioning matching commit {short_manual}, got: {:?}",
+        outcome.warnings
+    );
+
+    let pr1_after = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    assert_eq!(pr1_after.state, crate::forge::PrState::Closed);
+    let pr2_after = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    assert_eq!(pr2_after.base, TRUNK);
+    w.assert_invariants();
+}
+
+#[test]
+fn sync_trunk_recovers_when_previous_squash_merge_left_pr_open() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    let squash1 = w
+        .forge
+        .partial_squash_merge_leaving_pr_open(prs[0], None)
+        .unwrap();
+    let report = w.sync_trunk();
+    assert_eq!(report.trunk, squash1);
+    assert_eq!(report.merged, vec![prs[0]]);
+
+    let pr1_after = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    assert_eq!(pr1_after.state, crate::forge::PrState::Closed);
+
+    w.sync();
+    let pr2_after = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    assert_eq!(pr2_after.base, TRUNK);
+    w.assert_invariants();
+}
