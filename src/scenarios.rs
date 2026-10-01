@@ -43,6 +43,7 @@ fn block_on<F: Future>(f: F) -> F::Output {
 #[derive(Debug, Clone)]
 struct LayerSpec {
     message: CommitMessage,
+    author: Option<(String, String)>,
     /// What this layer alone changes. Kept separately from `files` so that
     /// reordering, inserting and dropping layers can recompute the chain the
     /// way an interactive rebase would.
@@ -139,6 +140,7 @@ impl World {
                     body: String::new(),
                     trailers: Vec::new(),
                 },
+                author: None,
                 changes: owned(changes),
                 files: Vec::new(),
             },
@@ -170,6 +172,19 @@ impl World {
         self.rebuild();
     }
 
+    fn add_trailer(&mut self, i: usize, key: &str, value: &str) {
+        self.layers[i]
+            .message
+            .trailers
+            .push((key.to_string(), value.to_string()));
+        self.rebuild();
+    }
+
+    fn set_author(&mut self, i: usize, name: &str, email: &str) {
+        self.layers[i].author = Some((name.to_string(), email.to_string()));
+        self.rebuild();
+    }
+
     /// Rebuild the local commit chain from the specs.
     fn rebuild(&mut self) {
         // Recompute each layer's tree by replaying the deltas over the base.
@@ -183,7 +198,16 @@ impl World {
         let mut parent = self.base_oid;
         for layer in &self.layers {
             let files = borrowed(&layer.files);
-            parent = self.t.commit(&layer.message.render(), &files, &[parent]);
+            let author = layer
+                .author
+                .as_ref()
+                .map(|(name, email)| (name.as_str(), email.as_str()));
+            parent = self.t.commit_with_author(
+                &layer.message.render(),
+                &files,
+                &[parent],
+                author,
+            );
         }
         self.t.set_branch(TRUNK, parent);
         self.sync_worktree();
@@ -4460,4 +4484,188 @@ fn cherry_pick_diff_succeeds_when_lower_layer_conflicts_with_declared_dependency
     let st = w.status();
     assert_eq!(st.layers.len(), 4);
     assert_eq!(st.layers[3].state, status::LayerState::Current);
+}
+
+#[test]
+fn land_preserves_co_authored_by_and_other_trailers() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.layers[0].message.body = "Detailed explanation of layer one.".into();
+    w.add_trailer(0, "Co-authored-by", "Alice <alice@example.com>");
+    w.add_trailer(0, "Co-authored-by", "Bob <bob@example.com>");
+    w.add_trailer(0, "Reviewed-by", "Carol <carol@example.com>");
+
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.layers[1].message.body = "Follow-up work.".into();
+    w.add_trailer(1, "Co-authored-by", "Dave <dave@example.com>");
+    w.add_trailer(1, "Signed-off-by", "Test User <test@example.com>");
+
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Both PR descriptions on the forge include the Co-authored-by trailers.
+    let pr1 = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    assert!(
+        pr1.body
+            .contains("Co-authored-by: Alice <alice@example.com>"),
+        "PR #1 body missing Alice Co-authored-by:\n{}",
+        pr1.body
+    );
+    assert!(
+        pr1.body.contains("Co-authored-by: Bob <bob@example.com>"),
+        "PR #1 body missing Bob Co-authored-by:\n{}",
+        pr1.body
+    );
+    assert!(
+        pr1.body.contains("Reviewed-by: Carol <carol@example.com>"),
+        "PR #1 body missing Reviewed-by:\n{}",
+        pr1.body
+    );
+
+    // Land layer one and verify the squashed trunk commit preserves body and all
+    // Co-authored-by / Reviewed-by / Pull-Request trailers while dropping Depends-On.
+    let landed1 = w.land(0);
+    let squash1_msg = w.git.message_of(landed1.squash).unwrap();
+    assert!(
+        squash1_msg.contains("Detailed explanation of layer one."),
+        "squash commit missing body:\n{squash1_msg}"
+    );
+    assert!(
+        squash1_msg.contains("Co-authored-by: Alice <alice@example.com>"),
+        "squash commit missing first Co-authored-by:\n{squash1_msg}"
+    );
+    assert!(
+        squash1_msg.contains("Co-authored-by: Bob <bob@example.com>"),
+        "squash commit missing second Co-authored-by:\n{squash1_msg}"
+    );
+    assert!(
+        squash1_msg.contains("Reviewed-by: Carol <carol@example.com>"),
+        "squash commit missing Reviewed-by:\n{squash1_msg}"
+    );
+    assert!(
+        squash1_msg.contains(&format!(
+            "Pull-Request: https://github.com/o/r/pull/{}",
+            prs[0]
+        )),
+        "squash commit missing Pull-Request trailer:\n{squash1_msg}"
+    );
+    assert!(
+        !squash1_msg.contains("Depends-On:"),
+        "squash commit must not retain Depends-On trailer:\n{squash1_msg}"
+    );
+
+    // Surviving local commit (Layer two) still has its Co-authored-by and Signed-off-by
+    // trailers after the post-land rebase, and landing it preserves them too.
+    let stack = w.discover();
+    assert_eq!(stack.layers.len(), 1);
+    let local2_msg = w.git.message_of(stack.layers[0].commit).unwrap();
+    assert!(
+        local2_msg.contains("Co-authored-by: Dave <dave@example.com>"),
+        "rebased local commit lost Co-authored-by:\n{local2_msg}"
+    );
+    assert!(
+        local2_msg.contains("Signed-off-by: Test User <test@example.com>"),
+        "rebased local commit lost Signed-off-by:\n{local2_msg}"
+    );
+
+    let landed2 = w.land(0);
+    let squash2_msg = w.git.message_of(landed2.squash).unwrap();
+    assert!(
+        squash2_msg.contains("Co-authored-by: Dave <dave@example.com>"),
+        "second squash commit missing Co-authored-by:\n{squash2_msg}"
+    );
+    assert!(
+        squash2_msg.contains("Signed-off-by: Test User <test@example.com>"),
+        "second squash commit missing Signed-off-by:\n{squash2_msg}"
+    );
+}
+
+#[test]
+fn diff_and_land_preserve_commit_authors_and_detect_author_amendments() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one by Alice", &[("a.txt", "a1")]);
+    w.set_author(0, "Alice Author", "alice@example.com");
+
+    w.add_layer("Layer two by Bob", &[("b.txt", "b1")]);
+    w.set_author(1, "Bob Builder", "bob@example.com");
+
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Pushed PR branch commits carry each layer's author.
+    let pr1 = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    let pr2 = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    assert_eq!(
+        w.git.author_of(pr1.head_oid).unwrap(),
+        ("Alice Author".to_string(), "alice@example.com".to_string())
+    );
+    assert_eq!(
+        w.git.author_of(pr2.head_oid).unwrap(),
+        ("Bob Builder".to_string(), "bob@example.com".to_string())
+    );
+
+    // Amending Layer one's code appends an `[nspr]` update commit that also
+    // preserves Alice as the commit author.
+    w.amend_layer(0, &[("a.txt", "a2")]);
+    w.sync();
+    let pr1 = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    assert_eq!(
+        w.git.author_of(pr1.head_oid).unwrap(),
+        ("Alice Author".to_string(), "alice@example.com".to_string())
+    );
+
+    // Amending Layer two's author (e.g. `git commit --amend --author=...`) is
+    // detected by `nspr status` as `Modified` and rewrites the PR branch commits
+    // on `nspr diff` so all commits on the branch carry the new author.
+    w.set_author(1, "Carol Contributor", "carol@example.com");
+    let st = w.status();
+    assert_eq!(st.layers[1].state, status::LayerState::Modified);
+
+    let outcomes = w.sync();
+    assert_eq!(outcomes[1].action, LayerAction::Updated);
+    let pr2 = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    assert_eq!(
+        w.git.author_of(pr2.head_oid).unwrap(),
+        (
+            "Carol Contributor".to_string(),
+            "carol@example.com".to_string()
+        )
+    );
+
+    // Landing Layer one preserves Alice as the squash commit's author on trunk,
+    // preserves Carol as the author on the repaired PR #2 branch, and preserves
+    // Carol as the author on the rebased local commit.
+    let landed1 = w.land(0);
+    assert_eq!(
+        w.git.author_of(landed1.squash).unwrap(),
+        ("Alice Author".to_string(), "alice@example.com".to_string())
+    );
+
+    let pr2_after_land1 = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    assert_eq!(
+        w.git.author_of(pr2_after_land1.head_oid).unwrap(),
+        (
+            "Carol Contributor".to_string(),
+            "carol@example.com".to_string()
+        )
+    );
+    let stack = w.discover();
+    assert_eq!(stack.layers.len(), 1);
+    assert_eq!(
+        w.git.author_of(stack.layers[0].commit).unwrap(),
+        (
+            "Carol Contributor".to_string(),
+            "carol@example.com".to_string()
+        )
+    );
+
+    // Landing Layer two preserves Carol as the squash commit's author on trunk.
+    let landed2 = w.land(0);
+    assert_eq!(
+        w.git.author_of(landed2.squash).unwrap(),
+        (
+            "Carol Contributor".to_string(),
+            "carol@example.com".to_string()
+        )
+    );
 }

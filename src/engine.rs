@@ -458,6 +458,9 @@ pub struct Decision {
     /// The layer's local commit message differs from the initial commit on its
     /// PR branch.
     pub message_changed: Vec<bool>,
+    /// The layer's local commit author differs from the commits on its PR
+    /// branch.
+    pub author_changed: Vec<bool>,
     /// The pull request's title or description on the forge was edited to
     /// something different from the branch's initial commit message.
     pub github_message_edited: Vec<bool>,
@@ -480,6 +483,7 @@ pub fn decide(
     let n = stack.layers.len();
     let mut patch_changed = vec![false; n];
     let mut message_changed = vec![false; n];
+    let mut author_changed = vec![false; n];
     let mut github_message_edited = vec![false; n];
     let mut rewrite_history = vec![false; n];
     let mut push = vec![false; n];
@@ -542,6 +546,13 @@ pub fn decide(
                         message_changed[i] = true;
                         rewrite_history[i] = true;
                     }
+                    let local_author = git.author_of(stack.layers[i].commit)?;
+                    if git.author_of(first_oid)? != local_author
+                        || git.author_of(pr.head_oid)? != local_author
+                    {
+                        author_changed[i] = true;
+                        rewrite_history[i] = true;
+                    }
                     if !opts.preserve_commit_history && first_oid != pr.head_oid
                     {
                         rewrite_history[i] = true;
@@ -583,6 +594,7 @@ pub fn decide(
 
         push[i] = patch_changed[i]
             || message_changed[i]
+            || author_changed[i]
             || rewrite_history[i]
             || base_branch_changed
             || needs_conflict_refresh
@@ -780,6 +792,7 @@ pub fn decide(
     Ok(Decision {
         patch_changed,
         message_changed,
+        author_changed,
         github_message_edited,
         rewrite_history,
         push,
@@ -1240,7 +1253,8 @@ async fn execute(
                     && git.merge_base(parent_tip, pr.head_oid)?
                         == current_pr_base_tip
                     && !decision.patch_changed[i]
-                    && !decision.message_changed[i];
+                    && !decision.message_changed[i]
+                    && !decision.author_changed[i];
                 let defer_push_to_stage2 = no_auto_merge_hazard
                     && (already_parked_on_remote
                         || (parent_deferred && pr.base == base_branches[i]));
@@ -1295,7 +1309,11 @@ async fn execute(
                     )?;
                     let clean_msg = stack.layers[i].message.clean_for_branch();
                     match crate::land::replay(
-                        git, &revisions, anchor, &clean_msg,
+                        git,
+                        &revisions,
+                        anchor,
+                        &clean_msg,
+                        Some(layer_commit),
                     )? {
                         Some(t) => t,
                         None => git.synthesize_initial_commit(
@@ -1490,6 +1508,7 @@ async fn execute(
                     LayerAction::Skipped
                 } else if decision.patch_changed[i]
                     || decision.message_changed[i]
+                    || decision.author_changed[i]
                 {
                     LayerAction::Updated
                 } else {

@@ -227,6 +227,8 @@ impl FakeForge {
         }
         let tree_oid = index.write_tree_to(&self.repo)?;
         let tree = self.repo.find_tree(tree_oid)?;
+        let head_commit = self.repo.find_commit(head_oid)?;
+        let author = head_commit.author();
         let sig = self.repo.signature()?;
 
         // With no explicit title and message, GitHub falls back to the
@@ -242,7 +244,7 @@ impl FakeForge {
 
         let squash = self.repo.commit(
             None,
-            &sig,
+            &author,
             &sig,
             &message,
             &tree,
