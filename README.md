@@ -42,6 +42,22 @@ Local Git History (1 branch)          GitHub Pull Requests (Native Stack)
 cargo install --path .
 ```
 
+### Shell Completions (Bash / Zsh / Fish)
+`nspr` uses [`clap_complete`](https://docs.rs/clap_complete) with dynamic completion support — subcommands, flags, git remotes (`--remote`), and local stack PR numbers (`nspr land <TAB>`, `nspr close <TAB>`, `nspr patch <TAB>`) are completed directly by the `nspr` binary so completions never go out of date:
+
+```bash
+# Zsh (add to ~/.zshrc):
+source <(nspr completions zsh)
+
+# Bash (add to ~/.bashrc):
+source <(nspr completions bash)
+
+# Fish (add to ~/.config/fish/config.fish):
+nspr completions fish | source
+```
+
+*(If you prefer a standalone static completion script, pass `--static`: `nspr completions --static zsh` / `nspr completions --static bash`.)*
+
 ### Authentication
 `nspr` requires a GitHub token (for GraphQL/REST API calls) and Git push access (HTTPS or SSH). It automatically discovers your token in the following order:
 1. `$NSPR_GITHUB_TOKEN` environment variable
@@ -228,6 +244,7 @@ For **branching DAG stacks**, `nspr` automatically switches to hierarchical tree
 | **`nspr patch`** | `nspr patch <PR> [-b <branch>]` | Fetch a PR and its entire upstream stack chain into a local branch (`pr/<number>` by default) for local testing or review. |
 | **`nspr close`** | `nspr close <PR>` | Close a pull request on GitHub, drop its commit from your stack, and restack dependent layers onto its parent. |
 | **`nspr upgrade`** | `nspr upgrade [--update-message]` | Convert existing `spr` pull requests (`[spr]` branch commits, `Pull Request:` trailers, and `spr/main/master.*` synthetic bases) in-place into native `nspr` stacked pull requests. |
+| **`nspr completions`** | `nspr completions [--static] <shell>` | Output shell completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell`. |
 
 ### Migrating Existing `spr` Stacks (`nspr upgrade`)
 If you have an existing branch with open pull requests created by `spr` (`spacedentist/spr` or `ejoffe/spr`):
