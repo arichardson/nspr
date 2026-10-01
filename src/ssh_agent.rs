@@ -43,6 +43,34 @@ pub const DEFAULT_SSH_AGENT_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Probe an SSH agent socket at `sock_path` with a maximum timeout.
 #[cfg(unix)]
 pub fn probe_ssh_agent(sock_path: &Path, timeout: Duration) -> SshAgentStatus {
+    log::debug!(
+        "probing SSH agent at {} (timeout {:?})...",
+        sock_path.display(),
+        timeout
+    );
+    let status = probe_ssh_agent_inner(sock_path, timeout);
+    match &status {
+        SshAgentStatus::Available { identities_count } => {
+            log::debug!(
+                "  -> SSH agent at {} available ({identities_count} identities)",
+                sock_path.display()
+            );
+        }
+        other => {
+            log::debug!(
+                "  -> SSH agent at {} unavailable ({other:?}); falling back to SSH key files in ~/.ssh",
+                sock_path.display()
+            );
+        }
+    }
+    status
+}
+
+#[cfg(unix)]
+fn probe_ssh_agent_inner(
+    sock_path: &Path,
+    timeout: Duration,
+) -> SshAgentStatus {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
@@ -158,7 +186,12 @@ pub fn check_ssh_agent(timeout: Duration) -> SshAgentStatus {
         Ok(path) if !path.is_empty() => {
             probe_ssh_agent(Path::new(&path), timeout)
         }
-        _ => SshAgentStatus::NotConfigured,
+        _ => {
+            log::debug!(
+                "$SSH_AUTH_SOCK is not set; falling back to SSH key files in ~/.ssh"
+            );
+            SshAgentStatus::NotConfigured
+        }
     }
 }
 
@@ -221,7 +254,12 @@ pub fn resolve_effective_url(
     }
 
     if !best_prefix.is_empty() {
-        format!("{}{}", best_replacement, &url[best_prefix.len()..])
+        let rewritten =
+            format!("{}{}", best_replacement, &url[best_prefix.len()..]);
+        log::debug!(
+            "git config rewrote remote URL `{url}` -> `{rewritten}` (is_push={is_push})"
+        );
+        rewritten
     } else {
         url.to_string()
     }

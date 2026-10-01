@@ -220,6 +220,21 @@ pub async fn sync_stack(
     let mut opts = opts.clone();
     opts.preserve_commit_history =
         config.preserve_commit_history.resolve(merge_settings);
+    if matches!(
+        config.preserve_commit_history,
+        crate::config::PreserveCommitHistory::Auto
+    ) && !opts.preserve_commit_history
+    {
+        log::debug!(
+            "preserveCommitHistory=auto: repository disallow squash merges ({merge_settings:?}); falling back to single-commit force-push mode"
+        );
+    } else {
+        log::debug!(
+            "preserve_commit_history resolved to {} (config={:?}, merge_settings={merge_settings:?})",
+            opts.preserve_commit_history,
+            config.preserve_commit_history
+        );
+    }
 
     recover_missing_pr_trailers(git, forge, config, stack, &mut opts, prompter)
         .await?;
@@ -276,6 +291,9 @@ pub async fn sync_stack(
     // branches forward onto their new base tips in the same `nspr diff` run so
     // the user never has to run `nspr diff` twice.
     let final_outcomes = if staged {
+        log::debug!(
+            "running second-stage catch-up pass to advance staged branches onto their new base tips"
+        );
         let mut catchup_opts = opts.clone();
         catchup_opts.refresh_when_behind = true;
         let trees = stack.trees_for(
@@ -809,6 +827,11 @@ fn find_root_commit(
     {
         return Some(root_oid);
     }
+    log::debug!(
+        "root ref for #{} unavailable or not an ancestor of {}; falling back to branch_revisions since {fallback_base_tip}",
+        pr.number,
+        pr.head_oid
+    );
     crate::land::branch_revisions(git, pr.head_oid, fallback_base_tip)
         .ok()
         .and_then(|r| r.first().copied())
@@ -1316,12 +1339,19 @@ async fn execute(
                         Some(layer_commit),
                     )? {
                         Some(t) => t,
-                        None => git.synthesize_initial_commit(
-                            anchor,
-                            desired_tree,
-                            layer_commit,
-                            &clean_msg,
-                        )?,
+                        None => {
+                            log::debug!(
+                                "replaying {} revision(s) of #{} onto {anchor} conflicted; falling back to single synthesized commit",
+                                revisions.len(),
+                                pr.number
+                            );
+                            git.synthesize_initial_commit(
+                                anchor,
+                                desired_tree,
+                                layer_commit,
+                                &clean_msg,
+                            )?
+                        }
                     }
                 } else {
                     pr.head_oid
