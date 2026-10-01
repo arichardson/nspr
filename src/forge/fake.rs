@@ -19,7 +19,7 @@ use git2::{Oid, Repository};
 use super::{
     CheckCounts, Comment, CreatePr, Forge, ListedPr, MergeState, Mergeable,
     PrState, Protection, PullRequest, PullRequestUpdate, PushSpec,
-    RepoMergeSettings, ReviewDecision, SquashMerge,
+    RepoMergeSettings, ReviewDecision, ReviewSummary, SquashMerge,
 };
 
 #[derive(Debug, Clone)]
@@ -35,6 +35,7 @@ struct FakePr {
     auto_merge: bool,
     draft: bool,
     checks: Option<CheckCounts>,
+    reviews: ReviewSummary,
 }
 
 pub struct FakeForge {
@@ -144,6 +145,17 @@ impl FakeForge {
             .find(|p| p.number == number)
         {
             pr.checks = Some(checks);
+        }
+    }
+
+    pub fn set_reviews(&self, number: u64, reviews: ReviewSummary) {
+        if let Some(pr) = self
+            .prs
+            .borrow_mut()
+            .iter_mut()
+            .find(|p| p.number == number)
+        {
+            pr.reviews = reviews;
         }
     }
 
@@ -366,6 +378,7 @@ impl Forge for FakeForge {
             auto_merge: pr.auto_merge,
             draft: pr.draft,
             checks: pr.checks,
+            reviews: pr.reviews,
         })
     }
 
@@ -386,6 +399,7 @@ impl Forge for FakeForge {
             auto_merge: false,
             draft: req.draft,
             checks: None,
+            reviews: ReviewSummary::default(),
         });
         Ok(number)
     }

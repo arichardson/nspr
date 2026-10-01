@@ -42,16 +42,32 @@ pub enum MergeState {
 }
 
 /// Summary of CI check runs and status contexts on a pull request's head commit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckCounts {
     pub passed: usize,
     pub failed: usize,
     pub pending: usize,
+    /// Names of failing check runs or status contexts (shown in `nspr status -v`).
+    pub failed_names: Vec<String>,
 }
 
 impl CheckCounts {
     pub fn total(&self) -> usize {
         self.passed + self.failed + self.pending
+    }
+}
+
+/// Summary of the latest opinionated reviews (`APPROVED` / `CHANGES_REQUESTED`)
+/// on a pull request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewSummary {
+    pub approved_by: Vec<String>,
+    pub changes_requested_by: Vec<String>,
+}
+
+impl ReviewSummary {
+    pub fn is_empty(&self) -> bool {
+        self.approved_by.is_empty() && self.changes_requested_by.is_empty()
     }
 }
 
@@ -77,6 +93,7 @@ pub struct PullRequest {
     pub auto_merge: bool,
     pub draft: bool,
     pub checks: Option<CheckCounts>,
+    pub reviews: ReviewSummary,
 }
 
 impl PullRequest {

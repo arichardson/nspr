@@ -210,7 +210,7 @@ async fn run(cli: Cli) -> Result<()> {
     let mut session = Session::open(&cli.remote, fetch_remote_trunk).await?;
     match cli.command.unwrap_or(Command::Diff(DiffArgs::default())) {
         Command::Diff(args) => session.diff(args, cli.verbose).await,
-        Command::Status => session.status().await,
+        Command::Status => session.status(cli.verbose).await,
         Command::Sync => session.sync().await,
         Command::Land(args) => session.land(args).await,
         Command::Amend => session.amend().await,
@@ -822,12 +822,12 @@ impl Session {
         Ok(())
     }
 
-    async fn status(&self) -> Result<()> {
+    async fn status(&self, verbose: bool) -> Result<()> {
         let stack = self.discover()?;
         let report =
             status::status(&self.git, &self.forge, &self.config, &stack)
                 .await?;
-        print!("{}", report.render());
+        print!("{}", report.render_verbose(verbose));
         Ok(())
     }
 

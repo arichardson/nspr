@@ -19,11 +19,19 @@ query PullRequest($owner: String!, $name: String!, $number: Int!) {
       mergeCommit {
         oid
       }
+      latestOpinionatedReviews(last: 50) {
+        nodes {
+          state
+          author {
+            login
+          }
+        }
+      }
       commits(last: 1) {
         nodes {
           commit {
             statusCheckRollup {
-              contexts {
+              contexts(first: 100) {
                 checkRunCountsByState {
                   state
                   count
@@ -31,6 +39,16 @@ query PullRequest($owner: String!, $name: String!, $number: Int!) {
                 statusContextCountsByState {
                   state
                   count
+                }
+                nodes {
+                  ... on CheckRun {
+                    name
+                    conclusion
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                  }
                 }
               }
             }

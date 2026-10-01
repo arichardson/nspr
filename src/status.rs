@@ -9,7 +9,9 @@ use color_eyre::eyre::Result;
 
 use crate::config::Config;
 use crate::engine::{self, SyncOptions};
-use crate::forge::{CheckCounts, Forge, MergeState, Mergeable, PrState};
+use crate::forge::{
+    CheckCounts, Forge, MergeState, Mergeable, PrState, ReviewSummary,
+};
 use crate::git::Git;
 use crate::stack::{Dep, Stack};
 
@@ -70,6 +72,7 @@ pub struct LayerStatus {
     /// The layer this one is stacked on, if any.
     pub dep: Dep,
     pub checks: Option<CheckCounts>,
+    pub reviews: ReviewSummary,
 }
 
 #[derive(Debug, Clone)]
@@ -206,7 +209,11 @@ pub fn from_parts(
             github_message_edited: decision.github_message_edited[i],
             landable: layer.dep == Dep::Main && layer.pr.is_some(),
             dep: layer.dep,
-            checks: prs[i].as_ref().and_then(|p| p.checks),
+            checks: prs[i].as_ref().and_then(|p| p.checks.clone()),
+            reviews: prs[i]
+                .as_ref()
+                .map(|p| p.reviews.clone())
+                .unwrap_or_default(),
         });
     }
 
@@ -236,7 +243,29 @@ impl StackStatus {
     /// the bottom. Automatically uses Unicode glyphs, colors, and terminal
     /// width truncation when stdout is a smart terminal.
     pub fn render(&self) -> String {
-        self.render_plan(false)
+        self.render_verbose(false)
+    }
+
+    /// Render the stack status table, optionally printing a second line under
+    /// each pull request with reviewer logins and failing check names.
+    pub fn render_verbose(&self, verbose: bool) -> String {
+        let term = console::Term::stdout();
+        let is_tty = term.is_term();
+        let use_color = is_tty && console::colors_enabled();
+        let use_unicode = is_tty && supports_unicode();
+        let term_width = if is_tty {
+            term.size_checked().map(|(_rows, cols)| cols as usize)
+        } else {
+            None
+        };
+        self.render_table_inner(
+            None,
+            false,
+            verbose,
+            use_unicode,
+            use_color,
+            term_width,
+        )
     }
 
     /// Render the pre-push stack plan before `nspr diff` runs. When
@@ -255,6 +284,7 @@ impl StackStatus {
         self.render_table_inner(
             None,
             update_message,
+            false,
             use_unicode,
             use_color,
             term_width,
@@ -286,6 +316,23 @@ impl StackStatus {
         self.render_table(None, use_unicode, use_color, term_width)
     }
 
+    pub fn render_with_options_verbose(
+        &self,
+        use_unicode: bool,
+        use_color: bool,
+        term_width: Option<usize>,
+        verbose: bool,
+    ) -> String {
+        self.render_table_inner(
+            None,
+            false,
+            verbose,
+            use_unicode,
+            use_color,
+            term_width,
+        )
+    }
+
     pub fn render_table(
         &self,
         outcomes: Option<&[engine::LayerOutcome]>,
@@ -295,6 +342,7 @@ impl StackStatus {
     ) -> String {
         self.render_table_inner(
             outcomes,
+            false,
             false,
             use_unicode,
             use_color,
@@ -354,6 +402,7 @@ impl StackStatus {
         &self,
         outcomes: Option<&[engine::LayerOutcome]>,
         update_message: bool,
+        verbose: bool,
         use_unicode: bool,
         use_color: bool,
         term_width: Option<usize>,
@@ -370,6 +419,8 @@ impl StackStatus {
             state_styled: String,
             checks_plain: String,
             checks_styled: String,
+            reviews_plain: String,
+            reviews_styled: String,
             badges_joined: String,
         }
 
@@ -594,7 +645,7 @@ impl StackStatus {
                     });
                 }
 
-                let (checks_plain, checks_styled) = match layer.checks {
+                let (checks_plain, checks_styled) = match &layer.checks {
                     Some(c) if c.total() > 0 => {
                         let plain =
                             format!("{}/{} checks", c.passed, c.total());
@@ -614,6 +665,46 @@ impl StackStatus {
                     _ => (String::new(), String::new()),
                 };
 
+                let (reviews_plain, reviews_styled) = match (
+                    layer.reviews.approved_by.len(),
+                    layer.reviews.changes_requested_by.len(),
+                ) {
+                    (0, 0) => (String::new(), String::new()),
+                    (a, 0) => {
+                        let plain = format!("{a} approved");
+                        let styled = if use_color {
+                            style(&plain).green().to_string()
+                        } else {
+                            plain.clone()
+                        };
+                        (plain, styled)
+                    }
+                    (0, c) => {
+                        let plain = format!("{c} changes requested");
+                        let styled = if use_color {
+                            style(&plain).red().bold().to_string()
+                        } else {
+                            plain.clone()
+                        };
+                        (plain, styled)
+                    }
+                    (a, c) => {
+                        let a_plain = format!("{a} approved");
+                        let c_plain = format!("{c} changes requested");
+                        let plain = format!("{a_plain}, {c_plain}");
+                        let styled = if use_color {
+                            format!(
+                                "{}, {}",
+                                style(&a_plain).green(),
+                                style(&c_plain).red().bold()
+                            )
+                        } else {
+                            plain.clone()
+                        };
+                        (plain, styled)
+                    }
+                };
+
                 rows.push(RowData {
                     layer,
                     num_plain,
@@ -621,6 +712,8 @@ impl StackStatus {
                     state_styled,
                     checks_plain,
                     checks_styled,
+                    reviews_plain,
+                    reviews_styled,
                     badges_joined: badges.join("  "),
                 });
             }
@@ -644,6 +737,12 @@ impl StackStatus {
             .iter()
             .flatten()
             .map(|r| measure_text_width(&r.checks_plain))
+            .max()
+            .unwrap_or(0);
+        let max_reviews_width = component_rows
+            .iter()
+            .flatten()
+            .map(|r| measure_text_width(&r.reviews_plain))
             .max()
             .unwrap_or(0);
         let max_badges_width = component_rows
@@ -728,6 +827,18 @@ impl StackStatus {
                 } else {
                     String::new()
                 };
+                let reviews_col = if max_reviews_width > 0 {
+                    let padded_reviews = pad_str(
+                        &row.reviews_styled,
+                        max_reviews_width,
+                        Alignment::Left,
+                        None,
+                    );
+                    prefix_width += max_reviews_width + 2;
+                    format!("  {padded_reviews}")
+                } else {
+                    String::new()
+                };
                 let badges_col = if max_badges_width > 0 {
                     let padded_badges = pad_str(
                         &row.badges_joined,
@@ -759,8 +870,56 @@ impl StackStatus {
                 };
 
                 out.push_str(&format!(
-                    "  {glyph}  {styled_num}  {padded_state}{checks_col}{badges_col}  {styled_subject}\n"
+                    "  {glyph}  {styled_num}  {padded_state}{checks_col}{reviews_col}{badges_col}  {styled_subject}\n"
                 ));
+
+                if verbose {
+                    if !row.layer.reviews.approved_by.is_empty() {
+                        let names = row.layer.reviews.approved_by.join(", ");
+                        if use_color {
+                            out.push_str(&format!(
+                                "     {} {}\n",
+                                style("approved by:").green(),
+                                names
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "     approved by: {names}\n"
+                            ));
+                        }
+                    }
+                    if !row.layer.reviews.changes_requested_by.is_empty() {
+                        let names =
+                            row.layer.reviews.changes_requested_by.join(", ");
+                        if use_color {
+                            out.push_str(&format!(
+                                "     {} {}\n",
+                                style("changes requested by:").red().bold(),
+                                names
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "     changes requested by: {names}\n"
+                            ));
+                        }
+                    }
+                    if let Some(checks) = &row.layer.checks
+                        && !checks.failed_names.is_empty()
+                    {
+                        let names = checks.failed_names.join(", ");
+                        if use_color {
+                            out.push_str(&format!(
+                                "     {} {}\n",
+                                style("failed checks:").red().bold(),
+                                names
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "     failed checks: {names}\n"
+                            ));
+                        }
+                    }
+                }
             }
             out.push_str(&format!("  {trunk_connector} {styled_trunk}\n"));
         }
@@ -796,6 +955,7 @@ mod tests {
                     landable: true,
                     dep: Dep::Main,
                     checks: None,
+                    reviews: ReviewSummary::default(),
                 },
                 LayerStatus {
                     index: 1,
@@ -816,6 +976,7 @@ mod tests {
                     landable: false,
                     dep: Dep::Layer(0),
                     checks: None,
+                    reviews: ReviewSummary::default(),
                 },
                 LayerStatus {
                     index: 2,
@@ -836,6 +997,7 @@ mod tests {
                     landable: false,
                     dep: Dep::Layer(1),
                     checks: None,
+                    reviews: ReviewSummary::default(),
                 },
             ],
         };
@@ -874,6 +1036,7 @@ mod tests {
                     landable: true,
                     dep: Dep::Main,
                     checks: None,
+                    reviews: ReviewSummary::default(),
                 },
                 LayerStatus {
                     index: 1,
@@ -894,6 +1057,7 @@ mod tests {
                     landable: false,
                     dep: Dep::Layer(0),
                     checks: None,
+                    reviews: ReviewSummary::default(),
                 },
                 LayerStatus {
                     index: 2,
@@ -914,6 +1078,7 @@ mod tests {
                     landable: true,
                     dep: Dep::Main,
                     checks: None,
+                    reviews: ReviewSummary::default(),
                 },
                 LayerStatus {
                     index: 3,
@@ -934,6 +1099,7 @@ mod tests {
                     landable: false,
                     dep: Dep::Layer(2),
                     checks: None,
+                    reviews: ReviewSummary::default(),
                 },
             ],
         };
@@ -979,7 +1145,9 @@ mod tests {
                         passed: 10,
                         failed: 0,
                         pending: 0,
+                        failed_names: Vec::new(),
                     }),
+                    reviews: ReviewSummary::default(),
                 },
                 LayerStatus {
                     index: 1,
@@ -1003,7 +1171,9 @@ mod tests {
                         passed: 9,
                         failed: 0,
                         pending: 1,
+                        failed_names: Vec::new(),
                     }),
+                    reviews: ReviewSummary::default(),
                 },
                 LayerStatus {
                     index: 2,
@@ -1027,7 +1197,9 @@ mod tests {
                         passed: 9,
                         failed: 1,
                         pending: 0,
+                        failed_names: vec!["clang-x86_64-debian".to_string()],
                     }),
+                    reviews: ReviewSummary::default(),
                 },
                 LayerStatus {
                     index: 3,
@@ -1048,6 +1220,7 @@ mod tests {
                     landable: false,
                     dep: Dep::Layer(2),
                     checks: None,
+                    reviews: ReviewSummary::default(),
                 },
             ],
         };
@@ -1083,5 +1256,100 @@ mod tests {
             "passing checks must be green: {}",
             lines[3]
         );
+    }
+
+    #[test]
+    fn render_displays_reviews_and_verbose_details() {
+        let status = StackStatus {
+            trunk: "main".to_string(),
+            layers: vec![
+                LayerStatus {
+                    index: 0,
+                    subject: "Approved bottom PR".into(),
+                    number: Some(101),
+                    url: None,
+                    branch: Some("users/me/1".into()),
+                    base: Some("main".into()),
+                    wanted_base: "main".into(),
+                    wanted_base_label: "main".into(),
+                    state: LayerState::Current,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    message_differs: false,
+                    github_message_edited: false,
+                    landable: true,
+                    dep: Dep::Main,
+                    checks: Some(CheckCounts {
+                        passed: 10,
+                        failed: 0,
+                        pending: 0,
+                        failed_names: Vec::new(),
+                    }),
+                    reviews: ReviewSummary {
+                        approved_by: vec![
+                            "alice".to_string(),
+                            "bob".to_string(),
+                        ],
+                        changes_requested_by: Vec::new(),
+                    },
+                },
+                LayerStatus {
+                    index: 1,
+                    subject: "Changes requested and failing check".into(),
+                    number: Some(102),
+                    url: None,
+                    branch: Some("users/me/2".into()),
+                    base: Some("users/me/1".into()),
+                    wanted_base: "users/me/1".into(),
+                    wanted_base_label: "#101".into(),
+                    state: LayerState::Current,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    message_differs: false,
+                    github_message_edited: false,
+                    landable: false,
+                    dep: Dep::Layer(0),
+                    checks: Some(CheckCounts {
+                        passed: 8,
+                        failed: 2,
+                        pending: 0,
+                        failed_names: vec![
+                            "clang-x86_64-debian".to_string(),
+                            "llvm-bazel".to_string(),
+                        ],
+                    }),
+                    reviews: ReviewSummary {
+                        approved_by: vec!["alice".to_string()],
+                        changes_requested_by: vec!["carol".to_string()],
+                    },
+                },
+            ],
+        };
+
+        let non_verbose =
+            status.render_with_options_verbose(true, false, None, false);
+        let expected_non_verbose = concat!(
+            "  ●  #102  ok   8/10 checks  1 approved, 1 changes requested            Changes requested and failing check\n",
+            "  ●  #101  ok  10/10 checks  2 approved                       landable  Approved bottom PR\n",
+            "  ┴─ main\n",
+        );
+        assert_eq!(non_verbose, expected_non_verbose);
+
+        let verbose =
+            status.render_with_options_verbose(true, false, None, true);
+        let expected_verbose = concat!(
+            "  ●  #102  ok   8/10 checks  1 approved, 1 changes requested            Changes requested and failing check\n",
+            "     approved by: alice\n",
+            "     changes requested by: carol\n",
+            "     failed checks: clang-x86_64-debian, llvm-bazel\n",
+            "  ●  #101  ok  10/10 checks  2 approved                       landable  Approved bottom PR\n",
+            "     approved by: alice, bob\n",
+            "  ┴─ main\n",
+        );
+        assert_eq!(verbose, expected_verbose);
     }
 }
