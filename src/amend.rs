@@ -82,6 +82,11 @@ pub async fn amend(
                 new_subject: pr.title.clone(),
             });
             message.update_from_pr(&pr.title, &body);
+            crate::refs::update_message(
+                git,
+                number,
+                &message.clean_for_branch(),
+            )?;
         }
     }
 

@@ -215,6 +215,12 @@ pub async fn upgrade_stack_with_options(
     let mut pass1_pushes: Vec<PushSpec> = Vec::new();
     let mut pass2_pushes: Vec<PushSpec> = Vec::new();
 
+    let merge_settings = forge.repo_merge_settings().await?;
+    let preserve_commit_history =
+        config.preserve_commit_history.resolve(merge_settings);
+    let warn_merge_strategy =
+        preserve_commit_history && !merge_settings.is_squash_only();
+
     for (i, pr) in prs.iter().enumerate() {
         if !upgrade_layers.contains(&i) {
             base_branches.push(config.trunk.clone());
@@ -327,7 +333,10 @@ pub async fn upgrade_stack_with_options(
             .unwrap_or(pass1_parent_tip)
         };
 
-        let clean_msg = stack.layers[i].message.clean_for_branch();
+        let clean_msg = crate::engine::branch_initial_message(
+            preserve_commit_history,
+            &stack.layers[i].message,
+        );
         let final_tip = git.synthesize_initial_commit(
             final_parent_tip,
             trees.effective[i],
@@ -386,11 +395,6 @@ pub async fn upgrade_stack_with_options(
         forge.push(&pass1_pushes).await?;
     }
 
-    let merge_settings = forge.repo_merge_settings().await?;
-    let preserve_commit_history =
-        config.preserve_commit_history.resolve(merge_settings);
-    let warn_merge_strategy =
-        preserve_commit_history && !merge_settings.is_squash_only();
     for (i, pr) in prs.iter().enumerate() {
         if !upgrade_layers.contains(&i) {
             continue;
@@ -468,6 +472,11 @@ pub async fn upgrade_stack_with_options(
 
         crate::refs::update(git, pr.number, tip)?;
         crate::refs::update_root(git, pr.number, tip)?;
+        crate::refs::update_message(
+            git,
+            pr.number,
+            &stack.layers[i].message.clean_for_branch(),
+        )?;
 
         // Normalize `Pull Request:` -> `Pull-Request:` in local commit message.
         messages[i].set(PULL_REQUEST, &config.pull_request_url(pr.number));

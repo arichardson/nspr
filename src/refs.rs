@@ -29,6 +29,10 @@ pub fn root_ref_name(number: u64) -> String {
     format!("refs/nspr/root/{number}")
 }
 
+pub fn msg_ref_name(number: u64) -> String {
+    format!("refs/nspr/msg/{number}")
+}
+
 /// Point `refs/nspr/pr/<number>` at `oid`.
 pub fn update(git: &Git, number: u64, oid: Oid) -> Result<()> {
     git.repo().reference(
@@ -51,6 +55,20 @@ pub fn update_root(git: &Git, number: u64, root_oid: Oid) -> Result<()> {
     Ok(())
 }
 
+/// Record the last-synced commit message for a pull request so `nspr` can
+/// distinguish local commit message edits from GitHub Web UI title/body edits
+/// without storing the full commit message on the PR branch's initial commit.
+pub fn update_message(git: &Git, number: u64, message: &str) -> Result<()> {
+    let blob_oid = git.repo().blob(message.as_bytes())?;
+    git.repo().reference(
+        &msg_ref_name(number),
+        blob_oid,
+        true,
+        "nspr: pull request last synced message",
+    )?;
+    Ok(())
+}
+
 /// Look up the recorded head commit of a pull request's branch, if recorded.
 pub fn get(git: &Git, number: u64) -> Option<Oid> {
     git.repo()
@@ -67,12 +85,28 @@ pub fn get_root(git: &Git, number: u64) -> Option<Oid> {
         .and_then(|r| r.target())
 }
 
+/// Look up the last-synced commit message of a pull request, if recorded.
+pub fn get_message(git: &Git, number: u64) -> Option<String> {
+    let oid = git
+        .repo()
+        .find_reference(&msg_ref_name(number))
+        .ok()
+        .and_then(|r| r.target())?;
+    let blob = git.repo().find_blob(oid).ok()?;
+    std::str::from_utf8(blob.content())
+        .ok()
+        .map(ToOwned::to_owned)
+}
+
 /// Drop the refs for a pull request, once it is merged or closed.
 pub fn remove(git: &Git, number: u64) -> Result<()> {
     if let Ok(mut r) = git.repo().find_reference(&ref_name(number)) {
         r.delete()?;
     }
     if let Ok(mut r) = git.repo().find_reference(&root_ref_name(number)) {
+        r.delete()?;
+    }
+    if let Ok(mut r) = git.repo().find_reference(&msg_ref_name(number)) {
         r.delete()?;
     }
     Ok(())

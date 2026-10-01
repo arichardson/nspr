@@ -1861,9 +1861,11 @@ fn amend_pulls_edited_titles_back_into_the_commits() {
 }
 
 /// After `amend` pulls an edited title/description from GitHub into the local
-/// commit, the next `sync` rewrites the initial commit on the PR branch so that
-/// a subsequent web UI squash-merge uses the updated message, and any further
-/// `sync` is a complete no-op.
+/// commit, a subsequent `sync` in `preserve_commit_history` mode is an
+/// immediate no-op (zero pushes, since the initial branch commit is
+/// `[nspr] initial commit` and GitHub already has the updated title/body).
+/// In `preserveCommitHistory = false` mode, the next `sync` rewrites the
+/// single branch commit to carry the updated message.
 #[test]
 fn amend_rewrites_branch_commit_message_and_subsequent_sync_is_noop() {
     let mut w = World::new(&[("root.txt", "root")]);
@@ -1876,13 +1878,27 @@ fn amend_rewrites_branch_commit_message_and_subsequent_sync_is_noop() {
         .edit_in_ui(prs[0], "A better title", "New body text.");
     w.amend();
 
+    let before = w.push_count();
+    let outcomes = w.sync();
+    assert!(outcomes.iter().all(|o| o.action == LayerAction::Skipped));
+    assert_eq!(w.push_count(), before);
+    assert_eq!(
+        crate::refs::get_message(&w.git, prs[0])
+            .as_deref()
+            .map(str::trim),
+        Some("A better title\n\nNew body text.")
+    );
+
+    // When `preserveCommitHistory` is `false`, `sync` rewrites the branch
+    // commit to carry the full commit message, and the following `sync` is a
+    // no-op.
+    w.config.preserve_commit_history =
+        crate::config::PreserveCommitHistory::False;
     let outcomes = w.sync();
     assert_eq!(outcomes[0].action, LayerAction::Updated);
     let root_msg = w.git.message_of(outcomes[0].tip).unwrap();
     assert_eq!(root_msg.trim(), "A better title\n\nNew body text.");
 
-    // Once the branch's initial commit matches the new message, re-syncing
-    // pushes nothing.
     let before = w.push_count();
     let outcomes = w.sync();
     assert!(outcomes.iter().all(|o| o.action == LayerAction::Skipped));
@@ -2408,22 +2424,26 @@ fn initial_pr_commit_and_reanchored_commit_carry_clean_commit_message() {
         &[("b.txt", "b1")],
     );
     let outcomes = w.sync();
+    let prs = w.pr_numbers();
 
-    // The initial commit on PR #1's branch carries the real commit message
-    // rather than `[nspr] initial version`, so a 1-commit web UI squash merge
-    // defaults to the actual commit message.
+    // When `preserve_commit_history` is enabled (the default on repositories
+    // with squash-only + PR_TITLE/PR_BODY), the initial commit on PR #1's
+    // branch uses `[nspr] initial commit` and the synced message is recorded in
+    // `refs/nspr/msg/<number>`, so commit message changes never require
+    // force-pushing the branch.
     let msg1 = w.git.message_of(outcomes[0].tip).unwrap();
+    assert_eq!(msg1.trim(), crate::engine::INITIAL_COMMIT_MESSAGE);
     assert_eq!(
-        msg1.trim(),
-        "Layer one\n\nDetailed explanation for layer one."
+        crate::refs::get_message(&w.git, prs[0])
+            .as_deref()
+            .map(str::trim),
+        Some("Layer one\n\nDetailed explanation for layer one.")
     );
-    assert!(!msg1.contains("[nspr]"));
 
     // Edit Layer two's title & description on GitHub and pull it locally via
     // `amend`, then land Layer one. When `land` re-anchors Layer two onto the
-    // new squash commit, Layer two's branch commit is updated to the edited
-    // commit message.
-    let prs = w.pr_numbers();
+    // new squash commit, Layer two's branch commit keeps `[nspr] initial commit`
+    // while `refs/nspr/msg/<number>` records the updated message.
     w.forge.edit_in_ui(
         prs[1],
         "Layer two renamed",
@@ -2434,9 +2454,12 @@ fn initial_pr_commit_and_reanchored_commit_carry_clean_commit_message() {
     let landed = w.land(0);
     let repaired_tip = landed.repaired[0].new_tip;
     let msg2 = w.git.message_of(repaired_tip).unwrap();
+    assert_eq!(msg2.trim(), crate::engine::INITIAL_COMMIT_MESSAGE);
     assert_eq!(
-        msg2.trim(),
-        "Layer two renamed\n\nUpdated body for layer two."
+        crate::refs::get_message(&w.git, prs[1])
+            .as_deref()
+            .map(str::trim),
+        Some("Layer two renamed\n\nUpdated body for layer two.")
     );
 }
 
@@ -2452,35 +2475,41 @@ fn editing_local_commit_message_rewrites_first_branch_commit_and_updates_pr() {
     w.amend_layer(0, &[("a.txt", "a2")]);
     w.sync();
 
+    let prs = w.pr_numbers();
+    let pr1_before = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    let pr2_before = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    let pushes_before = w.push_count();
+
     // Now edit Layer one's commit message locally (like `git commit --amend`
     // changing the title/body) and run `nspr diff` (`w.sync()`).
     w.layers[0].message = crate::trailers::CommitMessage::parse(&format!(
         "Rewritten title\n\nRewritten body.\n\nPull-Request: #{}",
-        w.pr_numbers()[0]
+        prs[0]
     ));
     w.rebuild();
 
     let outcomes = w.sync();
     assert_eq!(outcomes[0].action, LayerAction::Updated);
+    assert_eq!(outcomes[1].action, LayerAction::Skipped);
 
-    // 1. The GitHub PR title and body were updated automatically.
-    let prs = w.pr_numbers();
+    // Zero git pushes occurred: updating the commit message only updates the
+    // GitHub PR title and description via API, leaving both PR branches untouched.
+    assert_eq!(w.push_count(), pushes_before);
+
     let pr1 = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    let pr2 = block_on(w.forge.get_pull_request(prs[1])).unwrap();
     assert_eq!(pr1.title, "Rewritten title");
     assert!(pr1.body.contains("Rewritten body."));
+    assert_eq!(pr1.head_oid, pr1_before.head_oid);
+    assert_eq!(pr2.head_oid, pr2_before.head_oid);
 
-    // 2. The initial commit on PR #1's branch was rewritten to carry the new
-    //    commit message, and the subsequent revision commit was replayed on top.
     let revs = crate::land::branch_revisions(&w.git, pr1.head_oid, w.base_oid)
         .unwrap();
     assert_eq!(revs.len(), 2);
     let first_msg = w.git.message_of(revs[0]).unwrap();
-    assert_eq!(first_msg.trim(), "Rewritten title\n\nRewritten body.");
+    assert_eq!(first_msg.trim(), crate::engine::INITIAL_COMMIT_MESSAGE);
 
-    // 3. Layer two was re-anchored onto PR #1's new tip so its displayed diff
-    //    on GitHub still shows only `b.txt`.
     let repo = w.t.open();
-    let pr2 = block_on(w.forge.get_pull_request(prs[1])).unwrap();
     let text = review_diff::displayed_patch(&repo, pr1.head_oid, pr2.head_oid)
         .unwrap();
     assert!(text.contains("b.txt"));
@@ -2645,17 +2674,30 @@ fn upgrade_converts_legacy_spr_stack_into_native_stacked_prs() {
     assert_eq!(stack.layers[1].pr, Some(pr2_num));
 
     // The remote PR branches no longer contain `[spr]` commits, and instead
-    // carry the clean commit messages.
+    // carry `[nspr] initial commit` with the clean commit messages recorded in
+    // `refs/nspr/msg/<number>`.
     let pr1 = block_on(w.forge.get_pull_request(pr1_num)).unwrap();
     let pr2 = block_on(w.forge.get_pull_request(pr2_num)).unwrap();
     assert_eq!(pr2.base, "spr/main/1111");
     assert_eq!(
         w.git.message_of(pr1.head_oid).unwrap().trim(),
-        "Layer one\n\nBody one."
+        crate::engine::INITIAL_COMMIT_MESSAGE
     );
     assert_eq!(
         w.git.message_of(pr2.head_oid).unwrap().trim(),
-        "Layer two\n\nBody two."
+        crate::engine::INITIAL_COMMIT_MESSAGE
+    );
+    assert_eq!(
+        crate::refs::get_message(&w.git, pr1_num)
+            .as_deref()
+            .map(str::trim),
+        Some("Layer one\n\nBody one.")
+    );
+    assert_eq!(
+        crate::refs::get_message(&w.git, pr2_num)
+            .as_deref()
+            .map(str::trim),
+        Some("Layer two\n\nBody two.")
     );
 
     // Subsequent `status` is `Current` ("ok") and `sync` pushes nothing.
@@ -3545,20 +3587,13 @@ fn editing_upper_layer_message_after_lower_layer_fast_forwards_only_rewrites_tha
     assert_eq!(outcomes[2].action, LayerAction::Updated);
     w.assert_invariants();
 
-    let forced_branches: Vec<String> = w
-        .forge
-        .pushes
-        .borrow()
-        .iter()
-        .skip(pushes_before)
-        .filter(|p| p.force)
-        .map(|p| p.branch.clone())
-        .collect();
     assert_eq!(
-        forced_branches,
-        vec!["users/tester/layer-three".to_string()],
-        "only layer-three should be force-pushed when its commit message changes"
+        w.push_count(),
+        pushes_before,
+        "editing a commit message in preserve_commit_history mode should update the PR via API without pushing any git branches"
     );
+    let pr3 = block_on(w.forge.get_pull_request(w.pr_numbers()[2])).unwrap();
+    assert!(pr3.body.contains("New description for layer three."));
 }
 
 #[test]
@@ -4284,10 +4319,17 @@ fn upgrade_preserves_github_edits_by_default_and_overwrites_with_update_message(
     let pr1 = block_on(w.forge.get_pull_request(pr1_num)).unwrap();
     assert_eq!(pr1.title, "Web UI title one");
     assert_eq!(crate::pr_body::strip_warning(&pr1.body), "Web UI body one.");
-    // The branch commit itself was replaced with the clean local commit message.
+    // The branch commit itself was replaced with `[nspr] initial commit` and
+    // the local commit message is recorded in `refs/nspr/msg/<number>`.
     assert_eq!(
         w.git.message_of(pr1.head_oid).unwrap().trim(),
-        "Local title one\n\nLocal body one."
+        crate::engine::INITIAL_COMMIT_MESSAGE
+    );
+    assert_eq!(
+        crate::refs::get_message(&w.git, pr1_num)
+            .as_deref()
+            .map(str::trim),
+        Some("Local title one\n\nLocal body one.")
     );
 
     // Re-mark PR #2 as a legacy `spr` trailer and run `upgrade_stack_with_options(..., true)`:
