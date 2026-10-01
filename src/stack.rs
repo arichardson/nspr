@@ -137,8 +137,10 @@ pub fn parse_pr_ref(value: &str) -> Option<u64> {
 impl Stack {
     /// Discover the stack between `trunk_oid` and `HEAD`.
     pub fn discover(git: &Git, trunk_oid: Oid, trunk: &str) -> Result<Self> {
+        log::debug!("discovering local stack since {trunk} ({trunk_oid})");
         let oids = git.commits_since(trunk_oid)?;
         if oids.is_empty() {
+            log::debug!("no commits found above {trunk_oid}");
             return Ok(Self {
                 trunk: trunk.to_string(),
                 base: trunk_oid,
@@ -180,6 +182,10 @@ impl Stack {
             layers,
         };
         stack.resolve_deps(git)?;
+        log::debug!(
+            "discovered {} layer(s) based on {base}",
+            stack.layers.len()
+        );
         Ok(stack)
     }
 
@@ -276,6 +282,11 @@ impl Stack {
         let tree = if base_tree == local_parent_tree {
             own_tree
         } else {
+            log::debug!(
+                "computing 3-way tree merge for layer {} ({:?}) onto declared dependency",
+                i,
+                layer.subject()
+            );
             let index =
                 git.merge_trees(local_parent_tree, base_tree, own_tree)?;
             if index.has_conflicts() {
@@ -388,11 +399,19 @@ impl Stack {
         for i in 0..n {
             let d = match self.base_tree_cached(git, i, &mut cache) {
                 Ok(tree) => tree,
-                Err(_) => git.tree_of(self.layers[i].parent)?,
+                Err(e) => {
+                    log::debug!(
+                        "base_tree_cached failed for layer {i} ({e}); falling back to local parent tree"
+                    );
+                    git.tree_of(self.layers[i].parent)?
+                }
             };
             let eff = match self.effective_tree_cached(git, i, &mut cache) {
                 Ok(tree) => tree,
-                Err(_) => {
+                Err(e) => {
+                    log::debug!(
+                        "effective_tree_cached failed for layer {i} ({e}); falling back to local commit tree"
+                    );
                     let own = git.tree_of(self.layers[i].commit)?;
                     cache.insert(i, own);
                     own

@@ -62,13 +62,20 @@ where
         debug!("using GitHub token from ${TOKEN_ENV_VAR}");
         return Some(t);
     }
+    debug!("${TOKEN_ENV_VAR} not set; checking ${FALLBACK_ENV_VAR}");
     if let Some(t) = env(FALLBACK_ENV_VAR).and_then(clean) {
         debug!("using GitHub token from ${FALLBACK_ENV_VAR}");
         return Some(t);
     }
+    debug!(
+        "${FALLBACK_ENV_VAR} not set; checking git config (`{GIT_CONFIG_KEY}` / `{LEGACY_SPR_GIT_CONFIG_KEY}`)"
+    );
     if let Some(t) = git_config().and_then(clean) {
         return Some(t);
     }
+    debug!(
+        "no GitHub token in environment or git config; falling back to `gh auth token`"
+    );
     if let Some(t) = gh().and_then(clean) {
         debug!("using GitHub token from `gh auth token`");
         return Some(t);
@@ -183,13 +190,19 @@ fn git_config_token() -> Option<String> {
         .and_then(|repo| repo.config())
         .or_else(|_| git2::Config::open_default())
         .ok()?;
-    for key in [GIT_CONFIG_KEY, LEGACY_SPR_GIT_CONFIG_KEY] {
-        if let Ok(val) = config.get_string(key)
-            && let Some(cleaned) = clean(val)
-        {
-            debug!("using GitHub token from git config `{key}`");
-            return Some(cleaned);
-        }
+    if let Ok(val) = config.get_string(GIT_CONFIG_KEY)
+        && let Some(cleaned) = clean(val)
+    {
+        debug!("using GitHub token from git config `{GIT_CONFIG_KEY}`");
+        return Some(cleaned);
+    }
+    if let Ok(val) = config.get_string(LEGACY_SPR_GIT_CONFIG_KEY)
+        && let Some(cleaned) = clean(val)
+    {
+        debug!(
+            "`{GIT_CONFIG_KEY}` not set; falling back to legacy git config `{LEGACY_SPR_GIT_CONFIG_KEY}`"
+        );
+        return Some(cleaned);
     }
     None
 }

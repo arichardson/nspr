@@ -245,6 +245,9 @@ impl Git {
         }
 
         if updating {
+            log::debug!(
+                "rewrote commit messages starting from {base} (new tip: {parent})"
+            );
             self.repo
                 .find_reference("HEAD")?
                 .resolve()?
@@ -263,6 +266,10 @@ impl Git {
         commits: &[Oid],
         mut new_parent: Oid,
     ) -> Result<Vec<Oid>> {
+        log::debug!(
+            "rebasing {} local commit(s) onto {new_parent}",
+            commits.len()
+        );
         let mut result = Vec::new();
         let hooks = self.hooks();
 
@@ -283,6 +290,9 @@ impl Git {
             let tree_oid = index.write_tree_to(self.repo.as_ref())?;
             if tree_oid == new_parent_commit.tree_id() {
                 // Became empty: almost always because it just landed.
+                log::debug!(
+                    "commit {oid} became empty during rebase; dropping"
+                );
                 hooks.run_post_rewrite_rebase(
                     self.repo.as_ref(),
                     &[(*oid, new_parent)],
@@ -308,6 +318,7 @@ impl Git {
 
         let new_commit = self.repo.find_commit(new_parent)?;
         let mut reference = self.repo.head()?.resolve()?;
+        log::debug!("checking out rebased tree for {new_parent}");
         self.repo
             .checkout_tree(new_commit.as_object(), None)
             .map_err(Error::from)
@@ -318,6 +329,7 @@ impl Git {
     }
 
     pub fn check_no_uncommitted_changes(&self) -> Result<()> {
+        log::debug!("checking working tree for uncommitted changes");
         let mut opts = git2::StatusOptions::new();
         opts.include_ignored(false).include_untracked(false);
         if self.repo.statuses(Some(&mut opts))?.is_empty() {

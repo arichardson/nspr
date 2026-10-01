@@ -138,10 +138,8 @@ impl GitRemote {
             SshAgentStatus::NotConfigured
         };
 
-        if log::log_enabled!(log::Level::Debug) {
-            eprintln!("git {action_desc} ({effective_url})...");
-            let _ = std::io::stderr().flush();
-        } else if dir == Direction::Push {
+        log::debug!("git {action_desc} ({effective_url})...");
+        if !log::log_enabled!(log::Level::Debug) && dir == Direction::Push {
             eprintln!(
                 "{}",
                 console::style(format!(
@@ -157,7 +155,7 @@ impl GitRemote {
         let mut callbacks = RemoteCallbacks::new();
         callbacks.credentials(auth.credentials(&config));
 
-        func(&mut remote, callbacks).wrap_err_with(|| {
+        let res = func(&mut remote, callbacks).wrap_err_with(|| {
             if is_ssh {
                 ssh_agent::format_ssh_auth_error(
                     &effective_url,
@@ -175,7 +173,11 @@ impl GitRemote {
                     &self.url
                 )
             }
-        })
+        });
+        if res.is_ok() {
+            log::debug!("  -> git {action_desc} finished");
+        }
+        res
     }
 
     /// Every branch on the remote and the commit it points at.
@@ -214,9 +216,20 @@ impl GitRemote {
             .map(Oid::to_string)
             .collect();
         if wanted.is_empty() {
+            if !seen.is_empty() {
+                log::debug!(
+                    "fetch_objects: all {} requested commit(s) already present locally",
+                    seen.len()
+                );
+            }
             return Ok(());
         }
 
+        log::debug!(
+            "fetching {} missing commit(s) from remote: {}",
+            wanted.len(),
+            wanted.join(", ")
+        );
         let desc = format!("fetch: {} commit(s)", wanted.len());
         self.with_remote(Direction::Fetch, &desc, |remote, callbacks| {
             let mut conn =

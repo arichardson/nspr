@@ -288,17 +288,24 @@ pub async fn land_layer(
             Some(stack.layers[d.layer].commit),
         )? {
             Some(tip) => (tip, false),
-            None => (
-                collapse(
-                    git,
-                    d,
-                    old_root,
-                    new_root,
-                    &clean_msg,
-                    &mut warnings,
-                )?,
-                true,
-            ),
+            None => {
+                log::debug!(
+                    "replaying {} revision(s) of #{} onto {new_root} conflicted; falling back to collapsed commit",
+                    revisions.len(),
+                    d.number
+                );
+                (
+                    collapse(
+                        git,
+                        d,
+                        old_root,
+                        new_root,
+                        &clean_msg,
+                        &mut warnings,
+                    )?,
+                    true,
+                )
+            }
         };
 
         // The justification for force-pushing: the reviewer sees the same
@@ -363,6 +370,10 @@ pub async fn land_layer(
             stack.rebase_without(git, &removed, rebase_onto, false)
         {
             if rebase_onto != stack.base && dependents.is_empty() {
+                log::debug!(
+                    "rebasing remaining local commits onto {rebase_onto} failed ({rebase_err}); falling back to rebasing onto current stack base {}",
+                    stack.base
+                );
                 stack
                     .rebase_without(git, &removed, stack.base, false)
                     .wrap_err(
@@ -932,12 +943,19 @@ async fn repair_remaining_dependents(
             Some(stack.layers[d_layer].commit),
         )? {
             Some(tip) => (tip, false),
-            None => (
-                collapse(
-                    git, &d_snap, old_root, new_root, &clean_msg, warnings,
-                )?,
-                true,
-            ),
+            None => {
+                log::debug!(
+                    "replaying {} revision(s) of #{} onto {new_root} conflicted; falling back to collapsed commit",
+                    revisions.len(),
+                    d_state.number
+                );
+                (
+                    collapse(
+                        git, &d_snap, old_root, new_root, &clean_msg, warnings,
+                    )?,
+                    true,
+                )
+            }
         };
 
         let before = displayed_patch_id(git.repo(), old_root, d_state.tip)?;

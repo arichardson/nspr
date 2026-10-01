@@ -125,6 +125,7 @@ impl GitHubForge {
         if let Some(login) = cached {
             return Ok(login);
         }
+        debug!("API GET /user (viewer_login)");
         let login = self
             .api
             .current()
@@ -135,6 +136,7 @@ impl GitHubForge {
                  expired; run `gh auth login`.",
             )?
             .login;
+        debug!("  -> viewer login = {login}");
         *self.login.borrow_mut() = Some(login.clone());
         Ok(login)
     }
@@ -182,6 +184,7 @@ impl GitHubForge {
             );
         };
         let login = viewer.login;
+        debug!("  -> viewer login = {login}");
         *self.login.borrow_mut() = Some(login.clone());
 
         let oid = match data
@@ -213,24 +216,41 @@ impl GitHubForge {
         }
         let repo = self.remote.repo();
         if repo.find_commit(pr.head_oid).is_err() {
+            debug!(
+                "  -> #{}: head_oid {} missing locally; will fetch base_oid {}",
+                pr.number, pr.head_oid, pr.base_oid
+            );
             return false;
         }
         let root_ref = crate::refs::root_ref_name(pr.number);
         let Some(root_oid) =
             repo.find_reference(&root_ref).ok().and_then(|r| r.target())
         else {
+            debug!(
+                "  -> #{}: no local `{root_ref}`; falling back to fetching base_oid {}",
+                pr.number, pr.base_oid
+            );
             return false;
         };
         if let Ok(root_commit) = repo.find_commit(root_oid)
             && root_commit.parent_count() == 1
             && let Ok(parent_oid) = root_commit.parent_id(0)
             && repo.find_commit(parent_oid).is_ok()
-        {
-            root_oid == pr.head_oid
+            && (root_oid == pr.head_oid
                 || repo
                     .graph_descendant_of(pr.head_oid, root_oid)
-                    .unwrap_or(false)
+                    .unwrap_or(false))
+        {
+            debug!(
+                "  -> #{}: skipping fetch of missing base_oid {} (using local `{root_ref}` = {root_oid})",
+                pr.number, pr.base_oid
+            );
+            true
         } else {
+            debug!(
+                "  -> #{}: local `{root_ref}` ({root_oid}) not an ancestor of head_oid {}; falling back to fetching base_oid {}",
+                pr.number, pr.head_oid, pr.base_oid
+            );
             false
         }
     }
@@ -707,6 +727,9 @@ impl Forge for GitHubForge {
         }
         for suffix in 1.. {
             let candidate = format!("{preferred}-{suffix}");
+            debug!(
+                "branch `{preferred}` already exists on remote; trying `{candidate}`"
+            );
             if self.branch_oid(&candidate).await?.is_none() {
                 return Ok(candidate);
             }
@@ -724,6 +747,10 @@ impl Forge for GitHubForge {
 
     async fn list_own_comments(&self, number: u64) -> Result<Vec<Comment>> {
         let login = self.viewer_login().await?;
+        debug!(
+            "API GET /repos/{}/{}/issues/{number}/comments",
+            self.owner, self.repo
+        );
         let first = self
             .api
             .issues(&self.owner, &self.repo)
@@ -750,6 +777,10 @@ impl Forge for GitHubForge {
     }
 
     async fn create_comment(&self, number: u64, body: &str) -> Result<u64> {
+        debug!(
+            "API POST /repos/{}/{}/issues/{number}/comments",
+            self.owner, self.repo
+        );
         let comment = self
             .api
             .issues(&self.owner, &self.repo)
@@ -764,6 +795,7 @@ impl Forge for GitHubForge {
         // this endpoint as PATCH, so the call is made directly.
         let route =
             format!("/repos/{}/{}/issues/comments/{id}", self.owner, self.repo);
+        debug!("API PATCH {route}");
         self.api
             .patch::<octocrab::models::issues::Comment, _, _>(
                 route,
@@ -775,6 +807,10 @@ impl Forge for GitHubForge {
     }
 
     async fn delete_comment(&self, id: u64) -> Result<()> {
+        debug!(
+            "API DELETE /repos/{}/{}/issues/comments/{id}",
+            self.owner, self.repo
+        );
         self.api
             .issues(&self.owner, &self.repo)
             .delete_comment(octocrab::models::CommentId(id))
@@ -792,6 +828,7 @@ impl Forge for GitHubForge {
             debug!("no node id available; leaving draft state alone");
             return Ok(());
         }
+        debug!("API POST /graphql set_draft(node_id={node_id}, draft={draft})");
         let mutation = if draft {
             "mutation($id: ID!) { convertPullRequestToDraft(input: \
              {pullRequestId: $id}) { pullRequest { number } } }"
@@ -827,6 +864,7 @@ impl Forge for GitHubForge {
                 self.owner, self.repo
             ),
         };
+        debug!("API POST /graphql SearchPullRequests(query={query_filter:?})");
         let body = serde_json::json!({
             "query": SEARCH_PULL_REQUESTS_QUERY,
             "variables": {
@@ -848,13 +886,15 @@ impl Forge for GitHubForge {
             );
         };
 
-        Ok(data
+        let prs: Vec<ListedPr> = data
             .search
             .nodes
             .into_iter()
             .flatten()
             .map(listed_pr_from)
-            .collect())
+            .collect();
+        debug!("  -> found {} open PR(s)", prs.len());
+        Ok(prs)
     }
 
     async fn find_pull_request_by_head(
@@ -863,6 +903,9 @@ impl Forge for GitHubForge {
     ) -> Result<Option<PullRequest>> {
         let query_filter =
             format!("repo:{}/{} is:pr head:\"{head}\"", self.owner, self.repo);
+        debug!(
+            "API POST /graphql FindPullRequestByHead(query={query_filter:?})"
+        );
         let body = serde_json::json!({
             "query": SEARCH_PULL_REQUESTS_QUERY,
             "variables": {
@@ -887,10 +930,14 @@ impl Forge for GitHubForge {
 
         match target {
             Some(node) => {
+                debug!("  -> matched head `{head}` to PR #{}", node.number);
                 let pr = self.get_pull_request(node.number).await?;
                 Ok(Some(pr))
             }
-            None => Ok(None),
+            None => {
+                debug!("  -> no PR found for head `{head}`");
+                Ok(None)
+            }
         }
     }
 
@@ -927,6 +974,7 @@ impl Forge for GitHubForge {
                         "/repos/{}/{}/stacks/{}/add",
                         self.owner, self.repo, matched.number
                     );
+                    debug!("API POST {route} (pull_requests={delta:?})");
                     let body = serde_json::json!({ "pull_requests": delta });
                     match self
                         .api
@@ -953,7 +1001,7 @@ impl Forge for GitHubForge {
                         }
                         Err(e) => {
                             debug!(
-                                "could not extend github stack #{} with {delta:?}: {e}; will recreate",
+                                "could not extend github stack #{} with {delta:?}: {e}; falling back to recreating stack",
                                 matched.number
                             );
                         }
@@ -967,6 +1015,7 @@ impl Forge for GitHubForge {
             }
 
             let route = format!("/repos/{}/{}/stacks", self.owner, self.repo);
+            debug!("API POST {route} (pull_requests={desired:?})");
             let body = serde_json::json!({ "pull_requests": desired });
             match self.api.post::<_, RemoteStack>(route, Some(&body)).await {
                 Ok(created) => {
@@ -1015,22 +1064,31 @@ impl Forge for GitHubForge {
         }
 
         let route = format!("/repos/{}/{}", self.owner, self.repo);
+        debug!("API GET {route} (repo merge settings)");
         let settings = match self
             .api
             .get::<RepoSettingsResponse, _, _>(route, None::<&()>)
             .await
         {
-            Ok(resp) => RepoMergeSettings {
-                allow_squash_merge: resp.allow_squash_merge,
-                allow_merge_commit: resp.allow_merge_commit,
-                allow_rebase_merge: resp.allow_rebase_merge,
-                squash_uses_pr_description: resp.squash_merge_commit_title
-                    == "PR_TITLE"
-                    && resp.squash_merge_commit_message != "COMMIT_MESSAGES",
-            },
+            Ok(resp) => {
+                let s = RepoMergeSettings {
+                    allow_squash_merge: resp.allow_squash_merge,
+                    allow_merge_commit: resp.allow_merge_commit,
+                    allow_rebase_merge: resp.allow_rebase_merge,
+                    squash_uses_pr_description: resp.squash_merge_commit_title
+                        == "PR_TITLE"
+                        && resp.squash_merge_commit_message
+                            != "COMMIT_MESSAGES",
+                };
+                debug!("  -> repo merge settings: {s:?}");
+                s
+            }
             Err(e) => {
-                debug!("could not query repo merge settings: {e}");
-                RepoMergeSettings::default()
+                let defaults = RepoMergeSettings::default();
+                debug!(
+                    "could not query repo merge settings ({e}); falling back to defaults {defaults:?}"
+                );
+                defaults
             }
         };
 
@@ -1046,6 +1104,10 @@ impl GitHubForge {
             return Ok(oid);
         }
         for delay_ms in [200_u64, 500, 1000] {
+            debug!(
+                "  -> #{} is Merged on GitHub but mergeCommit is not populated yet; waiting {delay_ms}ms",
+                pr.number
+            );
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
                 .await;
             if let Ok(refreshed) = self.get_pull_request(pr.number).await
@@ -1057,7 +1119,7 @@ impl GitHubForge {
         }
         if let Some(oid) = self.branch_oid(&pr.base).await? {
             debug!(
-                "  -> merged #{}; falling back to {} tip {oid}",
+                "  -> merged #{}; mergeCommit still missing, falling back to `{}` tip {oid}",
                 pr.number, pr.base
             );
             return Ok(oid);
@@ -1072,6 +1134,7 @@ impl GitHubForge {
     async fn list_remote_stacks(&self) -> Result<Option<Vec<RemoteStack>>> {
         let route =
             format!("/repos/{}/{}/stacks?per_page=100", self.owner, self.repo);
+        debug!("API GET {route}");
         match self
             .api
             .get::<Vec<RemoteStack>, _, _>(route, None::<&()>)
@@ -1094,6 +1157,7 @@ impl GitHubForge {
             "/repos/{}/{}/stacks/{stack_number}/unstack",
             self.owner, self.repo
         );
+        debug!("API POST {route}");
         if let Err(e) = self.api._post(route, None::<&()>).await {
             debug!("could not unstack #{stack_number}: {e}");
         }
@@ -1104,6 +1168,7 @@ impl GitHubForge {
             "/repos/{}/{}/stacks?pull_request={pr_number}",
             self.owner, self.repo
         );
+        debug!("API GET {route}");
         if let Ok(stacks) = self
             .api
             .get::<Vec<RemoteStack>, _, _>(route, None::<&()>)

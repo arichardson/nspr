@@ -84,6 +84,7 @@ pub async fn resolve_trunk_from_remote_oid(
 
     match remote_oid {
         Ok(Some(oid)) => {
+            debug!("resolved remote trunk `{remote}/{trunk}` = {oid}");
             forge.fetch_commit(oid).await?;
             git.set_reference(&trunk_ref, oid, "nspr: observed trunk")?;
             Ok(oid)
@@ -94,6 +95,9 @@ pub async fn resolve_trunk_from_remote_oid(
             if let Err(error) = other {
                 debug!("could not read {trunk} from the remote: {error:#}");
             }
+            debug!(
+                "remote trunk `{trunk}` unavailable; falling back to local tracking ref `{trunk_ref}`"
+            );
             git.resolve_reference(&trunk_ref).map_err(|_| {
                 eyre!(
                     "cannot tell where `{trunk}` is: the remote did not \
