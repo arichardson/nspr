@@ -248,7 +248,7 @@ pub async fn land_layer(
         }
     };
     forge.fetch_commit(squash).await?;
-    print_landed(git, number, &title, squash)?;
+    print_landed(git, config, number, &title, squash)?;
 
     // --- Steps 3-5: replay each dependent's revisions onto the new tip. -----
     //
@@ -346,7 +346,7 @@ pub async fn land_layer(
     // head branch via the forge API. -----------------------------------------
     if !push_specs.is_empty() {
         forge.push(&push_specs).await?;
-        print_repaired(&repaired, &config.trunk);
+        print_repaired(config, &repaired);
     }
 
     for (dep_num, new_tip, new_root_commit) in ref_updates {
@@ -595,7 +595,7 @@ pub async fn land_all(
                 }
                 let (title, _) =
                     squash_message(&stack.layers[index], state.number, opts);
-                print_landed(git, state.number, &title, squash)?;
+                print_landed(git, config, state.number, &title, squash)?;
                 forge.delete_branch(&state.branch).await?;
                 crate::refs::remove(git, state.number)?;
 
@@ -800,7 +800,7 @@ pub async fn land_all(
             }
         };
         forge.fetch_commit(squash).await?;
-        print_landed(git, state.number, &title, squash)?;
+        print_landed(git, config, state.number, &title, squash)?;
         forge.delete_branch(&state.branch).await?;
         crate::refs::remove(git, state.number)?;
 
@@ -994,7 +994,7 @@ async fn repair_remaining_dependents(
 
     if !push_specs.is_empty() {
         forge.push(&push_specs).await?;
-        print_repaired(&repaired, &config.trunk);
+        print_repaired(config, &repaired);
     }
 
     for (dep_num, new_tip, new_root_commit) in ref_updates {
@@ -1009,26 +1009,29 @@ async fn repair_remaining_dependents(
 
 fn print_landed(
     git: &Git,
+    config: &Config,
     number: u64,
     title: &str,
     squash: Oid,
 ) -> Result<()> {
     println!(
-        "{} #{} {} as {}",
+        "{} {} {} as {}",
         console::style("landed").green().bold(),
-        number,
+        config.pull_request_link(number, format!("#{number}")),
         title,
         git.short_id(squash)?
     );
     Ok(())
 }
 
-fn print_repaired(repaired: &[Repair], trunk: &str) {
+fn print_repaired(config: &Config, repaired: &[Repair]) {
     for repair in repaired {
+        let pr = config
+            .pull_request_link(repair.number, format!("#{}", repair.number));
         if repair.retargeted {
-            println!("  repaired #{} (retargeted → {})", repair.number, trunk);
+            println!("  repaired {pr} (retargeted → {})", config.trunk);
         } else {
-            println!("  repaired #{}", repair.number);
+            println!("  repaired {pr}");
         }
     }
 }

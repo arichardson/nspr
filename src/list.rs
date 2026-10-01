@@ -116,7 +116,12 @@ pub fn format_stacks(stacks: &[PrStack]) -> String {
 fn format_node(node: &StackNode, depth: usize, out: &mut String) {
     let indent = "  ".repeat(depth);
     let decision = format_decision(node.pr.review_decision, node.pr.draft);
-    let num = style(format!("#{}", node.pr.number)).bold();
+    let styled_num = style(format!("#{}", node.pr.number)).bold();
+    let num = if console::colors_enabled() && !node.pr.url.is_empty() {
+        crate::utils::osc8_link(&node.pr.url, styled_num)
+    } else {
+        styled_num.to_string()
+    };
     let _ = writeln!(out, "{indent}{num}  {decision}  {}", node.pr.title);
     for child in &node.children {
         format_node(child, depth + 1, out);

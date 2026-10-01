@@ -399,6 +399,22 @@ impl StackStatus {
         components
     }
 
+    fn url_for_pr(&self, number: u64) -> Option<String> {
+        if let Some(url) = self
+            .layers
+            .iter()
+            .find(|l| l.number == Some(number))
+            .and_then(|l| l.url.clone())
+        {
+            return Some(url);
+        }
+        self.layers
+            .iter()
+            .find_map(|l| l.url.as_deref())
+            .and_then(|u| u.rsplit_once("/pull/"))
+            .map(|(prefix, _)| format!("{prefix}/pull/{number}"))
+    }
+
     fn render_table_inner(
         &self,
         outcomes: Option<&[engine::LayerOutcome]>,
@@ -415,6 +431,7 @@ impl StackStatus {
 
         struct RowData<'a> {
             layer: &'a LayerStatus,
+            effective_num: Option<u64>,
             num_plain: String,
             glyph: String,
             state_styled: String,
@@ -422,7 +439,8 @@ impl StackStatus {
             checks_styled: String,
             reviews_plain: String,
             reviews_styled: String,
-            badges_joined: String,
+            badges_plain: String,
+            badges_styled: String,
         }
 
         let arrow = if use_unicode { "→" } else { "->" };
@@ -440,8 +458,8 @@ impl StackStatus {
                     list.iter().find(|o| o.index == layer.index)
                 });
 
-                let num_plain = match layer.number.or(outcome.map(|o| o.number))
-                {
+                let effective_num = layer.number.or(outcome.map(|o| o.number));
+                let num_plain = match effective_num {
                     Some(n) => format!("#{n}"),
                     None => dash.to_string(),
                 };
@@ -560,34 +578,40 @@ impl StackStatus {
                     state_plain.to_string()
                 };
 
-                let mut badges = Vec::new();
-                if layer.draft {
-                    badges.push(if use_color {
-                        style("draft").dim().to_string()
+                let mut badges_plain_vec = Vec::new();
+                let mut badges_styled_vec = Vec::new();
+                let mut push_badge = |plain: String, styled: String| {
+                    if use_color {
+                        badges_styled_vec.push(styled);
                     } else {
-                        "draft".to_string()
-                    });
+                        badges_styled_vec.push(plain.clone());
+                    }
+                    badges_plain_vec.push(plain);
+                };
+
+                if layer.draft {
+                    push_badge(
+                        "draft".to_string(),
+                        style("draft").dim().to_string(),
+                    );
                 }
                 if layer.conflicting {
-                    badges.push(if use_color {
-                        style("conflicts").red().bold().to_string()
-                    } else {
-                        "conflicts".to_string()
-                    });
+                    push_badge(
+                        "conflicts".to_string(),
+                        style("conflicts").red().bold().to_string(),
+                    );
                 }
                 if layer.behind {
-                    badges.push(if use_color {
-                        style("behind").yellow().to_string()
-                    } else {
-                        "behind".to_string()
-                    });
+                    push_badge(
+                        "behind".to_string(),
+                        style("behind").yellow().to_string(),
+                    );
                 }
                 if layer.auto_merge {
-                    badges.push(if use_color {
-                        style("AUTO-MERGE").red().bold().to_string()
-                    } else {
-                        "AUTO-MERGE".to_string()
-                    });
+                    push_badge(
+                        "AUTO-MERGE".to_string(),
+                        style("AUTO-MERGE").red().bold().to_string(),
+                    );
                 }
                 let non_adjacent_in_comp = if pos_in_comp == 0 {
                     matches!(layer.dep, Dep::ExternalPr(_))
@@ -595,55 +619,79 @@ impl StackStatus {
                     let below_idx = self.layers[comp[pos_in_comp - 1]].index;
                     layer.dep != Dep::Layer(below_idx)
                 };
+                let target_pr_url = layer
+                    .wanted_base_label
+                    .strip_prefix('#')
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .and_then(|n| self.url_for_pr(n));
                 if outcome.is_some_and(|o| o.retargeted) {
-                    let t =
-                        format!("rebased {arrow} {}", layer.wanted_base_label);
-                    badges.push(if use_color {
-                        style(t).magenta().to_string()
-                    } else {
-                        t
-                    });
+                    let prefix = format!("rebased {arrow} ");
+                    let plain = format!("{prefix}{}", layer.wanted_base_label);
+                    let styled = match &target_pr_url {
+                        Some(url) => format!(
+                            "{}{}",
+                            style(&prefix).magenta(),
+                            crate::utils::osc8_link(
+                                url,
+                                style(&layer.wanted_base_label).magenta()
+                            )
+                        ),
+                        None => style(&plain).magenta().to_string(),
+                    };
+                    push_badge(plain, styled);
                 } else if layer
                     .base
                     .as_ref()
                     .is_some_and(|b| b != &layer.wanted_base)
                 {
-                    let t =
-                        format!("retarget {arrow} {}", layer.wanted_base_label);
-                    badges.push(if use_color {
-                        style(t).magenta().to_string()
-                    } else {
-                        t
-                    });
+                    let prefix = format!("retarget {arrow} ");
+                    let plain = format!("{prefix}{}", layer.wanted_base_label);
+                    let styled = match &target_pr_url {
+                        Some(url) => format!(
+                            "{}{}",
+                            style(&prefix).magenta(),
+                            crate::utils::osc8_link(
+                                url,
+                                style(&layer.wanted_base_label).magenta()
+                            )
+                        ),
+                        None => style(&plain).magenta().to_string(),
+                    };
+                    push_badge(plain, styled);
                 } else if non_adjacent_in_comp {
-                    let t = format!("base: {}", layer.wanted_base_label);
-                    badges.push(if use_color {
-                        style(t).blue().to_string()
-                    } else {
-                        t
-                    });
+                    let prefix = "base: ";
+                    let plain = format!("{prefix}{}", layer.wanted_base_label);
+                    let styled = match &target_pr_url {
+                        Some(url) => format!(
+                            "{}{}",
+                            style(prefix).blue(),
+                            crate::utils::osc8_link(
+                                url,
+                                style(&layer.wanted_base_label).blue()
+                            )
+                        ),
+                        None => style(&plain).blue().to_string(),
+                    };
+                    push_badge(plain, styled);
                 }
                 if layer.message_differs {
                     if update_message || !layer.github_message_edited {
-                        badges.push(if use_color {
-                            style("update message").cyan().to_string()
-                        } else {
-                            "update message".to_string()
-                        });
+                        push_badge(
+                            "update message".to_string(),
+                            style("update message").cyan().to_string(),
+                        );
                     } else {
-                        badges.push(if use_color {
-                            style("message differs").yellow().to_string()
-                        } else {
-                            "message differs".to_string()
-                        });
+                        push_badge(
+                            "message differs".to_string(),
+                            style("message differs").yellow().to_string(),
+                        );
                     }
                 }
                 if layer.landable {
-                    badges.push(if use_color {
-                        style("landable").green().to_string()
-                    } else {
-                        "landable".to_string()
-                    });
+                    push_badge(
+                        "landable".to_string(),
+                        style("landable").green().to_string(),
+                    );
                 }
 
                 let (checks_plain, checks_styled) = match &layer.checks {
@@ -708,6 +756,7 @@ impl StackStatus {
 
                 rows.push(RowData {
                     layer,
+                    effective_num,
                     num_plain,
                     glyph,
                     state_styled,
@@ -715,7 +764,8 @@ impl StackStatus {
                     checks_styled,
                     reviews_plain,
                     reviews_styled,
-                    badges_joined: badges.join("  "),
+                    badges_plain: badges_plain_vec.join("  "),
+                    badges_styled: badges_styled_vec.join("  "),
                 });
             }
             component_rows.push(rows);
@@ -749,7 +799,7 @@ impl StackStatus {
         let max_badges_width = component_rows
             .iter()
             .flatten()
-            .map(|r| measure_text_width(&r.badges_joined))
+            .map(|r| measure_text_width(&r.badges_plain))
             .max()
             .unwrap_or(0);
 
@@ -783,12 +833,15 @@ impl StackStatus {
                 let num_pad = num_width
                     .saturating_sub(measure_text_width(&row.num_plain));
                 let styled_num = if use_color {
-                    if row.layer.number.is_some() {
+                    if let Some(n) = row.effective_num {
                         let colored = style(&row.num_plain).bold().cyan();
-                        if let Some(url) = &row.layer.url {
+                        if let Some(url) =
+                            row.layer.url.clone().or_else(|| self.url_for_pr(n))
+                        {
                             format!(
-                                "{}\x1b]8;;{url}\x1b\\{colored}\x1b]8;;\x1b\\",
-                                " ".repeat(num_pad)
+                                "{}{}",
+                                " ".repeat(num_pad),
+                                crate::utils::osc8_link(&url, colored)
                             )
                         } else {
                             format!("{}{colored}", " ".repeat(num_pad))
@@ -841,14 +894,10 @@ impl StackStatus {
                     String::new()
                 };
                 let badges_col = if max_badges_width > 0 {
-                    let padded_badges = pad_str(
-                        &row.badges_joined,
-                        max_badges_width,
-                        Alignment::Left,
-                        None,
-                    );
+                    let badges_pad = max_badges_width
+                        .saturating_sub(measure_text_width(&row.badges_plain));
                     prefix_width += max_badges_width + 2;
-                    format!("  {padded_badges}")
+                    format!("  {}{}", row.badges_styled, " ".repeat(badges_pad))
                 } else {
                     String::new()
                 };
@@ -1352,5 +1401,84 @@ mod tests {
             "  ┴─ main\n",
         );
         assert_eq!(verbose, expected_verbose);
+    }
+
+    #[test]
+    fn render_wraps_pr_numbers_and_badge_references_in_osc8_links() {
+        console::set_colors_enabled(true);
+        let status = StackStatus {
+            trunk: "main".to_string(),
+            layers: vec![
+                LayerStatus {
+                    index: 0,
+                    subject: "Bottom commit".into(),
+                    number: Some(227865),
+                    url: Some(
+                        "https://github.com/llvm/llvm-project/pull/227865"
+                            .into(),
+                    ),
+                    branch: Some("users/me/bottom".into()),
+                    base: Some("main".into()),
+                    wanted_base: "main".into(),
+                    wanted_base_label: "main".into(),
+                    state: LayerState::Current,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    message_differs: false,
+                    github_message_edited: false,
+                    landable: true,
+                    dep: Dep::Main,
+                    checks: None,
+                    reviews: ReviewSummary::default(),
+                },
+                LayerStatus {
+                    index: 1,
+                    subject: "Top commit".into(),
+                    number: None,
+                    url: None,
+                    branch: None,
+                    base: Some("main".into()),
+                    wanted_base: "users/me/bottom".into(),
+                    wanted_base_label: "#227865".into(),
+                    state: LayerState::New,
+                    draft: false,
+                    auto_merge: false,
+                    conflicting: false,
+                    behind: false,
+                    message_differs: false,
+                    github_message_edited: false,
+                    landable: false,
+                    dep: Dep::Layer(0),
+                    checks: None,
+                    reviews: ReviewSummary::default(),
+                },
+            ],
+        };
+
+        let outcomes = vec![engine::LayerOutcome {
+            index: 1,
+            number: 227866,
+            branch: "users/me/top".into(),
+            tip: git2::Oid::ZERO_SHA1,
+            action: engine::LayerAction::Created,
+            base: "users/me/bottom".into(),
+            retargeted: false,
+        }];
+
+        let rendered = status.render_table(Some(&outcomes), true, true, None);
+        assert!(
+            rendered.contains(
+                "\x1b]8;;https://github.com/llvm/llvm-project/pull/227865\x1b\\"
+            ),
+            "existing PR number and badge reference must be wrapped in OSC 8 link: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(
+                "\x1b]8;;https://github.com/llvm/llvm-project/pull/227866\x1b\\"
+            ),
+            "newly created PR number in diff table must be wrapped in OSC 8 link: {rendered:?}"
+        );
     }
 }

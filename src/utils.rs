@@ -32,6 +32,11 @@ fn is_combining_mark(c: char) -> bool {
     matches!(c as u32, 0x0300..=0x036F)
 }
 
+/// Wrap `text` in an OSC 8 terminal hyperlink pointing at `url`.
+pub fn osc8_link(url: &str, text: impl std::fmt::Display) -> String {
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

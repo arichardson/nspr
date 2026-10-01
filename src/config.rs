@@ -97,6 +97,21 @@ impl Config {
         )
     }
 
+    /// Format `text` (such as `#123`) as an OSC 8 terminal hyperlink to the
+    /// pull request when terminal colors/styling are enabled, or plain `text`
+    /// otherwise.
+    pub fn pull_request_link(
+        &self,
+        number: u64,
+        text: impl std::fmt::Display,
+    ) -> String {
+        if console::colors_enabled() {
+            crate::utils::osc8_link(&self.pull_request_url(number), text)
+        } else {
+            text.to_string()
+        }
+    }
+
     /// Preferred branch name for a layer with the given subject.
     pub fn branch_name_for(&self, subject: &str) -> String {
         format!("{}{}", self.branch_prefix, slugify(subject))
