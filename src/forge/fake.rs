@@ -174,7 +174,31 @@ impl FakeForge {
 
     /// Simulate someone squash-merging through the GitHub UI.
     pub fn external_squash_merge(&self, number: u64) -> Result<Oid> {
-        self.do_squash_merge(number, None)
+        self.do_squash_merge(number, None, true)
+    }
+
+    /// Simulate GitHub's partial squash-merge failure mode (as seen on
+    /// `llvm/llvm-project#227512`), where `PUT /pulls/{number}/merge` creates
+    /// the squash commit on the base branch and advances `refs/heads/<base>`
+    /// before failing to mark the pull request as `Merged` in GitHub's database.
+    pub fn partial_squash_merge_leaving_pr_open(
+        &self,
+        number: u64,
+        req: Option<&SquashMerge>,
+    ) -> Result<Oid> {
+        if let Some(req) = req {
+            return self.do_squash_merge(number, Some(req), false);
+        }
+        let pr = self.find(number)?;
+        let head_oid = self.branch(&pr.head).ok_or_else(|| {
+            color_eyre::eyre::eyre!("head branch {} is gone", pr.head)
+        })?;
+        let default_req = SquashMerge {
+            title: format!("{} (#{number})", pr.title),
+            message: pr.body.clone(),
+            expected_head: head_oid,
+        };
+        self.do_squash_merge(number, Some(&default_req), false)
     }
 
     fn find(&self, number: u64) -> Result<FakePr> {
@@ -190,6 +214,7 @@ impl FakeForge {
         &self,
         number: u64,
         req: Option<&SquashMerge>,
+        mark_pr_merged: bool,
     ) -> Result<Oid> {
         let pr = self.find(number)?;
         if pr.state != PrState::Open {
@@ -216,9 +241,10 @@ impl FakeForge {
         // merged tree. This is what destroys SHA identity and breaks naive
         // stacking.
         let mb = self.repo.merge_base(base_oid, head_oid)?;
+        let base_commit = self.repo.find_commit(base_oid)?;
         let mut index = self.repo.merge_trees(
             &self.repo.find_commit(mb)?.tree()?,
-            &self.repo.find_commit(base_oid)?.tree()?,
+            &base_commit.tree()?,
             &self.repo.find_commit(head_oid)?.tree()?,
             None,
         )?;
@@ -226,6 +252,13 @@ impl FakeForge {
             bail!("PR #{number} does not merge cleanly");
         }
         let tree_oid = index.write_tree_to(&self.repo)?;
+        if tree_oid == base_commit.tree_id() {
+            bail!(
+                "PR #{number} squash merge would produce an empty 0-file commit \
+                 on `{}` (tree {tree_oid} is identical to base {base_oid})",
+                pr.base
+            );
+        }
         let tree = self.repo.find_tree(tree_oid)?;
         let head_commit = self.repo.find_commit(head_oid)?;
         let author = head_commit.author();
@@ -248,15 +281,16 @@ impl FakeForge {
             &sig,
             &message,
             &tree,
-            &[&self.repo.find_commit(base_oid)?],
+            &[&base_commit],
         )?;
 
         self.branches.borrow_mut().insert(pr.base.clone(), squash);
-        if let Some(p) = self
-            .prs
-            .borrow_mut()
-            .iter_mut()
-            .find(|p| p.number == number)
+        if mark_pr_merged
+            && let Some(p) = self
+                .prs
+                .borrow_mut()
+                .iter_mut()
+                .find(|p| p.number == number)
         {
             p.state = PrState::Merged;
             p.last_head_oid = head_oid;
@@ -441,7 +475,7 @@ impl Forge for FakeForge {
         number: u64,
         req: SquashMerge,
     ) -> Result<Oid> {
-        self.do_squash_merge(number, Some(&req))
+        self.do_squash_merge(number, Some(&req), true)
     }
 
     async fn branch_protection(
