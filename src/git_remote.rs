@@ -102,7 +102,7 @@ impl GitRemote {
     /// agent is responsive.
     fn authenticator(&self, ssh_status: &SshAgentStatus) -> GitAuthenticator {
         let mut auth = GitAuthenticator::default()
-            .try_cred_helper(true)
+            .try_cred_helper(self.auth_token.is_empty())
             .add_default_ssh_keys()
             .prompt_ssh_key_password(false)
             .add_plaintext_credentials("github.com", "nspr", &self.auth_token);

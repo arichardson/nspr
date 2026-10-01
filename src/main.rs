@@ -240,12 +240,16 @@ impl Session {
         let repo = git2::Repository::discover(".").map_err(|e| {
             eyre!("cannot open a git repository here: {}", e.message())
         })?;
+        log::debug!("opened git repository at {}", repo.path().display());
         let git = Git::new(repo);
 
         // The slug has to come from local config: we need it to build the API
         // client that would otherwise tell us the login.
         let (owner, name) = config::detect_repo(&git, remote)?;
         let trunk = config::detect_trunk(&git, remote)?;
+        log::debug!(
+            "detected repository {owner}/{name} on remote `{remote}` (trunk `{trunk}`)"
+        );
         let token = auth::github_token()?;
         let forge = GitHubForge::new(git.repo().clone(), &owner, &name, token)?;
 
