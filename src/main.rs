@@ -5,7 +5,8 @@
 //! the library; this file is deliberately thin, because everything here is
 //! untested by the scenario suite.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory as _, Parser, Subcommand};
+use clap_complete::{ArgValueCandidates, CompleteEnv, CompletionCandidate};
 use color_eyre::eyre::{Result, bail, eyre};
 use console::style;
 use git2::Oid;
@@ -36,7 +37,12 @@ use nspr::{
 )]
 struct Cli {
     /// The git remote that points at GitHub.
-    #[arg(long, global = true, default_value = "origin")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "origin",
+        add = ArgValueCandidates::new(complete_git_remotes)
+    )]
     remote: String,
 
     /// Print every decision, including the ones that led to doing nothing.
@@ -67,6 +73,19 @@ enum Command {
     Patch(PatchArgs),
     /// Convert existing `spr` pull requests (`[spr]` commits / `Pull Request:` trailers) to native `nspr` stacked pull requests.
     Upgrade(UpgradeArgs),
+    /// Generate shell completion scripts for bash, zsh, fish, elvish, or powershell.
+    Completions(CompletionsArgs),
+}
+
+#[derive(Args)]
+struct CompletionsArgs {
+    /// Shell to generate completions for (`bash`, `zsh`, `fish`, `elvish`, `powershell`).
+    #[arg(value_enum)]
+    shell: clap_complete::Shell,
+
+    /// Generate a standalone static completion script instead of a dynamic hook that invokes `nspr`.
+    #[arg(long)]
+    r#static: bool,
 }
 
 #[derive(Args, Default)]
@@ -91,10 +110,110 @@ fn parse_pr_arg(s: &str) -> std::result::Result<u64, String> {
     })
 }
 
+fn complete_git_remotes() -> Vec<CompletionCandidate> {
+    let Ok(repo) = git2::Repository::discover(".") else {
+        return Vec::new();
+    };
+    let Ok(remotes) = repo.remotes() else {
+        return Vec::new();
+    };
+    (0..remotes.len())
+        .filter_map(|i| remotes.get(i).ok().flatten())
+        .map(|name| {
+            let mut candidate = CompletionCandidate::new(name);
+            if let Ok(remote) = repo.find_remote(name)
+                && let Ok(url) = remote.url()
+            {
+                candidate = candidate.help(Some(url.to_string().into()));
+            }
+            candidate
+        })
+        .collect()
+}
+
+fn complete_stack_prs() -> Vec<CompletionCandidate> {
+    let Ok(repo) = git2::Repository::discover(".") else {
+        return Vec::new();
+    };
+    let git = Git::new(repo);
+    let mut seen = std::collections::HashSet::new();
+    let mut candidates = Vec::new();
+
+    let trunk = config::detect_trunk(&git, "origin")
+        .unwrap_or_else(|_| "main".to_string());
+    let trunk_oid = git
+        .resolve_reference(&format!("refs/remotes/origin/{trunk}"))
+        .or_else(|_| git.resolve_reference(&format!("refs/heads/{trunk}")));
+
+    if let Ok(base_oid) = trunk_oid
+        && let Ok(stack) = Stack::discover(&git, base_oid, &trunk)
+    {
+        for layer in &stack.layers {
+            if let Some(number) = layer.pr
+                && seen.insert(number)
+            {
+                candidates.push(
+                    CompletionCandidate::new(number.to_string())
+                        .help(Some(layer.subject().to_string().into())),
+                );
+            }
+        }
+    }
+
+    if let Ok(ref_prs) = nspr::refs::all(&git) {
+        for number in ref_prs {
+            if seen.insert(number) {
+                let mut candidate =
+                    CompletionCandidate::new(number.to_string());
+                if let Ok(oid) =
+                    git.resolve_reference(&nspr::refs::ref_name(number))
+                    && let Ok(msg) = git.message_of(oid)
+                {
+                    let parsed = nspr::trailers::CommitMessage::parse(&msg);
+                    if !parsed.subject.is_empty() {
+                        candidate = candidate.help(Some(parsed.subject.into()));
+                    }
+                }
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn write_completions(
+    args: &CompletionsArgs,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    if args.r#static {
+        let mut cmd = Cli::command();
+        clap_complete::generate(args.shell, &mut cmd, "nspr", out);
+        return Ok(());
+    }
+    let shell_name = match args.shell {
+        clap_complete::Shell::Bash => "bash",
+        clap_complete::Shell::Zsh => "zsh",
+        clap_complete::Shell::Fish => "fish",
+        clap_complete::Shell::Elvish => "elvish",
+        clap_complete::Shell::PowerShell => "powershell",
+        _ => bail!("unsupported shell: {}", args.shell),
+    };
+    let shells = clap_complete::env::Shells::builtins();
+    let completer = shells
+        .completer(shell_name)
+        .ok_or_else(|| eyre!("unsupported shell: {shell_name}"))?;
+    completer.write_registration("COMPLETE", "nspr", "nspr", "nspr", out)?;
+    Ok(())
+}
+
 #[derive(Args)]
 struct PatchArgs {
     /// The pull request number to check out (e.g. `123`, `#123`, or URL).
-    #[arg(value_parser = parse_pr_arg)]
+    #[arg(
+        value_parser = parse_pr_arg,
+        add = ArgValueCandidates::new(complete_stack_prs)
+    )]
     number: u64,
 
     /// Name for the local branch. Defaults to `pr/<number>`.
@@ -109,7 +228,10 @@ struct PatchArgs {
 #[derive(Args)]
 struct CloseArgs {
     /// The pull request to close (e.g. `123`, `#123`, or URL).
-    #[arg(value_parser = parse_pr_arg)]
+    #[arg(
+        value_parser = parse_pr_arg,
+        add = ArgValueCandidates::new(complete_stack_prs)
+    )]
     number: u64,
 }
 
@@ -151,11 +273,21 @@ struct DiffArgs {
 #[derive(Args, Default)]
 struct LandArgs {
     /// Specific pull request to land (e.g. `--pr=1234`, `--pr #1234`, or URL).
-    #[arg(long = "pr", value_name = "PR", value_parser = parse_pr_arg)]
+    #[arg(
+        long = "pr",
+        value_name = "PR",
+        value_parser = parse_pr_arg,
+        add = ArgValueCandidates::new(complete_stack_prs)
+    )]
     pr: Option<u64>,
 
     /// Specific pull request number to land (positional alias for `--pr`).
-    #[arg(value_name = "PR", value_parser = parse_pr_arg, conflicts_with = "pr")]
+    #[arg(
+        value_name = "PR",
+        value_parser = parse_pr_arg,
+        conflicts_with = "pr",
+        add = ArgValueCandidates::new(complete_stack_prs)
+    )]
     number: Option<u64>,
 
     /// Land the independent HEAD pull request (`Depends-On: main` / `--cherry-pick`).
@@ -182,8 +314,12 @@ impl LandArgs {
 }
 
 fn main() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
     color_eyre::install()?;
     let cli = Cli::parse();
+    if let Some(Command::Completions(args)) = &cli.command {
+        return write_completions(args, &mut std::io::stdout());
+    }
     let default_filter = if cli.verbose {
         "nspr=debug,warn"
     } else {
@@ -218,6 +354,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::List(args) => session.list(args).await,
         Command::Patch(args) => session.patch(args).await,
         Command::Upgrade(args) => session.upgrade(args).await,
+        Command::Completions(_) => unreachable!("handled in main"),
     }
 }
 
@@ -1539,6 +1676,111 @@ mod tests {
         match cli.command {
             Some(Command::Upgrade(args)) => assert!(args.update_message),
             _ => panic!("expected Upgrade"),
+        }
+    }
+
+    #[test]
+    fn cli_completions_generates_bash_and_zsh_scripts() {
+        for (shell, expected_dynamic, expected_static) in [
+            (
+                clap_complete::Shell::Bash,
+                "_clap_complete_nspr",
+                "complete -F _nspr",
+            ),
+            (
+                clap_complete::Shell::Zsh,
+                "_clap_dynamic_completer_nspr",
+                "#compdef nspr",
+            ),
+        ] {
+            let mut dynamic_out = Vec::new();
+            write_completions(
+                &CompletionsArgs {
+                    shell,
+                    r#static: false,
+                },
+                &mut dynamic_out,
+            )
+            .unwrap();
+            let dynamic_str = String::from_utf8(dynamic_out).unwrap();
+            assert!(
+                dynamic_str.contains(expected_dynamic),
+                "dynamic {shell} script missing `{expected_dynamic}`:\n{dynamic_str}"
+            );
+
+            let mut static_out = Vec::new();
+            write_completions(
+                &CompletionsArgs {
+                    shell,
+                    r#static: true,
+                },
+                &mut static_out,
+            )
+            .unwrap();
+            let static_str = String::from_utf8(static_out).unwrap();
+            assert!(
+                static_str.contains(expected_static),
+                "static {shell} script missing `{expected_static}`:\n{static_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_completion_engine_completes_subcommands_and_flags() {
+        let mut cmd = Cli::command();
+        cmd.build();
+
+        let subcommands = clap_complete::engine::complete(
+            &mut cmd,
+            vec!["nspr".into(), "".into()],
+            1,
+            None,
+        )
+        .unwrap();
+        let sub_names: Vec<String> = subcommands
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        for expected in [
+            "diff",
+            "status",
+            "sync",
+            "land",
+            "amend",
+            "close",
+            "list",
+            "patch",
+            "upgrade",
+            "completions",
+        ] {
+            assert!(
+                sub_names.contains(&expected.to_string()),
+                "expected subcommand `{expected}` in {sub_names:?}"
+            );
+        }
+
+        let diff_flags = clap_complete::engine::complete(
+            &mut cmd,
+            vec!["nspr".into(), "diff".into(), "--".into()],
+            2,
+            None,
+        )
+        .unwrap();
+        let flag_names: Vec<String> = diff_flags
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        for expected in [
+            "--cherry-pick",
+            "--new-stack",
+            "--update-message",
+            "--dry-run",
+            "--draft",
+        ] {
+            assert!(
+                flag_names.contains(&expected.to_string()),
+                "expected flag `{expected}` in {flag_names:?}"
+            );
         }
     }
 }
