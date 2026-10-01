@@ -165,10 +165,13 @@ fn complete_stack_prs() -> Vec<CompletionCandidate> {
             if seen.insert(number) {
                 let mut candidate =
                     CompletionCandidate::new(number.to_string());
-                if let Ok(oid) =
-                    git.resolve_reference(&nspr::refs::ref_name(number))
-                    && let Ok(msg) = git.message_of(oid)
-                {
+                let msg = nspr::refs::get_message(&git, number).or_else(|| {
+                    let oid = git
+                        .resolve_reference(&nspr::refs::ref_name(number))
+                        .ok()?;
+                    git.message_of(oid).ok()
+                });
+                if let Some(msg) = msg {
                     let parsed = nspr::trailers::CommitMessage::parse(&msg);
                     if !parsed.subject.is_empty() {
                         candidate = candidate.help(Some(parsed.subject.into()));

@@ -125,7 +125,7 @@ $ nspr diff -m "Address review feedback on cache TTL"
 ```
 
 * **Code-only updates**: When you only change files in a commit, `nspr` synthesizes a fast-forward commit on `#17`, so **nothing is force-pushed**. Reviewers on `#17` can click *"Changes since your last review"* and see only your fix, while untouched upper layers (`#18`, `#20`) are skipped completely unless a 3-way merge conflict refresh is needed.
-* **Commit message updates**: If you edit a commit's title or body locally (or pull Web UI edits via `nspr amend`), `nspr diff` automatically rewrites the first commit on that PR's branch (replaying any revision commits on top of it) and updates the GitHub PR title and description so the branch's initial commit message always matches the PR message.
+* **Commit message updates**: On repositories configured for squash-only merging with `PR_TITLE` + `PR_BODY` (the default `preserveCommitHistory = true` mode), PR branches start with `[nspr] initial commit`, so editing a commit's title or body locally (or pulling Web UI edits via `nspr amend`) updates the GitHub PR title and description via the API **without rewriting or force-pushing any git branches**. (When `preserveCommitHistory = false`, `nspr diff` rewrites the single commit on that PR's branch to carry the updated commit message.)
 
 ### 4. Land Pull Requests (`nspr land`)
 

@@ -299,6 +299,13 @@ pub async fn land_layer(
     let mut push_specs: Vec<PushSpec> = Vec::with_capacity(dependents.len());
     let mut ref_updates: Vec<(u64, Oid, Option<Oid>)> =
         Vec::with_capacity(dependents.len());
+    let preserve_commit_history = if dependents.is_empty() {
+        true
+    } else {
+        config
+            .preserve_commit_history
+            .resolve(forge.repo_merge_settings().await?)
+    };
 
     for d in &dependents {
         let Dep::Layer(dep) = stack.layers[d.layer].dep else {
@@ -315,7 +322,10 @@ pub async fn land_layer(
             continue;
         }
 
-        let clean_msg = stack.layers[d.layer].message.clean_for_branch();
+        let clean_msg = crate::engine::branch_initial_message(
+            preserve_commit_history,
+            &stack.layers[d.layer].message,
+        );
         let revisions = branch_revisions(git, d.tip, old_root)?;
         let (new_tip, collapsed) = match replay(
             git,
@@ -1070,6 +1080,9 @@ async fn repair_remaining_dependents(
     let mut repaired = Vec::new();
     let mut push_specs: Vec<PushSpec> = Vec::new();
     let mut ref_updates: Vec<(u64, Oid, Option<Oid>)> = Vec::new();
+    let preserve_commit_history = config
+        .preserve_commit_history
+        .resolve(forge.repo_merge_settings().await?);
 
     for d_layer in 0..stack.layers.len() {
         if landed_layers.contains(&d_layer) {
@@ -1126,7 +1139,10 @@ async fn repair_remaining_dependents(
             pr_states.get_mut(&d_layer).unwrap().base = config.trunk.clone();
         }
 
-        let clean_msg = stack.layers[d_layer].message.clean_for_branch();
+        let clean_msg = crate::engine::branch_initial_message(
+            preserve_commit_history,
+            &stack.layers[d_layer].message,
+        );
         let revisions = branch_revisions(git, d_state.tip, old_root)?;
         let d_snap = Dependent {
             layer: d_layer,

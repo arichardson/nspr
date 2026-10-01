@@ -116,8 +116,14 @@ and ask the user to restart their SSH agent rather than retrying.
   * `nspr diff --cherry-pick` (`-c`) only computes trees and updates for `HEAD`,
     so unrelated conflicts or `fixup!` commits lower in the branch do not block it.
 * **Commit message updates**:
-  * If a PR's title/body has **not** been edited on GitHub since the branch was
-    pushed, amending the local commit message and running `nspr diff`
+  * In `preserveCommitHistory` mode (the default on squash-only repos like
+    `llvm/llvm-project`), PR branches use `[nspr] initial commit` as their root
+    commit message and track the last-synced message in `refs/nspr/msg/<N>`.
+    Amending a commit message locally (or pulling edits via `nspr amend`)
+    updates the PR title/body via the GitHub API (`update message` badge) with
+    **zero git pushes or force-pushes**.
+  * If a PR's title/body has **not** been edited on GitHub since the message was
+    last synced, amending the local commit message and running `nspr diff`
     automatically updates the PR title/body on GitHub (`update message` badge).
   * If the PR title/body **was** edited on GitHub, `nspr status` shows
     `message differs` and `nspr diff` preserves the GitHub edits unless you pass

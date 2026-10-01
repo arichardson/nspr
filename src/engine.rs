@@ -25,8 +25,26 @@ use crate::review_diff::displayed_patch_id;
 use crate::stack::{Dep, Stack, Trees};
 use crate::trailers::{CommitMessage, DEPENDS_ON, PULL_REQUEST};
 
+/// Default message for the initial commit on a PR branch when
+/// `preserve_commit_history` is enabled (the repository uses the PR title and
+/// description for squash merges, so commit message edits never require
+/// rewriting or force-pushing the branch).
+pub const INITIAL_COMMIT_MESSAGE: &str = "[nspr] initial commit";
+
 /// Default message for a push that does not change the displayed patch.
 pub const AUTO_UPDATE_MESSAGE: &str = "[nspr] update";
+
+/// Message to place on the initial commit (`c_0`) of a pull request branch.
+pub fn branch_initial_message(
+    preserve_commit_history: bool,
+    msg: &CommitMessage,
+) -> String {
+    if preserve_commit_history {
+        INITIAL_COMMIT_MESSAGE.to_string()
+    } else {
+        msg.clean_for_branch()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SyncOptions {
@@ -552,17 +570,40 @@ pub fn decide(
                 } else {
                     current_anchor[i].unwrap_or(base_tip)
                 };
+                let recorded_msg = crate::refs::get_message(git, pr.number)
+                    .map(|m| CommitMessage::parse(&m));
                 if let Some(first_oid) = first_oid {
                     let current_msg = git.message_of(first_oid)?;
-                    let branch_commit_msg = CommitMessage::parse(&current_msg);
+                    let trimmed_current = current_msg.trim();
+                    let baseline_msg = if let Some(msg) = recorded_msg {
+                        msg
+                    } else if !trimmed_current.starts_with("[nspr]")
+                        && !trimmed_current.starts_with("[spr]")
+                    {
+                        CommitMessage::parse(&current_msg)
+                    } else {
+                        stack.layers[i].message.clone()
+                    };
                     github_message_edited[i] =
-                        pr_was_edited_on_forge(pr, &branch_commit_msg);
+                        pr_was_edited_on_forge(pr, &baseline_msg);
 
-                    let desired_msg =
-                        stack.layers[i].message.clean_for_branch();
-                    if current_msg.trim() != desired_msg.trim() {
-                        message_changed[i] = true;
-                        rewrite_history[i] = true;
+                    if opts.preserve_commit_history {
+                        if pr_message_differs_from(pr, &stack.layers[i].message)
+                        {
+                            message_changed[i] = true;
+                        }
+                    } else {
+                        let desired_msg =
+                            stack.layers[i].message.clean_for_branch();
+                        if trimmed_current != desired_msg.trim() {
+                            message_changed[i] = true;
+                            rewrite_history[i] = true;
+                        } else if pr_message_differs_from(
+                            pr,
+                            &stack.layers[i].message,
+                        ) {
+                            message_changed[i] = true;
+                        }
                     }
                     let local_author = git.author_of(stack.layers[i].commit)?;
                     if git.author_of(first_oid)? != local_author
@@ -576,8 +617,13 @@ pub fn decide(
                         rewrite_history[i] = true;
                     }
                 } else {
+                    let baseline_msg = recorded_msg
+                        .unwrap_or_else(|| stack.layers[i].message.clone());
                     github_message_edited[i] =
-                        pr_was_edited_on_forge(pr, &stack.layers[i].message);
+                        pr_was_edited_on_forge(pr, &baseline_msg);
+                    if pr_message_differs_from(pr, &stack.layers[i].message) {
+                        message_changed[i] = true;
+                    }
                 }
 
                 let shown = displayed_patch_id(
@@ -611,7 +657,6 @@ pub fn decide(
             });
 
         push[i] = patch_changed[i]
-            || message_changed[i]
             || author_changed[i]
             || rewrite_history[i]
             || base_branch_changed
@@ -1125,7 +1170,10 @@ async fn execute(
                 )?
                 .unwrap_or(desired_tree);
 
-                let initial_msg = stack.layers[i].message.clean_for_branch();
+                let initial_msg = branch_initial_message(
+                    opts.preserve_commit_history,
+                    &stack.layers[i].message,
+                );
                 let tip = git.synthesize_initial_commit(
                     parent_tip,
                     desired_tree,
@@ -1276,7 +1324,8 @@ async fn execute(
                     && git.merge_base(parent_tip, pr.head_oid)?
                         == current_pr_base_tip
                     && !decision.patch_changed[i]
-                    && !decision.message_changed[i]
+                    && (!decision.message_changed[i]
+                        || opts.preserve_commit_history)
                     && !decision.author_changed[i];
                 let defer_push_to_stage2 = no_auto_merge_hazard
                     && (already_parked_on_remote
@@ -1330,12 +1379,11 @@ async fn execute(
                         pr.head_oid,
                         old_root_parent,
                     )?;
-                    let clean_msg = stack.layers[i].message.clean_for_branch();
                     match crate::land::replay(
                         git,
                         &revisions,
                         anchor,
-                        &clean_msg,
+                        INITIAL_COMMIT_MESSAGE,
                         Some(layer_commit),
                     )? {
                         Some(t) => t,
@@ -1349,7 +1397,7 @@ async fn execute(
                                 anchor,
                                 desired_tree,
                                 layer_commit,
-                                &clean_msg,
+                                INITIAL_COMMIT_MESSAGE,
                             )?
                         }
                     }
@@ -1522,6 +1570,11 @@ async fn execute(
                 messages[i].set(PULL_REQUEST, &config.pull_request_url(number));
                 stack.layers[i].pr = Some(number);
                 crate::refs::update_root(git, number, tip)?;
+                crate::refs::update_message(
+                    git,
+                    number,
+                    &stack.layers[i].message.clean_for_branch(),
+                )?;
 
                 LayerOutcome {
                     index: i,
@@ -1537,7 +1590,10 @@ async fn execute(
                 let mut action = if !decision.push[i] {
                     LayerAction::Skipped
                 } else if decision.patch_changed[i]
-                    || decision.message_changed[i]
+                    || (decision.message_changed[i]
+                        && (opts.update_message
+                            || !decision.github_message_edited[i]
+                            || !opts.preserve_commit_history))
                     || decision.author_changed[i]
                 {
                     LayerAction::Updated
@@ -1572,6 +1628,11 @@ async fn execute(
                     if pr.body != body {
                         update.body = Some(body);
                     }
+                    crate::refs::update_message(
+                        git,
+                        pr.number,
+                        &stack.layers[i].message.clean_for_branch(),
+                    )?;
                 } else {
                     let body = crate::pr_body::splice_warning(
                         &pr.body,
