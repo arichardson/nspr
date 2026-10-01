@@ -4906,3 +4906,110 @@ fn sync_trunk_recovers_when_previous_squash_merge_left_pr_open() {
     assert_eq!(pr2_after.base, TRUNK);
     w.assert_invariants();
 }
+
+#[test]
+fn existing_pr_without_initial_commit_convention_is_not_rewritten() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one\n\nOriginal body", &[("a.txt", "a1")]);
+    w.add_layer("Layer two\n\nSecond body", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    // Simulate existing PR branches created before the `[nspr] initial commit`
+    // convention: each branch's initial commit carries the full commit message
+    // rather than `[nspr] initial commit`, and `refs/nspr/msg/*` does not exist.
+    let pr1_before = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    let pr2_before = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    let legacy_root1 = w.t.commit(
+        "Layer one\n\nOriginal body",
+        &[("root.txt", "root"), ("a.txt", "a1")],
+        &[w.base_oid],
+    );
+    let legacy_root2 = w.t.commit(
+        "Layer two\n\nSecond body",
+        &[("root.txt", "root"), ("a.txt", "a1"), ("b.txt", "b1")],
+        &[legacy_root1],
+    );
+    block_on(w.forge.push(&[
+        crate::forge::PushSpec::forced(&pr1_before.head, legacy_root1),
+        crate::forge::PushSpec::forced(&pr2_before.head, legacy_root2),
+    ]))
+    .unwrap();
+    refs::update_root(&w.git, prs[0], legacy_root1).unwrap();
+    refs::update(&w.git, prs[0], legacy_root1).unwrap();
+    refs::update_root(&w.git, prs[1], legacy_root2).unwrap();
+    refs::update(&w.git, prs[1], legacy_root2).unwrap();
+    {
+        let repo = w.t.open();
+        if let Ok(mut r) = repo.find_reference(&refs::msg_ref_name(prs[0])) {
+            r.delete().unwrap();
+        }
+        if let Ok(mut r) = repo.find_reference(&refs::msg_ref_name(prs[1])) {
+            r.delete().unwrap();
+        }
+    }
+
+    // Running `nspr diff` when nothing changed must skip both PRs without
+    // pushing or rewriting their initial commits to `[nspr] initial commit`.
+    let pushes_before_noop = w.push_count();
+    let noop_outcomes = w.sync();
+    assert_eq!(noop_outcomes[0].action, LayerAction::Skipped);
+    assert_eq!(noop_outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(w.push_count(), pushes_before_noop);
+
+    // Editing the local commit message of an existing PR must only update the
+    // GitHub PR title/body via API without force-pushing or rewriting the branch.
+    w.layers[0].message.subject = "Layer one (renamed)".into();
+    w.layers[0].message.body = "Updated body".into();
+    w.rebuild();
+
+    let pushes_before_msg_edit = w.push_count();
+    let msg_outcomes = w.sync();
+    assert_eq!(msg_outcomes[0].action, LayerAction::Updated);
+    assert_eq!(msg_outcomes[1].action, LayerAction::Skipped);
+    assert_eq!(
+        w.push_count(),
+        pushes_before_msg_edit,
+        "commit-message-only edit on a legacy PR must not push to git"
+    );
+    let pr1_after_msg = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    assert_eq!(pr1_after_msg.title, "Layer one (renamed)");
+    assert!(pr1_after_msg.body.starts_with("Updated body"));
+    assert_eq!(
+        pr1_after_msg.head_oid, legacy_root1,
+        "legacy PR branch commit must remain untouched"
+    );
+
+    // Amending the code of the legacy PR must fast-forward an `[nspr]` update
+    // commit on top of `legacy_root1` rather than rewriting `legacy_root1`.
+    w.amend_layer(0, &[("a.txt", "a2")]);
+    w.sync();
+    let pr1_after_code = block_on(w.forge.get_pull_request(prs[0])).unwrap();
+    let revisions1 =
+        land::branch_revisions(&w.git, pr1_after_code.head_oid, w.base_oid)
+            .unwrap();
+    assert_eq!(revisions1.len(), 2);
+    assert_eq!(revisions1[0], legacy_root1);
+    assert_eq!(
+        w.git.message_of(revisions1[0]).unwrap().trim(),
+        "Layer one\n\nOriginal body"
+    );
+
+    // Landing PR #1 replays PR #2 onto the new trunk; PR #2's first commit
+    // must keep its existing commit message rather than being rewritten to
+    // `[nspr] initial commit`.
+    let land_outcome = w.land(0);
+    let pr2_after_land = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    let revisions2 = land::branch_revisions(
+        &w.git,
+        pr2_after_land.head_oid,
+        land_outcome.squash,
+    )
+    .unwrap();
+    assert!(!revisions2.is_empty());
+    assert_eq!(
+        w.git.message_of(revisions2[0]).unwrap().trim(),
+        "Layer two\n\nSecond body"
+    );
+    w.assert_invariants();
+}
