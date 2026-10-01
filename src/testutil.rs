@@ -54,16 +54,34 @@ impl TestRepo {
         files: &[(&str, &str)],
         parents: &[Oid],
     ) -> Oid {
+        self.commit_with_author(message, files, parents, None)
+    }
+
+    /// Create a commit with an optional custom author `(name, email)` while
+    /// keeping the repository's default committer signature.
+    pub fn commit_with_author(
+        &self,
+        message: &str,
+        files: &[(&str, &str)],
+        parents: &[Oid],
+        author: Option<(&str, &str)>,
+    ) -> Oid {
         let repo = self.open();
         let tree_oid = self.tree_with(files);
         let tree = repo.find_tree(tree_oid).expect("find tree");
-        let sig = repo.signature().expect("signature");
+        let committer = repo.signature().expect("signature");
+        let author_sig = match author {
+            Some((name, email)) => {
+                git2::Signature::now(name, email).expect("author signature")
+            }
+            None => committer.clone(),
+        };
         let parent_commits: Vec<_> = parents
             .iter()
             .map(|oid| repo.find_commit(*oid).expect("find parent"))
             .collect();
         let parent_refs: Vec<_> = parent_commits.iter().collect();
-        repo.commit(None, &sig, &sig, message, &tree, &parent_refs)
+        repo.commit(None, &author_sig, &committer, message, &tree, &parent_refs)
             .expect("commit")
     }
 

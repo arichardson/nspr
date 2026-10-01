@@ -175,6 +175,7 @@ pub fn from_parts(
                 }
                 PrState::Open
                     if decision.patch_changed[i]
+                        || decision.author_changed[i]
                         || ((decision.message_changed[i]
                             || message_differs)
                             && (!decision.github_message_edited[i]

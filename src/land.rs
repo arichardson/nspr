@@ -280,21 +280,26 @@ pub async fn land_layer(
 
         let clean_msg = stack.layers[d.layer].message.clean_for_branch();
         let revisions = branch_revisions(git, d.tip, old_root)?;
-        let (new_tip, collapsed) =
-            match replay(git, &revisions, new_root, &clean_msg)? {
-                Some(tip) => (tip, false),
-                None => (
-                    collapse(
-                        git,
-                        d,
-                        old_root,
-                        new_root,
-                        &clean_msg,
-                        &mut warnings,
-                    )?,
-                    true,
-                ),
-            };
+        let (new_tip, collapsed) = match replay(
+            git,
+            &revisions,
+            new_root,
+            &clean_msg,
+            Some(stack.layers[d.layer].commit),
+        )? {
+            Some(tip) => (tip, false),
+            None => (
+                collapse(
+                    git,
+                    d,
+                    old_root,
+                    new_root,
+                    &clean_msg,
+                    &mut warnings,
+                )?,
+                true,
+            ),
+        };
 
         // The justification for force-pushing: the reviewer sees the same
         // patch afterwards.
@@ -919,16 +924,21 @@ async fn repair_remaining_dependents(
             base: d_state.base.clone(),
             tip: d_state.tip,
         };
-        let (new_tip, collapsed) =
-            match replay(git, &revisions, new_root, &clean_msg)? {
-                Some(tip) => (tip, false),
-                None => (
-                    collapse(
-                        git, &d_snap, old_root, new_root, &clean_msg, warnings,
-                    )?,
-                    true,
-                ),
-            };
+        let (new_tip, collapsed) = match replay(
+            git,
+            &revisions,
+            new_root,
+            &clean_msg,
+            Some(stack.layers[d_layer].commit),
+        )? {
+            Some(tip) => (tip, false),
+            None => (
+                collapse(
+                    git, &d_snap, old_root, new_root, &clean_msg, warnings,
+                )?,
+                true,
+            ),
+        };
 
         let before = displayed_patch_id(git.repo(), old_root, d_state.tip)?;
         let after = displayed_patch_id(git.repo(), new_root, new_tip)?;
@@ -1265,8 +1275,13 @@ pub(crate) fn replay(
     revisions: &[Oid],
     onto: Oid,
     initial_message: &str,
+    attribution_commit: Option<Oid>,
 ) -> Result<Option<Oid>> {
     let repo = git.repo();
+    let override_author = match attribution_commit {
+        Some(attr_oid) => Some(repo.find_commit(attr_oid)?),
+        None => None,
+    };
     let mut tip = onto;
     let mut first = true;
 
@@ -1294,9 +1309,21 @@ pub(crate) fn replay(
             String::from_utf8_lossy(commit.message_bytes()).into_owned()
         };
 
+        let old_author = commit.author();
+        let author = match &override_author {
+            Some(attr)
+                if old_author.name_bytes() != attr.author().name_bytes()
+                    || old_author.email_bytes()
+                        != attr.author().email_bytes() =>
+            {
+                attr.author()
+            }
+            _ => old_author,
+        };
+
         tip = repo.commit(
             None,
-            &commit.author(),
+            &author,
             &commit.committer(),
             &msg,
             &repo.find_tree(tree_oid)?,

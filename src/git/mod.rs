@@ -93,6 +93,15 @@ impl Git {
         Ok(String::from_utf8_lossy(commit.message_bytes()).into_owned())
     }
 
+    pub fn author_of(&self, oid: Oid) -> Result<(String, String)> {
+        let commit = self.repo.find_commit(oid)?;
+        let author = commit.author();
+        Ok((
+            String::from_utf8_lossy(author.name_bytes()).into_owned(),
+            String::from_utf8_lossy(author.email_bytes()).into_owned(),
+        ))
+    }
+
     pub fn short_id(&self, oid: Oid) -> Result<String> {
         let commit = self.repo.find_commit(oid)?;
         Ok(commit
