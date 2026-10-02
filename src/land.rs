@@ -128,16 +128,23 @@ pub async fn land_layer(
     )?;
 
     let layer = &stack.layers[index];
-    if let Dep::Layer(parent_idx) = layer.dep {
-        let parent = &stack.layers[parent_idx];
-        let parent_desc = match parent.pr {
-            Some(n) => format!("#{n} (`{}`)", parent.subject()),
-            None => format!("`{}`", parent.subject()),
-        };
+    let layer_deps = layer.layer_deps();
+    if !layer_deps.is_empty() {
+        let parent_descs: Vec<String> = layer_deps
+            .iter()
+            .map(|&parent_idx| {
+                let parent = &stack.layers[parent_idx];
+                match parent.pr {
+                    Some(n) => format!("#{n} (`{}`)", parent.subject()),
+                    None => format!("`{}`", parent.subject()),
+                }
+            })
+            .collect();
+        let parent_desc = parent_descs.join(", ");
         let root_hint = stack
             .layers
             .iter()
-            .find(|l| l.dep == Dep::Main)
+            .find(|l| l.is_root_landable())
             .and_then(|l| l.pr)
             .map(|n| {
                 format!(" (e.g. `nspr land --pr={n}` or `nspr land --bottom`)")
@@ -582,11 +589,11 @@ pub async fn land_all(
         {
             continue;
         }
-        let dep_ready = match stack.layers[index].dep {
-            Dep::Main => true,
-            Dep::Layer(dep) => landed_layers.contains(&dep),
-            Dep::ExternalPr(_) => false,
-        };
+        let dep_ready = stack.layers[index].external_pr_deps().is_empty()
+            && stack.layers[index]
+                .layer_deps()
+                .iter()
+                .all(|dep| landed_layers.contains(dep));
         if !dep_ready {
             continue;
         }
@@ -1261,7 +1268,7 @@ pub fn next_landable(stack: &Stack) -> Option<usize> {
     stack
         .layers
         .iter()
-        .position(|l| l.dep == Dep::Main && l.pr.is_some())
+        .position(|l| l.is_root_landable() && l.pr.is_some())
 }
 
 /// Search the first-parent history of `trunk_tip` (stopping at `stop_at` or

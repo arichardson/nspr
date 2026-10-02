@@ -494,14 +494,17 @@ impl Session {
 
         let only_layer = if args.cherry_pick {
             let head_idx = stack.layers.len() - 1;
-            if stack.layers[head_idx].dep != nspr::stack::Dep::Main {
+            if !stack.layers[head_idx].is_root_landable() {
                 if args.dry_run {
                     stack.layers[head_idx]
                         .message
                         .set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
                     stack.layers[head_idx].dep_spec =
                         Some(nspr::stack::DepSpec::Main);
+                    stack.layers[head_idx].dep_specs =
+                        vec![nspr::stack::DepSpec::Main];
                     stack.layers[head_idx].dep = nspr::stack::Dep::Main;
+                    stack.layers[head_idx].deps = vec![nspr::stack::Dep::Main];
                 } else {
                     let mut msg = stack.layers[head_idx].message.clone();
                     msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
@@ -528,16 +531,18 @@ impl Session {
                 .iter()
                 .position(|l| l.pr.is_none())
                 .unwrap_or(stack.layers.len() - 1);
-            if target_idx > 0
-                && stack.layers[target_idx].dep != nspr::stack::Dep::Main
-            {
+            if target_idx > 0 && !stack.layers[target_idx].is_root_landable() {
                 if args.dry_run {
                     stack.layers[target_idx]
                         .message
                         .set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
                     stack.layers[target_idx].dep_spec =
                         Some(nspr::stack::DepSpec::Main);
+                    stack.layers[target_idx].dep_specs =
+                        vec![nspr::stack::DepSpec::Main];
                     stack.layers[target_idx].dep = nspr::stack::Dep::Main;
+                    stack.layers[target_idx].deps =
+                        vec![nspr::stack::Dep::Main];
                 } else {
                     let mut msg = stack.layers[target_idx].message.clone();
                     msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
@@ -864,7 +869,7 @@ impl Session {
     }
 
     async fn refresh_remaining_metadata(&self) -> Result<()> {
-        let Ok(stack) =
+        let Ok(mut stack) =
             Stack::discover(&self.git, self.trunk_oid, &self.config.trunk)
         else {
             return Ok(());
@@ -872,6 +877,12 @@ impl Session {
         if stack.layers.is_empty() {
             return Ok(());
         }
+        let _ = engine::resolve_external_deps(
+            &self.forge,
+            &mut stack,
+            &SyncOptions::default(),
+        )
+        .await;
 
         self.forge.sync_stacks(&stack.pr_chains()).await?;
 
@@ -886,9 +897,27 @@ impl Session {
         let warn_merge_strategy =
             preserve_commit_history && !merge_settings.is_squash_only();
         let prs = engine::gather(&self.forge, &stack).await?;
-        for pr in prs.into_iter().flatten() {
-            let body =
-                nspr::pr_body::splice_warning(&pr.body, warn_merge_strategy);
+        for (i, pr) in prs.into_iter().enumerate() {
+            let Some(pr) = pr else { continue };
+            let multi_deps: Vec<String> =
+                if stack.layers[i].has_multiple_layer_deps() {
+                    stack.layers[i]
+                        .layer_deps()
+                        .into_iter()
+                        .map(|j| match stack.layers[j].pr {
+                            Some(n) => format!("#{n}"),
+                            None => format!("layer {}", j + 1),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            let body = nspr::pr_body::splice_warning_with_deps(
+                &pr.body,
+                warn_merge_strategy,
+                &multi_deps,
+                &self.config.trunk,
+            );
             if pr.body != body {
                 self.forge
                     .update_pull_request(
@@ -1355,7 +1384,7 @@ fn resolve_land_target(
     if args.cherry_pick {
         let head_idx = stack.layers.len() - 1;
         let head = &stack.layers[head_idx];
-        if head.dep != nspr::stack::Dep::Main {
+        if !head.is_root_landable() {
             bail!(
                 "HEAD commit `{}` is stacked on another commit (`Depends-On: {}` is not set).\n\
                  Use `nspr land --bottom` or `nspr land --all` to land from the bottom up, \
@@ -1395,7 +1424,7 @@ fn resolve_land_target(
 
     // If there is only a single open PR across the entire local stack (e.g. an
     // independent PR created via `nspr diff --cherry-pick` surrounded by local
-    // WIP commits without PRs), and that PR is a root (`Dep::Main`), land it!
+    // WIP commits without PRs), and that PR is a landable root, land it!
     let open_prs: Vec<usize> = stack
         .layers
         .iter()
@@ -1405,7 +1434,7 @@ fn resolve_land_target(
         .collect();
     if open_prs.len() == 1 {
         let only_idx = open_prs[0];
-        if stack.layers[only_idx].dep == nspr::stack::Dep::Main {
+        if stack.layers[only_idx].is_root_landable() {
             return Ok(only_idx);
         }
     }
@@ -1417,7 +1446,7 @@ fn resolve_land_target(
         .layers
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.dep == nspr::stack::Dep::Main && l.pr.is_some())
+        .filter(|(_, l)| l.is_root_landable() && l.pr.is_some())
         .map(|(i, _)| i)
         .collect();
     if landable_roots.len() == 1 && landable_roots[0] == stack.layers.len() - 1
@@ -1433,7 +1462,7 @@ fn resolve_land_target(
     let roots: Vec<String> = stack
         .layers
         .iter()
-        .filter(|l| l.dep == nspr::stack::Dep::Main)
+        .filter(|l| l.is_root_landable())
         .map(|l| match l.pr {
             Some(n) => format!("#{n} (`{}`)", l.subject()),
             None => format!("`{}`", l.subject()),
@@ -1442,12 +1471,12 @@ fn resolve_land_target(
     let bottom_pr = stack
         .layers
         .iter()
-        .find(|l| l.dep == nspr::stack::Dep::Main)
+        .find(|l| l.is_root_landable())
         .and_then(|l| l.pr);
     let pr_example = bottom_pr
         .map(|n| format!("--pr={n}"))
         .unwrap_or_else(|| "--pr=<NUMBER>".to_string());
-    let cherry_pick_hint = if head.dep == nspr::stack::Dep::Main {
+    let cherry_pick_hint = if head.is_root_landable() {
         "\n• `nspr land --cherry-pick`  Land the independent HEAD pull request"
     } else {
         ""
@@ -1476,7 +1505,10 @@ mod tests {
             message: CommitMessage::parse(subject),
             pr,
             dep_spec: None,
+            dep_specs: Vec::new(),
             dep,
+            deps: vec![dep],
+            merged_pr_deps: Vec::new(),
         }
     }
 

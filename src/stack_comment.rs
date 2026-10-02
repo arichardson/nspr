@@ -202,14 +202,27 @@ fn render_children(
                 Some(n) => format!("#{n}"),
                 None => "(not submitted)".to_string(),
             };
+            let multi_dep_suffix = if layer.has_multiple_layer_deps() {
+                let labels: Vec<String> = layer
+                    .layer_deps()
+                    .into_iter()
+                    .map(|j| match stack.layers[j].pr {
+                        Some(n) => format!("#{n}"),
+                        None => format!("layer {}", j + 1),
+                    })
+                    .collect();
+                format!(" *(depends on {})*", labels.join(", "))
+            } else {
+                String::new()
+            };
             if i == current {
                 out.push_str(&format!(
-                    "{indent}- ➡️ **{reference} {}**\n",
+                    "{indent}- ➡️ **{reference} {}**{multi_dep_suffix}\n",
                     layer.subject(),
                 ));
             } else {
                 out.push_str(&format!(
-                    "{indent}- {reference} {}\n",
+                    "{indent}- {reference} {}{multi_dep_suffix}\n",
                     layer.subject(),
                 ));
             }
@@ -288,11 +301,19 @@ pub async fn update_for_opts(
 
         let mut candidate_merged_nums: Vec<u64> = Vec::new();
         for &i in &component {
-            if let Dep::ExternalPr(n) = stack.layers[i].dep
-                && !active_prs.contains(&n)
-                && !candidate_merged_nums.contains(&n)
-            {
-                candidate_merged_nums.push(n);
+            for n in stack.layers[i].external_pr_deps() {
+                if !active_prs.contains(&n)
+                    && !candidate_merged_nums.contains(&n)
+                {
+                    candidate_merged_nums.push(n);
+                }
+            }
+            for &n in &stack.layers[i].merged_pr_deps {
+                if !active_prs.contains(&n)
+                    && !candidate_merged_nums.contains(&n)
+                {
+                    candidate_merged_nums.push(n);
+                }
             }
             if let Some(Some(comment)) = existing_comments.get(&i) {
                 for n in extract_stack_pr_numbers(&comment.body) {
@@ -439,7 +460,10 @@ mod tests {
                     message: crate::trailers::CommitMessage::parse("Layer 1\n"),
                     pr: Some(101),
                     dep_spec: None,
+                    dep_specs: Vec::new(),
                     dep: Dep::Main,
+                    deps: vec![Dep::Main],
+                    merged_pr_deps: Vec::new(),
                 },
                 Layer {
                     commit: oid,
@@ -447,7 +471,10 @@ mod tests {
                     message: crate::trailers::CommitMessage::parse("Layer 2\n"),
                     pr: Some(102),
                     dep_spec: None,
+                    dep_specs: Vec::new(),
                     dep: Dep::Layer(0),
+                    deps: vec![Dep::Layer(0)],
+                    merged_pr_deps: Vec::new(),
                 },
             ],
         };
@@ -479,7 +506,10 @@ mod tests {
                     message: crate::trailers::CommitMessage::parse("Layer 1\n"),
                     pr: Some(101),
                     dep_spec: None,
+                    dep_specs: Vec::new(),
                     dep: Dep::Main,
+                    deps: vec![Dep::Main],
+                    merged_pr_deps: Vec::new(),
                 },
                 Layer {
                     commit: oid,
@@ -487,7 +517,10 @@ mod tests {
                     message: crate::trailers::CommitMessage::parse("Layer 2\n"),
                     pr: Some(102),
                     dep_spec: None,
+                    dep_specs: Vec::new(),
                     dep: Dep::Layer(0),
+                    deps: vec![Dep::Layer(0)],
+                    merged_pr_deps: Vec::new(),
                 },
                 Layer {
                     commit: oid,
@@ -497,7 +530,10 @@ mod tests {
                     ),
                     pr: Some(103),
                     dep_spec: None,
+                    dep_specs: Vec::new(),
                     dep: Dep::Layer(0),
+                    deps: vec![Dep::Layer(0)],
+                    merged_pr_deps: Vec::new(),
                 },
             ],
         };
@@ -528,7 +564,10 @@ mod tests {
                     message: crate::trailers::CommitMessage::parse("ToolA 1\n"),
                     pr: Some(101),
                     dep_spec: None,
+                    dep_specs: Vec::new(),
                     dep: Dep::Main,
+                    deps: vec![Dep::Main],
+                    merged_pr_deps: Vec::new(),
                 },
                 Layer {
                     commit: oid,
@@ -536,7 +575,10 @@ mod tests {
                     message: crate::trailers::CommitMessage::parse("ToolA 2\n"),
                     pr: Some(102),
                     dep_spec: None,
+                    dep_specs: Vec::new(),
                     dep: Dep::Layer(0),
+                    deps: vec![Dep::Layer(0)],
+                    merged_pr_deps: Vec::new(),
                 },
                 Layer {
                     commit: oid,
@@ -544,7 +586,10 @@ mod tests {
                     message: crate::trailers::CommitMessage::parse("ToolB 1\n"),
                     pr: Some(201),
                     dep_spec: None,
+                    dep_specs: Vec::new(),
                     dep: Dep::Main,
+                    deps: vec![Dep::Main],
+                    merged_pr_deps: Vec::new(),
                 },
                 Layer {
                     commit: oid,
@@ -552,7 +597,10 @@ mod tests {
                     message: crate::trailers::CommitMessage::parse("ToolB 2\n"),
                     pr: Some(202),
                     dep_spec: None,
+                    dep_specs: Vec::new(),
                     dep: Dep::Layer(2),
+                    deps: vec![Dep::Layer(2)],
+                    merged_pr_deps: Vec::new(),
                 },
             ],
         };

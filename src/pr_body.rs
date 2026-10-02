@@ -11,6 +11,10 @@
 pub const WARNING_BEGIN: &str = "<!-- nspr:warning -->";
 pub const WARNING_END: &str = "<!-- /nspr:warning -->";
 
+pub const MERGE_STRATEGY_NOTE: &str = "\
+> [!WARNING]
+> It is recommended that this PR is merged using `nspr land`. If merging via the GitHub Web UI, please make sure to select **Squash and merge** and use the **PR title and description** as the commit message (rather than the default `[nspr]` branch commits).";
+
 pub const WARNING_BLOCK: &str = "\
 <!-- nspr:warning -->
 ---
@@ -22,14 +26,45 @@ pub const WARNING_BLOCK: &str = "\
 /// Ensure `body` ends with [`WARNING_BLOCK`] when `warn_merge_strategy` is
 /// `true`, or has any existing warning block stripped when `false`.
 pub fn splice_warning(body: &str, warn_merge_strategy: bool) -> String {
+    splice_warning_with_deps(body, warn_merge_strategy, &[], "main")
+}
+
+/// Ensure `body` ends with a `<!-- nspr:warning -->` block containing any
+/// active multi-dependency notice (`multi_deps` has 2+ open dependencies) and/or
+/// the merge strategy disclaimer (`warn_merge_strategy`).
+pub fn splice_warning_with_deps(
+    body: &str,
+    warn_merge_strategy: bool,
+    multi_deps: &[String],
+    trunk: &str,
+) -> String {
     let clean = strip_warning(body);
-    if !warn_merge_strategy {
+    let has_multi_deps = multi_deps.len() >= 2;
+    if !warn_merge_strategy && !has_multi_deps {
         return clean;
     }
+
+    let mut sections = Vec::new();
+    if has_multi_deps {
+        let joined = multi_deps.join(", ");
+        sections.push(format!(
+            "> [!IMPORTANT]\n\
+             > This pull request depends on multiple open pull requests ({joined}) and targets `{trunk}` until all but one dependency have landed. \
+             **Do not merge this pull request yet** — its diff currently includes changes from its unmerged dependencies."
+        ));
+    }
+    if warn_merge_strategy {
+        sections.push(MERGE_STRATEGY_NOTE.to_string());
+    }
+
+    let block = format!(
+        "{WARNING_BEGIN}\n---\n\n{}\n{WARNING_END}",
+        sections.join("\n\n")
+    );
     if clean.is_empty() {
-        WARNING_BLOCK.to_string()
+        block
     } else {
-        format!("{clean}\n\n{WARNING_BLOCK}")
+        format!("{clean}\n\n{block}")
     }
 }
 

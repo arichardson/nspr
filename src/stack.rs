@@ -51,19 +51,110 @@ pub struct Layer {
     pub parent: Oid,
     pub message: CommitMessage,
     pub pr: Option<u64>,
-    /// As written in the commit message, if present.
+    /// As written in the commit message, if present (first entry when multiple
+    /// dependencies are declared).
     pub dep_spec: Option<DepSpec>,
-    /// Resolved dependency. Defaults to the previous layer.
+    /// All `Depends-On:` entries as written in the commit message.
+    pub dep_specs: Vec<DepSpec>,
+    /// Effective single dependency for the GitHub `base` branch. Defaults to
+    /// the previous layer; when 2+ open `Dep::Layer` dependencies exist, this
+    /// is `Dep::Main` until all but one dependency have landed.
     pub dep: Dep,
+    /// All resolved dependencies in declared order.
+    pub deps: Vec<Dep>,
+    /// External pull request numbers verified as merged during `resolve_external_deps`.
+    pub merged_pr_deps: Vec<u64>,
 }
 
 impl Layer {
     pub fn subject(&self) -> &str {
         &self.message.subject
     }
+
+    /// Indices of all layers in `stack.layers` that this layer directly depends on.
+    pub fn layer_deps(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for &d in &self.deps {
+            if let Dep::Layer(j) = d
+                && !out.contains(&j)
+            {
+                out.push(j);
+            }
+        }
+        if out.is_empty()
+            && let Dep::Layer(j) = self.dep
+        {
+            out.push(j);
+        }
+        out
+    }
+
+    /// True when this layer depends on 2 or more open layers in the current stack.
+    ///
+    /// Because GitHub pull requests only have a single `base` branch, a layer
+    /// with multiple open dependencies targets `main` (with a union 3-way merge
+    /// tree) until all but one of its dependencies have landed.
+    pub fn has_multiple_layer_deps(&self) -> bool {
+        self.layer_deps().len() >= 2
+    }
+
+    /// External pull request numbers that this layer declares in `Depends-On:`.
+    pub fn external_pr_deps(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for &d in &self.deps {
+            if let Dep::ExternalPr(n) = d
+                && !out.contains(&n)
+            {
+                out.push(n);
+            }
+        }
+        if out.is_empty()
+            && let Dep::ExternalPr(n) = self.dep
+        {
+            out.push(n);
+        }
+        out
+    }
+
+    /// True if this layer sits directly on the trunk with no unmerged layer
+    /// dependencies, so it can be landed at the bottom of a stack.
+    pub fn is_root_landable(&self) -> bool {
+        self.dep == Dep::Main && self.layer_deps().is_empty()
+    }
+
+    /// Compute the effective single `Dep` (used for the GitHub `base` branch)
+    /// from the resolved `deps` list:
+    /// - If there is exactly 1 `Dep::Layer(j)`, returns `Dep::Layer(j)`.
+    /// - If there are 2+ `Dep::Layer(_)`s, returns `Dep::Main` (since GitHub
+    ///   only supports a single base branch, the PR targets `main` until all
+    ///   but one dependency have landed).
+    /// - If there are no `Dep::Layer(_)`s, returns the first `Dep::ExternalPr(n)`
+    ///   if any, or `Dep::Main`.
+    pub fn compute_effective_dep(deps: &[Dep]) -> Dep {
+        let mut layer_deps = Vec::new();
+        for &d in deps {
+            if let Dep::Layer(j) = d
+                && !layer_deps.contains(&j)
+            {
+                layer_deps.push(j);
+            }
+        }
+        if layer_deps.len() == 1 {
+            return Dep::Layer(layer_deps[0]);
+        }
+        if layer_deps.len() >= 2 {
+            return Dep::Main;
+        }
+        for &d in deps {
+            if let Dep::ExternalPr(n) = d {
+                return Dep::ExternalPr(n);
+            }
+        }
+        Dep::Main
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Stack {
     /// Name of the trunk branch (e.g. `main`).
     pub trunk: String,
@@ -121,6 +212,39 @@ pub fn parse_dep_spec(value: &str, trunk: &str) -> Result<DepSpec> {
     ))
 }
 
+/// Parse one or more `Depends-On:` values separated by commas or whitespace
+/// (e.g. `Depends-On: #102, #103`).
+pub fn parse_dep_specs(value: &str, trunk: &str) -> Result<Vec<DepSpec>> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!(
+            "cannot parse `{DEPENDS_ON}: {value}`; expected `main`, `#123`, a pull \
+             request URL, or a commit hash"
+        );
+    }
+    let mut specs = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Ok(spec) = parse_dep_spec(part, trunk) {
+            specs.push(spec);
+        } else {
+            for token in part.split_whitespace() {
+                specs.push(parse_dep_spec(token, trunk)?);
+            }
+        }
+    }
+    if specs.is_empty() {
+        bail!(
+            "cannot parse `{DEPENDS_ON}: {value}`; expected `main`, `#123`, a pull \
+             request URL, or a commit hash"
+        );
+    }
+    Ok(specs)
+}
+
 /// Extract a pull request number from a `Pull-Request:` trailer value.
 pub fn parse_pr_ref(value: &str) -> Option<u64> {
     let value = value.trim();
@@ -162,17 +286,21 @@ impl Stack {
         for oid in oids {
             let message = CommitMessage::parse(&git.message_of(oid)?);
             let pr = message.get(PULL_REQUEST).and_then(parse_pr_ref);
-            let dep_spec = match message.get(DEPENDS_ON) {
-                Some(v) => Some(parse_dep_spec(v, trunk)?),
-                None => None,
-            };
+            let mut dep_specs = Vec::new();
+            for raw in message.get_all(DEPENDS_ON) {
+                dep_specs.extend(parse_dep_specs(raw, trunk)?);
+            }
+            let dep_spec = dep_specs.first().cloned();
             layers.push(Layer {
                 commit: oid,
                 parent: git.parent_of(oid)?,
                 message,
                 pr,
                 dep_spec,
+                dep_specs,
                 dep: Dep::Main, // placeholder; set by resolve_deps
+                deps: Vec::new(),
+                merged_pr_deps: Vec::new(),
             });
         }
 
@@ -189,7 +317,7 @@ impl Stack {
         Ok(stack)
     }
 
-    /// Resolve every layer's `dep_spec` into a [`Dep`], and validate the graph.
+    /// Resolve every layer's `dep_specs` into `deps` and `dep`, and validate the graph.
     fn resolve_deps(&mut self, git: &Git) -> Result<()> {
         let by_pr: HashMap<u64, usize> = self
             .layers
@@ -200,54 +328,68 @@ impl Stack {
 
         let mut resolved = Vec::with_capacity(self.layers.len());
         for (i, layer) in self.layers.iter().enumerate() {
-            let dep = match &layer.dep_spec {
-                None if i == 0 => Dep::Main,
-                None => Dep::Layer(i - 1),
-                Some(DepSpec::Main) => Dep::Main,
-                Some(DepSpec::Pr(n)) => match by_pr.get(n) {
-                    Some(&j) => Dep::Layer(j),
-                    None => Dep::ExternalPr(*n),
-                },
-                Some(DepSpec::Commit(prefix)) => {
-                    let oid = git
-                        .repo()
-                        .revparse_single(prefix)
-                        .map_err(|_| {
-                            eyre!(
-                                "`{DEPENDS_ON}: {prefix}` does not name a \
-                                 commit in this repository"
-                            )
-                        })?
-                        .id();
-                    match self.layers.iter().position(|l| l.commit == oid) {
-                        Some(j) => Dep::Layer(j),
-                        None => bail!(
-                            "`{DEPENDS_ON}: {prefix}` resolves to {}, which is \
-                             not part of this stack",
-                            git.short_id(oid)?
-                        ),
+            let mut deps = Vec::new();
+            if layer.dep_specs.is_empty() {
+                let d = if i == 0 { Dep::Main } else { Dep::Layer(i - 1) };
+                deps.push(d);
+            } else {
+                for spec in &layer.dep_specs {
+                    let d = match spec {
+                        DepSpec::Main => Dep::Main,
+                        DepSpec::Pr(n) => match by_pr.get(n) {
+                            Some(&j) => Dep::Layer(j),
+                            None => Dep::ExternalPr(*n),
+                        },
+                        DepSpec::Commit(prefix) => {
+                            let oid = git
+                                .repo()
+                                .revparse_single(prefix)
+                                .map_err(|_| {
+                                    eyre!(
+                                        "`{DEPENDS_ON}: {prefix}` does not name a \
+                                         commit in this repository"
+                                    )
+                                })?
+                                .id();
+                            match self
+                                .layers
+                                .iter()
+                                .position(|l| l.commit == oid)
+                            {
+                                Some(j) => Dep::Layer(j),
+                                None => bail!(
+                                    "`{DEPENDS_ON}: {prefix}` resolves to {}, which is \
+                                     not part of this stack",
+                                    git.short_id(oid)?
+                                ),
+                            }
+                        }
+                    };
+                    // Forward references and self-references would make the
+                    // topological order invalid, and cycles impossible to submit.
+                    if let Dep::Layer(j) = d
+                        && j >= i
+                    {
+                        bail!(
+                            "`{}` declares a dependency on `{}`, which comes later in \
+                             the stack. Reorder the commits so dependencies come first.",
+                            self.layers[i].subject(),
+                            self.layers[j].subject(),
+                        );
+                    }
+                    if !deps.contains(&d) {
+                        deps.push(d);
                     }
                 }
-            };
-
-            // Forward references and self-references would make the topological
-            // order invalid, and cycles impossible to submit.
-            if let Dep::Layer(j) = dep
-                && j >= i
-            {
-                bail!(
-                    "`{}` declares a dependency on `{}`, which comes later in \
-                     the stack. Reorder the commits so dependencies come first.",
-                    self.layers[i].subject(),
-                    self.layers[j].subject(),
-                );
             }
 
-            resolved.push(dep);
+            let dep = Layer::compute_effective_dep(&deps);
+            resolved.push((dep, deps));
         }
 
-        for (layer, dep) in self.layers.iter_mut().zip(resolved) {
+        for (layer, (dep, deps)) in self.layers.iter_mut().zip(resolved) {
             layer.dep = dep;
+            layer.deps = deps;
         }
         Ok(())
     }
@@ -272,14 +414,14 @@ impl Stack {
         }
 
         let layer = &self.layers[i];
-        let base_tree = self.base_tree_cached(git, i, cache)?;
+        let merge_base_tree = self.merge_base_tree_cached(git, i, cache)?;
         let local_parent_tree = git.tree_of(layer.parent)?;
         let own_tree = git.tree_of(layer.commit)?;
 
         // Fast path: the declared base already matches the local parent, so the
         // layer's own tree is already correct. This is every layer in a plain
         // linear stack.
-        let tree = if base_tree == local_parent_tree {
+        let tree = if merge_base_tree == local_parent_tree {
             own_tree
         } else {
             log::debug!(
@@ -288,7 +430,7 @@ impl Stack {
                 layer.subject()
             );
             let index =
-                git.merge_trees(local_parent_tree, base_tree, own_tree)?;
+                git.merge_trees(local_parent_tree, merge_base_tree, own_tree)?;
             if index.has_conflicts() {
                 let files: Vec<String> = index
                     .conflicts()?
@@ -316,6 +458,94 @@ impl Stack {
 
         cache.insert(i, tree);
         Ok(tree)
+    }
+
+    /// Compute the combined dependency tree onto which layer `i`'s commit delta
+    /// (`local_parent -> commit`) should be applied.
+    ///
+    /// When layer `i` declares multiple open `Dep::Layer` dependencies, their
+    /// effective trees are 3-way merged over `tree(self.base)` so layer `i`'s
+    /// branch contains the union of all its dependencies' changes plus its own.
+    fn merge_base_tree_cached(
+        &self,
+        git: &Git,
+        i: usize,
+        cache: &mut HashMap<usize, Oid>,
+    ) -> Result<Oid> {
+        let layer_deps = self.layers[i].layer_deps();
+        match layer_deps.as_slice() {
+            [] => git.tree_of(self.base),
+            [j] => self.effective_tree_cached(git, *j, cache),
+            [first, rest @ ..] => {
+                let trunk_tree = git.tree_of(self.base)?;
+                let mut combined =
+                    self.effective_tree_cached(git, *first, cache)?;
+                for &j in rest {
+                    let dep_tree = self.effective_tree_cached(git, j, cache)?;
+                    if dep_tree == combined || dep_tree == trunk_tree {
+                        continue;
+                    }
+                    let index =
+                        git.merge_trees(trunk_tree, combined, dep_tree)?;
+                    if index.has_conflicts() {
+                        let files: Vec<String> = index
+                            .conflicts()?
+                            .filter_map(|c| c.ok())
+                            .filter_map(|c| {
+                                c.our.or(c.their).or(c.ancestor).map(|e| {
+                                    String::from_utf8_lossy(&e.path)
+                                        .into_owned()
+                                })
+                            })
+                            .collect();
+                        bail!(
+                            "declared dependencies of `{}` conflict with each other \
+                             (conflicts in {}).",
+                            self.layers[i].subject(),
+                            if files.is_empty() {
+                                "<unknown>".to_string()
+                            } else {
+                                files.join(", ")
+                            },
+                        );
+                    }
+                    combined = git.write_index(index)?;
+                }
+                Ok(combined)
+            }
+        }
+    }
+
+    /// Compute the combined dependency tree of layer `i` from precomputed
+    /// `effective` trees.
+    pub fn merge_base_tree_from_effective(
+        &self,
+        git: &Git,
+        i: usize,
+        effective: &[Oid],
+    ) -> Result<Oid> {
+        let layer_deps = self.layers[i].layer_deps();
+        match layer_deps.as_slice() {
+            [] => git.tree_of(self.base),
+            [j] => Ok(effective[*j]),
+            [first, rest @ ..] => {
+                let trunk_tree = git.tree_of(self.base)?;
+                let mut combined = effective[*first];
+                for &j in rest {
+                    let dep_tree = effective[j];
+                    if dep_tree == combined || dep_tree == trunk_tree {
+                        continue;
+                    }
+                    let index =
+                        git.merge_trees(trunk_tree, combined, dep_tree)?;
+                    if index.has_conflicts() {
+                        bail!("dependency trees conflict");
+                    }
+                    combined = git.write_index(index)?;
+                }
+                Ok(combined)
+            }
+        }
     }
 
     /// The tree the layer's *base* should have, i.e. the effective tree of
@@ -367,7 +597,7 @@ impl Stack {
             if Self::is_layer_selected(i, only_layer, only_layers) || needed[i]
             {
                 needed[i] = true;
-                if let Dep::Layer(j) = self.layers[i].dep {
+                for j in self.layers[i].layer_deps() {
                     needed[j] = true;
                 }
             }
@@ -537,7 +767,7 @@ impl Stack {
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
-            if let Dep::Layer(j) = layer.dep {
+            for j in layer.layer_deps() {
                 let (a, b) = (find(&mut parent, i), find(&mut parent, j));
                 parent[a] = b;
             }
@@ -573,6 +803,12 @@ impl Stack {
         let Some(&first) = component.first() else {
             return true;
         };
+        if component
+            .iter()
+            .any(|&i| self.layers[i].has_multiple_layer_deps())
+        {
+            return false;
+        }
         if !matches!(self.layers[first].dep, Dep::Main | Dep::ExternalPr(_)) {
             return false;
         }
@@ -607,11 +843,11 @@ impl Stack {
             if self.layers[i].pr.is_none() {
                 continue;
             }
-            if let Dep::Layer(j) = layer.dep
-                && self.layers[j].pr.is_some()
-            {
-                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
-                parent[a] = b;
+            for j in layer.layer_deps() {
+                if self.layers[j].pr.is_some() {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                    parent[a] = b;
+                }
             }
         }
 
@@ -637,7 +873,9 @@ impl Stack {
     /// other layers depending on it. An independent root (`Dep::Main`) with
     /// no dependents is standalone (`false`).
     pub fn is_layer_stacked(&self, i: usize) -> bool {
-        self.layers[i].dep != Dep::Main || !self.dependents_of(i).is_empty()
+        self.layers[i].dep != Dep::Main
+            || !self.layers[i].layer_deps().is_empty()
+            || self.layers.iter().any(|l| l.layer_deps().contains(&i))
     }
 
     /// True if the stack has no branches: the bottom layer sits on the trunk
@@ -671,6 +909,66 @@ impl Stack {
 
         for (i, layer) in self.layers.iter().enumerate() {
             if removed.contains(&i) {
+                continue;
+            }
+
+            if layer.dep_specs.len() >= 2 {
+                let mut any_entry_needs_rewrite = false;
+                let mut new_entries: Vec<String> = Vec::new();
+                for (spec, &dep) in layer.dep_specs.iter().zip(&layer.deps) {
+                    let dep_was_removed =
+                        matches!(dep, Dep::Layer(p) if removed.contains(&p));
+                    let entry_needs_rewrite = match spec {
+                        DepSpec::Commit(_) => dep_was_removed,
+                        DepSpec::Pr(_) => {
+                            rewrite_explicit_pr_refs && dep_was_removed
+                        }
+                        DepSpec::Main => false,
+                    };
+                    if entry_needs_rewrite {
+                        any_entry_needs_rewrite = true;
+                        let mut inherited = dep;
+                        while let Dep::Layer(p) = inherited {
+                            if removed.contains(&p) {
+                                inherited = self.layers[p].dep;
+                            } else {
+                                break;
+                            }
+                        }
+                        let s = match inherited {
+                            Dep::Main => continue,
+                            Dep::ExternalPr(n) => format!("#{n}"),
+                            Dep::Layer(p) => match self.layers[p].pr {
+                                Some(n) => format!("#{n}"),
+                                None => git.short_id(self.layers[p].commit)?,
+                            },
+                        };
+                        if !new_entries.contains(&s) {
+                            new_entries.push(s);
+                        }
+                    } else {
+                        let s = match spec {
+                            DepSpec::Main => self.trunk.clone(),
+                            DepSpec::Pr(n) => format!("#{n}"),
+                            DepSpec::Commit(c) => c.clone(),
+                        };
+                        if !new_entries.contains(&s) {
+                            new_entries.push(s);
+                        }
+                    }
+                }
+                if any_entry_needs_rewrite {
+                    let spec_str = if new_entries.is_empty() {
+                        self.trunk.clone()
+                    } else {
+                        new_entries.join(", ")
+                    };
+                    if messages[i].get(DEPENDS_ON) != Some(spec_str.as_str()) {
+                        messages[i].set(DEPENDS_ON, &spec_str);
+                        any_rewritten = true;
+                    }
+                }
+                prev_survivor = Some(i);
                 continue;
             }
 
@@ -779,6 +1077,18 @@ mod tests {
             DepSpec::Commit("a1b2c3d".into())
         );
         assert!(parse_dep_spec("not a ref", "main").is_err());
+    }
+
+    #[test]
+    fn parse_dep_specs_multiple() {
+        assert_eq!(
+            parse_dep_specs("#101, #102", "main").unwrap(),
+            vec![DepSpec::Pr(101), DepSpec::Pr(102)]
+        );
+        assert_eq!(
+            parse_dep_specs("#101 #102", "main").unwrap(),
+            vec![DepSpec::Pr(101), DepSpec::Pr(102)]
+        );
     }
 
     #[test]
