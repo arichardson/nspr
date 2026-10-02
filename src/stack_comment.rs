@@ -20,13 +20,45 @@
 use color_eyre::eyre::Result;
 
 use crate::config::Config;
-use crate::forge::Forge;
+use crate::forge::{Forge, PrState};
 use crate::stack::{Dep, Stack};
 
 pub const BEGIN: &str = "<!-- nspr:stack -->";
 pub const END: &str = "<!-- /nspr:stack -->";
 const LEGACY_SPR_MARKER: &str = "<!-- spr-dependencies -->";
 const LEGACY_SPR_END: &str = "<!-- spr-dependencies-list-end -->";
+
+/// A dependency pull request that has already been merged into the trunk and is
+/// no longer present in the local commit stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedPr {
+    pub number: u64,
+    pub title: String,
+}
+
+/// Extract pull request numbers from the generated `<!-- nspr:stack -->` block
+/// of an existing comment, in top-to-bottom order.
+pub fn extract_stack_pr_numbers(body: &str) -> Vec<u64> {
+    let block = if let Some(start) = body.find(BEGIN)
+        && let Some(end) = body[start..].find(END)
+    {
+        &body[start + BEGIN.len()..start + end]
+    } else {
+        return Vec::new();
+    };
+
+    let mut nums = Vec::new();
+    let re = lazy_regex::regex!(r"^\s*-\s*(?:➡️\s*\*\*)?#(\d+)\b");
+    for line in block.lines() {
+        if let Some(caps) = re.captures(line)
+            && let Ok(n) = caps[1].parse::<u64>()
+            && !nums.contains(&n)
+        {
+            nums.push(n);
+        }
+    }
+    nums
+}
 
 /// Replace the generated block in `body`, or append one if there is none.
 ///
@@ -88,11 +120,25 @@ pub fn strip(body: &str) -> String {
 /// that merely happen to be adjacent in the local commit order must not look
 /// like they depend on each other.
 pub fn render(config: &Config, stack: &Stack, current: usize) -> String {
+    render_with_merged(config, stack, current, &[])
+}
+
+/// Render the stack seen from layer `current`, including any already-merged
+/// dependencies (`merged_deps`) that are no longer in the local commit history.
+pub fn render_with_merged(
+    config: &Config,
+    stack: &Stack,
+    current: usize,
+    merged_deps: &[MergedPr],
+) -> String {
     let mut out = String::from("#### Stack\n\n");
     out.push_str(&format!("- `{}`\n", config.trunk));
 
     let component = stack.component_of(current);
     if stack.is_component_linear(&component) {
+        for m in merged_deps {
+            out.push_str(&format!("- #{} {} *(merged)*\n", m.number, m.title));
+        }
         for &i in &component {
             let layer = &stack.layers[i];
             let reference = match layer.pr {
@@ -109,6 +155,12 @@ pub fn render(config: &Config, stack: &Stack, current: usize) -> String {
             }
         }
     } else {
+        for m in merged_deps {
+            out.push_str(&format!(
+                "  - #{} {} *(merged)*\n",
+                m.number, m.title
+            ));
+        }
         // Group children by parent layer within this connected component so DFS
         // traversal keeps branches intact without leaking independent stacks.
         let mut children_map: std::collections::HashMap<
@@ -205,21 +257,15 @@ pub async fn update_for_opts(
     stack: &Stack,
     opts: &crate::engine::SyncOptions,
 ) -> Result<usize> {
-    // A pull request on its own is not a stack; the table would be noise.
-    let stacked: std::collections::HashSet<usize> = stack
-        .pr_components()
-        .into_iter()
-        .filter(|component| component.len() >= 2)
-        .flatten()
-        .collect();
+    let active_prs: std::collections::HashSet<u64> =
+        stack.layers.iter().filter_map(|l| l.pr).collect();
 
-    let mut updated = 0;
+    let mut existing_comments: std::collections::HashMap<
+        usize,
+        Option<crate::forge::Comment>,
+    > = std::collections::HashMap::new();
     for (i, layer) in stack.layers.iter().enumerate() {
-        if !opts.is_layer_selected(i) {
-            continue;
-        }
         let Some(number) = layer.pr else { continue };
-
         let existing =
             forge
                 .list_own_comments(number)
@@ -228,33 +274,103 @@ pub async fn update_for_opts(
                 .find(|c| {
                     c.body.contains(BEGIN) || c.body.contains(LEGACY_SPR_MARKER)
                 });
+        existing_comments.insert(i, existing);
+    }
 
-        if !stacked.contains(&i) {
-            let Some(comment) = existing else { continue };
-            // Anything a human wrote around the table is worth keeping, so the
-            // comment only goes away entirely when the table was all of it.
-            let body = strip(&comment.body);
-            if body.is_empty() {
-                forge.delete_comment(comment.id).await?;
-            } else {
-                forge.update_comment(comment.id, &body).await?;
-            }
-            updated += 1;
+    let mut merged_cache: std::collections::HashMap<u64, Option<MergedPr>> =
+        std::collections::HashMap::new();
+
+    let mut updated = 0;
+    for component in stack.components() {
+        if !component.iter().any(|&i| opts.is_layer_selected(i)) {
             continue;
         }
 
-        let block = render(config, stack, i);
-        match existing {
-            Some(comment) => {
-                let body = splice(&comment.body, &block);
-                if body != comment.body {
-                    forge.update_comment(comment.id, &body).await?;
-                    updated += 1;
+        let mut candidate_merged_nums: Vec<u64> = Vec::new();
+        for &i in &component {
+            if let Dep::ExternalPr(n) = stack.layers[i].dep
+                && !active_prs.contains(&n)
+                && !candidate_merged_nums.contains(&n)
+            {
+                candidate_merged_nums.push(n);
+            }
+            if let Some(Some(comment)) = existing_comments.get(&i) {
+                for n in extract_stack_pr_numbers(&comment.body) {
+                    if !active_prs.contains(&n)
+                        && !candidate_merged_nums.contains(&n)
+                    {
+                        candidate_merged_nums.push(n);
+                    }
                 }
             }
-            None => {
-                forge.create_comment(number, &splice("", &block)).await?;
+        }
+
+        let mut merged_deps: Vec<MergedPr> = Vec::new();
+        for n in candidate_merged_nums {
+            let entry = match merged_cache.get(&n) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fetched = match forge.get_pull_request(n).await {
+                        Ok(pr) if pr.state == PrState::Merged => {
+                            Some(MergedPr {
+                                number: pr.number,
+                                title: pr.title,
+                            })
+                        }
+                        _ => None,
+                    };
+                    merged_cache.insert(n, fetched.clone());
+                    fetched
+                }
+            };
+            if let Some(m) = entry {
+                merged_deps.push(m);
+            }
+        }
+
+        let open_prs_in_comp = component
+            .iter()
+            .filter(|&&i| stack.layers[i].pr.is_some())
+            .count();
+        let is_stacked = open_prs_in_comp + merged_deps.len() >= 2;
+
+        for &i in &component {
+            if !opts.is_layer_selected(i) {
+                continue;
+            }
+            let Some(number) = stack.layers[i].pr else {
+                continue;
+            };
+            let existing = existing_comments.remove(&i).flatten();
+
+            if !is_stacked {
+                let Some(comment) = existing else { continue };
+                // Anything a human wrote around the table is worth keeping, so
+                // the comment only goes away entirely when the table was all of
+                // it.
+                let body = strip(&comment.body);
+                if body.is_empty() {
+                    forge.delete_comment(comment.id).await?;
+                } else {
+                    forge.update_comment(comment.id, &body).await?;
+                }
                 updated += 1;
+                continue;
+            }
+
+            let block = render_with_merged(config, stack, i, &merged_deps);
+            match existing {
+                Some(comment) => {
+                    let body = splice(&comment.body, &block);
+                    if body != comment.body {
+                        forge.update_comment(comment.id, &body).await?;
+                        updated += 1;
+                    }
+                }
+                None => {
+                    forge.create_comment(number, &splice("", &block)).await?;
+                    updated += 1;
+                }
             }
         }
     }

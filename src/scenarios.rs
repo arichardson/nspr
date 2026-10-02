@@ -5014,3 +5014,58 @@ fn existing_pr_without_initial_commit_convention_is_not_rewritten() {
     );
     w.assert_invariants();
 }
+
+#[test]
+fn stack_comment_retains_merged_dependencies_after_land() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.add_layer("Layer three", &[("c.txt", "c1")]);
+    w.sync();
+    w.update_stack_comments();
+    let prs = w.pr_numbers();
+
+    // Land PR #1 (`prs[0]`) so it is merged and removed from local history.
+    w.land(0);
+    w.update_stack_comments();
+
+    let comment2 = w
+        .comment_on(prs[1])
+        .expect("stack comment must remain on PR #2")
+        .body;
+    assert!(
+        comment2.contains(&format!("#{} Layer one *(merged)*", prs[0])),
+        "merged PR #1 must remain in PR #2's stack comment:\n{comment2}"
+    );
+    assert!(
+        comment2.contains(&format!("**#{} Layer two**", prs[1])),
+        "{comment2}"
+    );
+    assert!(
+        comment2.contains(&format!("#{} Layer three", prs[2])),
+        "{comment2}"
+    );
+
+    // Land PR #2 (`prs[1]`) so only PR #3 (`prs[2]`) remains open in local history.
+    w.land(0);
+    w.update_stack_comments();
+
+    let comment3 = w
+        .comment_on(prs[2])
+        .expect(
+            "stack comment must not be deleted when merged dependencies exist",
+        )
+        .body;
+    assert!(
+        comment3.contains(&format!("#{} Layer one *(merged)*", prs[0])),
+        "merged PR #1 must remain in PR #3's stack comment:\n{comment3}"
+    );
+    assert!(
+        comment3.contains(&format!("#{} Layer two *(merged)*", prs[1])),
+        "merged PR #2 must remain in PR #3's stack comment:\n{comment3}"
+    );
+    assert!(
+        comment3.contains(&format!("**#{} Layer three**", prs[2])),
+        "{comment3}"
+    );
+}
