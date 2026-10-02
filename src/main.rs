@@ -240,6 +240,23 @@ struct CloseArgs {
 
 #[derive(Args, Default)]
 struct DiffArgs {
+    /// Specific pull request or commit to create or update (e.g. `--pr=1234`, `#1234`, URL, or `HEAD~1`).
+    #[arg(
+        long = "pr",
+        value_name = "PR_OR_COMMIT",
+        conflicts_with_all = ["all", "cherry_pick", "new_stack"],
+        add = ArgValueCandidates::new(complete_stack_prs)
+    )]
+    pr: Option<String>,
+
+    /// Specific pull request or commit to create or update (positional alias for `--pr`).
+    #[arg(
+        value_name = "PR_OR_COMMIT",
+        conflicts_with_all = ["pr", "all", "cherry_pick", "new_stack"],
+        add = ArgValueCandidates::new(complete_stack_prs)
+    )]
+    target: Option<String>,
+
     /// Push all stacks on the branch, not just the current stack.
     #[arg(short, long)]
     all: bool,
@@ -271,6 +288,35 @@ struct DiffArgs {
     /// Never prompt; use the default update message.
     #[arg(long)]
     no_prompt: bool,
+}
+
+impl DiffArgs {
+    fn target_spec(&self) -> Option<&str> {
+        self.pr.as_deref().or(self.target.as_deref())
+    }
+}
+
+fn resolve_diff_target(git: &Git, stack: &Stack, spec: &str) -> Result<usize> {
+    let spec = spec.trim();
+    if let Some(pr_num) = nspr::stack::parse_pr_ref(spec)
+        && let Some(idx) =
+            stack.layers.iter().position(|l| l.pr == Some(pr_num))
+    {
+        return Ok(idx);
+    }
+    if let Ok(obj) = git.repo().revparse_single(spec)
+        && let Ok(commit) = obj.peel_to_commit()
+        && let Some(idx) =
+            stack.layers.iter().position(|l| l.commit == commit.id())
+    {
+        return Ok(idx);
+    }
+    if let Some(pr_num) = nspr::stack::parse_pr_ref(spec) {
+        bail!("pull request #{pr_num} is not in the current stack");
+    }
+    bail!(
+        "`{spec}` does not match any pull request or commit in the current stack"
+    )
 }
 
 #[derive(Args, Default)]
@@ -512,13 +558,15 @@ impl Session {
                 }
             }
             None
+        } else if let Some(spec) = args.target_spec() {
+            Some(resolve_diff_target(&self.git, &stack, spec)?)
         } else {
             None
         };
 
         let components = stack.components();
         let only_layers = if !args.all
-            && !args.cherry_pick
+            && only_layer.is_none()
             && components.len() > 1
         {
             let head_idx = stack.layers.len() - 1;
@@ -1661,6 +1709,34 @@ mod tests {
             Some(Command::Diff(args)) => {
                 assert!(args.dry_run);
                 assert!(args.all);
+            }
+            _ => panic!("expected Diff"),
+        }
+    }
+
+    #[test]
+    fn cli_diff_accepts_pr_and_positional_target() {
+        let cli = Cli::try_parse_from(["nspr", "diff", "227865"]).unwrap();
+        match cli.command {
+            Some(Command::Diff(args)) => {
+                assert_eq!(args.target_spec(), Some("227865"));
+            }
+            _ => panic!("expected Diff"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["nspr", "diff", "--pr", "#227562"]).unwrap();
+        match cli.command {
+            Some(Command::Diff(args)) => {
+                assert_eq!(args.target_spec(), Some("#227562"));
+            }
+            _ => panic!("expected Diff"),
+        }
+
+        let cli = Cli::try_parse_from(["nspr", "diff", "HEAD~1"]).unwrap();
+        match cli.command {
+            Some(Command::Diff(args)) => {
+                assert_eq!(args.target_spec(), Some("HEAD~1"));
             }
             _ => panic!("expected Diff"),
         }
