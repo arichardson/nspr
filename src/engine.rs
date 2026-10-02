@@ -1553,7 +1553,7 @@ async fn execute(
     let mut retargeted_descriptions: Vec<String> = Vec::new();
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
-        if !opts.is_layer_selected(i) {
+        if !opts.is_layer_selected(i) && !decision.push[i] {
             continue;
         }
         let base_branch = base_branches[i].clone();
