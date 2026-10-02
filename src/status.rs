@@ -71,6 +71,10 @@ pub struct LayerStatus {
     pub landable: bool,
     /// The layer this one is stacked on, if any.
     pub dep: Dep,
+    /// All layer indices this layer directly depends on.
+    pub layer_deps: Vec<usize>,
+    /// Short human-readable labels for `layer_deps` (e.g. `["#102", "#103"]`).
+    pub dep_labels: Vec<String>,
     pub checks: Option<CheckCounts>,
     pub reviews: ReviewSummary,
 }
@@ -87,8 +91,15 @@ pub async fn status(
     config: &Config,
     stack: &Stack,
 ) -> Result<StackStatus> {
+    let mut stack = stack.clone();
+    let _ = engine::resolve_external_deps(
+        forge,
+        &mut stack,
+        &SyncOptions::default(),
+    )
+    .await;
     let trees = stack.all_trees_lenient(git)?;
-    let prs = engine::gather(forge, stack).await?;
+    let prs = engine::gather(forge, &stack).await?;
     let preserve_commit_history = match config.preserve_commit_history {
         crate::config::PreserveCommitHistory::Auto => config
             .preserve_commit_history
@@ -100,8 +111,8 @@ pub async fn status(
         preserve_commit_history,
         ..Default::default()
     };
-    let decision = engine::decide(git, stack, &prs, &trees, &opts)?;
-    from_parts(git, config, stack, &prs, &decision, false)
+    let decision = engine::decide(git, &stack, &prs, &trees, &opts)?;
+    from_parts(git, config, &stack, &prs, &decision, false)
 }
 
 pub async fn status_for(
@@ -188,6 +199,15 @@ pub fn from_parts(
             },
         };
 
+        let layer_deps = layer.layer_deps();
+        let dep_labels: Vec<String> = layer_deps
+            .iter()
+            .map(|&j| match stack.layers[j].pr {
+                Some(n) => format!("#{n}"),
+                None => format!("layer {}", j + 1),
+            })
+            .collect();
+
         layers.push(LayerStatus {
             index: i,
             subject: layer.subject().to_string(),
@@ -208,8 +228,10 @@ pub fn from_parts(
                 .is_some_and(|p| p.merge_state == MergeState::Behind),
             message_differs,
             github_message_edited: decision.github_message_edited[i],
-            landable: layer.dep == Dep::Main && layer.pr.is_some(),
+            landable: layer.is_root_landable() && layer.pr.is_some(),
             dep: layer.dep,
+            layer_deps,
+            dep_labels,
             checks: prs[i].as_ref().and_then(|p| p.checks.clone()),
             reviews: prs[i]
                 .as_ref()
@@ -374,7 +396,11 @@ impl StackStatus {
             .collect();
 
         for (pos, layer) in self.layers.iter().enumerate() {
-            if let Dep::Layer(j) = layer.dep
+            let visual_dep = match layer.dep {
+                Dep::Layer(j) => Some(j),
+                _ => layer.layer_deps.iter().copied().max(),
+            };
+            if let Some(j) = visual_dep
                 && let Some(&parent_pos) = by_index.get(&j)
             {
                 let (a, b) =
@@ -657,6 +683,33 @@ impl StackStatus {
                         ),
                         None => style(&plain).magenta().to_string(),
                     };
+                    push_badge(plain, styled);
+                } else if layer.dep_labels.len() >= 2 {
+                    let prefix = "depends on ";
+                    let plain =
+                        format!("{prefix}{}", layer.dep_labels.join(", "));
+                    let styled_parts: Vec<String> = layer
+                        .dep_labels
+                        .iter()
+                        .map(|label| {
+                            let url = label
+                                .strip_prefix('#')
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .and_then(|n| self.url_for_pr(n));
+                            match url {
+                                Some(u) => crate::utils::osc8_link(
+                                    &u,
+                                    style(label).blue(),
+                                ),
+                                None => style(label).blue().to_string(),
+                            }
+                        })
+                        .collect();
+                    let styled = format!(
+                        "{}{}",
+                        style(prefix).blue(),
+                        styled_parts.join(&style(", ").blue().to_string()),
+                    );
                     push_badge(plain, styled);
                 } else if non_adjacent_in_comp {
                     let prefix = "base: ";
@@ -1004,6 +1057,8 @@ mod tests {
                     github_message_edited: false,
                     landable: true,
                     dep: Dep::Main,
+                    layer_deps: Vec::new(),
+                    dep_labels: Vec::new(),
                     checks: None,
                     reviews: ReviewSummary::default(),
                 },
@@ -1025,6 +1080,8 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(0),
+                    layer_deps: vec![0],
+                    dep_labels: vec!["#225126".into()],
                     checks: None,
                     reviews: ReviewSummary::default(),
                 },
@@ -1046,6 +1103,8 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(1),
+                    layer_deps: vec![1],
+                    dep_labels: vec!["#225127".into()],
                     checks: None,
                     reviews: ReviewSummary::default(),
                 },
@@ -1085,6 +1144,8 @@ mod tests {
                     github_message_edited: false,
                     landable: true,
                     dep: Dep::Main,
+                    layer_deps: Vec::new(),
+                    dep_labels: Vec::new(),
                     checks: None,
                     reviews: ReviewSummary::default(),
                 },
@@ -1106,6 +1167,8 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(0),
+                    layer_deps: vec![0],
+                    dep_labels: vec!["#101".into()],
                     checks: None,
                     reviews: ReviewSummary::default(),
                 },
@@ -1127,6 +1190,8 @@ mod tests {
                     github_message_edited: false,
                     landable: true,
                     dep: Dep::Main,
+                    layer_deps: Vec::new(),
+                    dep_labels: Vec::new(),
                     checks: None,
                     reviews: ReviewSummary::default(),
                 },
@@ -1148,6 +1213,8 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(2),
+                    layer_deps: vec![2],
+                    dep_labels: vec!["#201".into()],
                     checks: None,
                     reviews: ReviewSummary::default(),
                 },
@@ -1191,6 +1258,8 @@ mod tests {
                     github_message_edited: false,
                     landable: true,
                     dep: Dep::Main,
+                    layer_deps: Vec::new(),
+                    dep_labels: Vec::new(),
                     checks: Some(CheckCounts {
                         passed: 10,
                         failed: 0,
@@ -1217,6 +1286,8 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(0),
+                    layer_deps: vec![0],
+                    dep_labels: vec!["#101".into()],
                     checks: Some(CheckCounts {
                         passed: 9,
                         failed: 0,
@@ -1243,6 +1314,8 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(1),
+                    layer_deps: vec![1],
+                    dep_labels: vec!["#102".into()],
                     checks: Some(CheckCounts {
                         passed: 9,
                         failed: 1,
@@ -1269,6 +1342,8 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(2),
+                    layer_deps: vec![2],
+                    dep_labels: vec!["#103".into()],
                     checks: None,
                     reviews: ReviewSummary::default(),
                 },
@@ -1331,6 +1406,8 @@ mod tests {
                     github_message_edited: false,
                     landable: true,
                     dep: Dep::Main,
+                    layer_deps: Vec::new(),
+                    dep_labels: Vec::new(),
                     checks: Some(CheckCounts {
                         passed: 10,
                         failed: 0,
@@ -1363,6 +1440,8 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(0),
+                    layer_deps: vec![0],
+                    dep_labels: vec!["#101".into()],
                     checks: Some(CheckCounts {
                         passed: 8,
                         failed: 2,
@@ -1430,6 +1509,8 @@ mod tests {
                     github_message_edited: false,
                     landable: true,
                     dep: Dep::Main,
+                    layer_deps: Vec::new(),
+                    dep_labels: Vec::new(),
                     checks: None,
                     reviews: ReviewSummary::default(),
                 },
@@ -1451,6 +1532,8 @@ mod tests {
                     github_message_edited: false,
                     landable: false,
                     dep: Dep::Layer(0),
+                    layer_deps: vec![0],
+                    dep_labels: vec!["#227865".into()],
                     checks: None,
                     reviews: ReviewSummary::default(),
                 },

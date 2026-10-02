@@ -172,6 +172,16 @@ impl CommitMessage {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Look up all trailer values matching `key` (case-insensitively), in the
+    /// order they appeared.
+    pub fn get_all(&self, key: &str) -> Vec<&str> {
+        self.trailers
+            .iter()
+            .filter(|(k, _)| matches_trailer_key(k, key))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
     /// True if this commit message contains the legacy `Pull Request:` (with a
     /// space) trailer written by `spr`.
     pub fn has_legacy_spr_trailer(&self) -> bool {
@@ -180,15 +190,21 @@ impl CommitMessage {
             .any(|(k, _)| k.eq_ignore_ascii_case(LEGACY_SPR_PULL_REQUEST))
     }
 
-    /// Insert or replace a trailer, preserving its position if already present.
+    /// Insert or replace a trailer, preserving its position if already present
+    /// and collapsing any duplicate occurrences of `key`.
     pub fn set(&mut self, key: &str, value: &str) {
-        if let Some(entry) = self
+        if let Some(first_idx) = self
             .trailers
-            .iter_mut()
-            .find(|(k, _)| matches_trailer_key(k, key))
+            .iter()
+            .position(|(k, _)| matches_trailer_key(k, key))
         {
-            entry.0 = key.to_string();
-            entry.1 = value.to_string();
+            self.trailers[first_idx] = (key.to_string(), value.to_string());
+            let mut idx = 0;
+            self.trailers.retain(|(k, _)| {
+                let keep = idx == first_idx || !matches_trailer_key(k, key);
+                idx += 1;
+                keep
+            });
         } else {
             self.trailers.push((key.to_string(), value.to_string()));
         }

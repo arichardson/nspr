@@ -5069,3 +5069,184 @@ fn stack_comment_retains_merged_dependencies_after_land() {
         "{comment3}"
     );
 }
+
+#[test]
+fn multi_dependency_tree_merge_and_retarget_when_down_to_one() {
+    let mut w =
+        World::new(&[("shared_a.txt", "line1\n"), ("shared_b.txt", "line1\n")]);
+    // Stack A: A1 -> A2
+    w.add_layer("Layer A1", &[("a1.txt", "a1")]);
+    w.add_layer("Layer A2", &[("shared_a.txt", "line1\na2\n")]);
+    // Stack B: independent on main
+    w.add_layer("Layer B1", &[("shared_b.txt", "line1\nb1\n")]);
+    w.set_trailer(2, crate::trailers::DEPENDS_ON, "main");
+    w.sync();
+    let initial_prs = w.pr_numbers();
+    let pr_a1 = initial_prs[0];
+    let pr_a2 = initial_prs[1];
+    let pr_b1 = initial_prs[2];
+
+    // Top layer C depends on BOTH A2 and B1 and modifies lines introduced by both.
+    w.add_layer(
+        "Layer C (merges A2 and B1)",
+        &[
+            ("shared_a.txt", "line1\na2\nc_on_a\n"),
+            ("shared_b.txt", "line1\nb1\nc_on_b\n"),
+            ("c.txt", "c1"),
+        ],
+    );
+    w.set_trailer(
+        3,
+        crate::trailers::DEPENDS_ON,
+        &format!("#{pr_a2}, #{pr_b1}"),
+    );
+
+    let outcomes = w.sync();
+    assert_eq!(outcomes.len(), 4);
+    assert_eq!(outcomes[3].action, LayerAction::Created);
+    assert_eq!(
+        outcomes[3].base, TRUNK,
+        "PR with multiple open dependencies must target trunk until down to a single dependency"
+    );
+    let pr_c = outcomes[3].number;
+    w.assert_invariants();
+
+    // Check PR body warning on C.
+    let pr_c_remote = block_on(w.forge.get_pull_request(pr_c)).unwrap();
+    assert!(
+        pr_c_remote.body.contains("<!-- nspr:warning -->"),
+        "multi-dep PR body should contain warning block:\n{}",
+        pr_c_remote.body
+    );
+    assert!(
+        pr_c_remote.body.contains(&format!(
+            "depends on multiple open pull requests (#{pr_a2}, #{pr_b1})"
+        )),
+        "multi-dep PR body should list dependencies:\n{}",
+        pr_c_remote.body
+    );
+
+    // Check status output and landability.
+    let st = w.status();
+    assert_eq!(st.layers[3].state, status::LayerState::Current);
+    assert!(
+        !st.layers[3].landable,
+        "multi-dep PR must not be marked landable"
+    );
+    assert_eq!(
+        st.layers[3].dep_labels,
+        vec![format!("#{pr_a2}"), format!("#{pr_b1}")]
+    );
+    let rendered_status = st.render_table(None, true, false, None);
+    assert!(
+        rendered_status.contains(&format!("depends on #{pr_a2}, #{pr_b1}")),
+        "status table should show multi-dep badge:\n{rendered_status}"
+    );
+
+    // Attempting to land C directly must fail.
+    let land_err = w.try_land(3).unwrap_err();
+    assert!(
+        land_err.to_string().contains(&format!(
+            "is stacked on #{pr_a2} (`Layer A2`), #{pr_b1} (`Layer B1`), so it cannot land yet"
+        )),
+        "unexpected error: {land_err}"
+    );
+
+    // Check stack comment on C shows the full DAG and `(depends on ...)`.
+    w.update_stack_comments();
+    let comment_c = w
+        .comment_on(pr_c)
+        .expect("stack comment must be written on C")
+        .body;
+    assert!(
+        comment_c.contains(&format!("#{pr_a1} Layer A1")),
+        "{comment_c}"
+    );
+    assert!(
+        comment_c.contains(&format!("#{pr_a2} Layer A2")),
+        "{comment_c}"
+    );
+    assert!(
+        comment_c.contains(&format!("#{pr_b1} Layer B1")),
+        "{comment_c}"
+    );
+    assert!(
+        comment_c.contains(&format!(
+            "**#{pr_c} Layer C (merges A2 and B1)** *(depends on #{pr_a2}, #{pr_b1})*"
+        )),
+        "{comment_c}"
+    );
+
+    // Amending A2 marks A2 as Modified and C as NeedsRestack (not Modified).
+    w.amend_layer(1, &[("a2_extra.txt", "extra")]);
+    let st_after_amend = w.status();
+    assert_eq!(st_after_amend.layers[1].state, status::LayerState::Modified);
+    assert_eq!(
+        st_after_amend.layers[3].state,
+        status::LayerState::NeedsRestack
+    );
+    let amend_outcomes = w.sync();
+    assert_eq!(amend_outcomes[1].action, LayerAction::Updated);
+    assert_eq!(amend_outcomes[3].action, LayerAction::Refreshed);
+    w.assert_invariants();
+
+    // Now land B1 (`index 2`). Once B1 is merged on main, C only has a single
+    // remaining open dependency (`A2`), so it should retarget onto A2's branch!
+    w.land(2);
+
+    let st_after_b1_land = w.status();
+    assert_eq!(st_after_b1_land.layers.len(), 3);
+    assert_eq!(
+        st_after_b1_land.layers[2].wanted_base_label,
+        format!("#{pr_a2}")
+    );
+    assert_eq!(
+        st_after_b1_land.layers[2].state,
+        status::LayerState::NeedsRestack
+    );
+    let rendered_after_b1 =
+        st_after_b1_land.render_table(None, true, false, None);
+    assert!(
+        rendered_after_b1.contains(&format!("retarget → #{pr_a2}")),
+        "status should indicate retarget onto #{pr_a2}:\n{rendered_after_b1}"
+    );
+    assert!(
+        !rendered_after_b1.contains("depends on"),
+        "multi-dep badge should disappear once down to 1 open dependency:\n{rendered_after_b1}"
+    );
+
+    let retarget_outcomes = w.sync();
+    assert!(
+        retarget_outcomes[2].retargeted,
+        "C must be retargeted onto A2's branch"
+    );
+    let pr_a2_remote = block_on(w.forge.get_pull_request(pr_a2)).unwrap();
+    assert_eq!(retarget_outcomes[2].base, pr_a2_remote.head);
+
+    // Now that C is a single-dependency PR stacked on A2 (and A1/A2 have been
+    // re-anchored onto the new main containing B1), C's displayed diff on
+    // GitHub is strictly C's own changes (`assert_invariants` checks this!).
+    w.assert_invariants();
+
+    // And the multi-dependency warning has been removed from C's PR body.
+    let pr_c_after = block_on(w.forge.get_pull_request(pr_c)).unwrap();
+    assert!(
+        !pr_c_after.body.contains("<!-- nspr:warning -->"),
+        "multi-dep warning must be stripped once C is natively stacked on A2:\n{}",
+        pr_c_after.body
+    );
+
+    // And the stack comment retains merged B1 while showing C under A2 without
+    // the `(depends on ...)` suffix.
+    w.update_stack_comments();
+    let comment_c_after = w.comment_on(pr_c).unwrap().body;
+    assert!(
+        comment_c_after.contains(&format!("#{pr_b1} Layer B1 *(merged)*")),
+        "merged B1 must remain in stack comment:\n{comment_c_after}"
+    );
+    assert!(
+        comment_c_after
+            .contains(&format!("**#{pr_c} Layer C (merges A2 and B1)**\n")),
+        "C should no longer have `(depends on ...)` suffix:\n{comment_c_after}"
+    );
+}

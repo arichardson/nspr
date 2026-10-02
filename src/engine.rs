@@ -256,6 +256,7 @@ pub async fn sync_stack(
 
     recover_missing_pr_trailers(git, forge, config, stack, &mut opts, prompter)
         .await?;
+    resolve_external_deps(forge, stack, &opts).await?;
 
     let trees =
         stack.trees_for(git, opts.only_layer, opts.only_layers.as_ref())?;
@@ -403,7 +404,7 @@ pub async fn gather_for(
     for i in (0..n).rev() {
         if opts.is_layer_selected(i) || needed[i] {
             needed[i] = true;
-            if let Dep::Layer(j) = stack.layers[i].dep {
+            for j in stack.layers[i].layer_deps() {
                 needed[j] = true;
             }
         }
@@ -657,7 +658,31 @@ pub fn decide(
                             trees.effective[i],
                         )?;
                 }
-                shown != desired
+                if !stack.layers[i].merged_pr_deps.is_empty()
+                    && pr.base == stack.trunk
+                    && matches!(stack.layers[i].dep, Dep::Layer(_))
+                {
+                    git.tree_of(pr.head_oid)? != trees.effective[i]
+                } else if shown != desired
+                    && stack.layers[i].has_multiple_layer_deps()
+                {
+                    if multi_dep_own_patch_unchanged(
+                        git,
+                        stack,
+                        prs,
+                        trees,
+                        i,
+                        current_pr_base_tip,
+                        pr.head_oid,
+                    )? {
+                        needs_conflict_refresh = true;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    shown != desired
+                }
             }
         };
 
@@ -891,6 +916,47 @@ fn find_root_commit(
     crate::land::branch_revisions(git, pr.head_oid, fallback_base_tip)
         .ok()
         .and_then(|r| r.first().copied())
+}
+
+fn multi_dep_own_patch_unchanged(
+    git: &Git,
+    stack: &Stack,
+    prs: &[Option<PullRequest>],
+    trees: &Trees,
+    i: usize,
+    current_pr_base_tip: Oid,
+    head_oid: Oid,
+) -> Result<bool> {
+    let layer_deps = stack.layers[i].layer_deps();
+    let Some(&first) = layer_deps.first() else {
+        return Ok(false);
+    };
+    let Some(first_pr) = &prs[first] else {
+        return Ok(false);
+    };
+    let trunk_tree = git.tree_of(current_pr_base_tip)?;
+    let mut remote_combined = git.tree_of(first_pr.head_oid)?;
+    for &j in &layer_deps[1..] {
+        let Some(pr_j) = &prs[j] else {
+            return Ok(false);
+        };
+        let dep_tree = git.tree_of(pr_j.head_oid)?;
+        if dep_tree == remote_combined || dep_tree == trunk_tree {
+            continue;
+        }
+        let index = git.merge_trees(trunk_tree, remote_combined, dep_tree)?;
+        if index.has_conflicts() {
+            return Ok(false);
+        }
+        remote_combined = git.write_index(index)?;
+    }
+    let remote_own =
+        tree_patch_id(git.repo(), remote_combined, git.tree_of(head_oid)?)?;
+    let local_combined =
+        stack.merge_base_tree_from_effective(git, i, &trees.effective)?;
+    let local_own =
+        tree_patch_id(git.repo(), local_combined, trees.effective[i])?;
+    Ok(remote_own == local_own)
 }
 
 /// Check if updating the base branch to `new_base_tree` without pushing this PR
@@ -1560,13 +1626,28 @@ async fn execute(
         let tip = tips[i];
         let branch = branches[i].clone();
         let subject = stack.layers[i].subject().to_string();
+        let multi_deps: Vec<String> =
+            if stack.layers[i].has_multiple_layer_deps() {
+                stack.layers[i]
+                    .layer_deps()
+                    .into_iter()
+                    .map(|j| match stack.layers[j].pr {
+                        Some(n) => format!("#{n}"),
+                        None => format!("layer {}", j + 1),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         let outcome = match &prs[i] {
             None if !decision.push[i] => continue,
             None => {
-                let body = crate::pr_body::splice_warning(
+                let body = crate::pr_body::splice_warning_with_deps(
                     &stack.layers[i].message.clean_body_for_pr(),
                     warn_merge_strategy,
+                    &multi_deps,
+                    &config.trunk,
                 );
                 let number = forge
                     .create_pull_request(CreatePr {
@@ -1632,9 +1713,11 @@ async fn execute(
                     if pr.title != subject {
                         update.title = Some(subject);
                     }
-                    let body = crate::pr_body::splice_warning(
+                    let body = crate::pr_body::splice_warning_with_deps(
                         &stack.layers[i].message.clean_body_for_pr(),
                         warn_merge_strategy,
+                        &multi_deps,
+                        &config.trunk,
                     );
                     if pr.body != body {
                         update.body = Some(body);
@@ -1645,9 +1728,11 @@ async fn execute(
                         &stack.layers[i].message.clean_for_branch(),
                     )?;
                 } else {
-                    let body = crate::pr_body::splice_warning(
+                    let body = crate::pr_body::splice_warning_with_deps(
                         &pr.body,
                         warn_merge_strategy,
+                        &multi_deps,
+                        &config.trunk,
                     );
                     if pr.body != body {
                         update.body = Some(body);
@@ -1709,13 +1794,21 @@ async fn execute(
 /// Layers with no trailer are left alone: the implicit "previous layer" rule
 /// is the common case and spelling it out on every commit would be noise.
 fn canonical_dep(config: &Config, stack: &Stack, i: usize) -> Option<String> {
-    stack.layers[i].dep_spec.as_ref()?;
-    match stack.layers[i].dep {
-        Dep::Main => Some(config.trunk.clone()),
-        Dep::Layer(j) => stack.layers[j].pr.map(|n| format!("#{n}")),
-        // Still unresolved, so we have nothing better to write.
-        Dep::ExternalPr(_) => None,
+    if stack.layers[i].dep_specs.is_empty() {
+        return None;
     }
+    let layer_deps = stack.layers[i].layer_deps();
+    if !layer_deps.is_empty() {
+        let mut parts = Vec::with_capacity(layer_deps.len());
+        for j in layer_deps {
+            parts.push(format!("#{}", stack.layers[j].pr?));
+        }
+        return Some(parts.join(", "));
+    }
+    if !stack.layers[i].external_pr_deps().is_empty() {
+        return None;
+    }
+    Some(config.trunk.clone())
 }
 
 /// Resolve `Depends-On:` references to pull requests outside the local stack.
@@ -1728,23 +1821,47 @@ pub async fn resolve_external_deps(
     stack: &mut Stack,
     opts: &SyncOptions,
 ) -> Result<()> {
-    for i in 0..stack.layers.len() {
-        if !opts.is_layer_selected(i) {
+    let n = stack.layers.len();
+    let mut needed = vec![false; n];
+    for i in (0..n).rev() {
+        if opts.is_layer_selected(i) || needed[i] {
+            needed[i] = true;
+            for j in stack.layers[i].layer_deps() {
+                needed[j] = true;
+            }
+        }
+    }
+    for i in 0..n {
+        if !needed[i] {
             continue;
         }
-        let Dep::ExternalPr(number) = stack.layers[i].dep else {
+        let external_prs = stack.layers[i].external_pr_deps();
+        if external_prs.is_empty() {
             continue;
-        };
-        let pr = forge.get_pull_request(number).await?;
-        match pr.state {
-            PrState::Merged => stack.layers[i].dep = Dep::Main,
-            _ => bail!(
-                "`{}` declares `{DEPENDS_ON}: #{number}`, but that pull \
-                 request is neither in this stack nor merged.\nEither include \
-                 its commit in the stack or point the trailer elsewhere.",
-                stack.layers[i].subject(),
-            ),
         }
+        for number in external_prs {
+            let pr = forge.get_pull_request(number).await?;
+            match pr.state {
+                PrState::Merged => {
+                    if !stack.layers[i].merged_pr_deps.contains(&number) {
+                        stack.layers[i].merged_pr_deps.push(number);
+                    }
+                    for d in &mut stack.layers[i].deps {
+                        if *d == Dep::ExternalPr(number) {
+                            *d = Dep::Main;
+                        }
+                    }
+                }
+                _ => bail!(
+                    "`{}` declares `{DEPENDS_ON}: #{number}`, but that pull \
+                     request is neither in this stack nor merged.\nEither include \
+                     its commit in the stack or point the trailer elsewhere.",
+                    stack.layers[i].subject(),
+                ),
+            }
+        }
+        stack.layers[i].dep =
+            crate::stack::Layer::compute_effective_dep(&stack.layers[i].deps);
     }
     Ok(())
 }
