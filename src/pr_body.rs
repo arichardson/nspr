@@ -49,7 +49,7 @@ pub fn splice_warning_with_deps(
         let joined = multi_deps.join(", ");
         sections.push(format!(
             "> [!IMPORTANT]\n\
-             > This pull request depends on multiple open pull requests ({joined}) and targets a synthetic merge base branch until all but one dependency have landed. \
+             > This pull request depends on multiple open pull requests ({joined}) and targets a synthetic merge base branch until its dependencies form a single linear chain. \
              **Do not merge this pull request yet.**"
         ));
     }

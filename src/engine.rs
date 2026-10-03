@@ -2041,6 +2041,7 @@ pub async fn resolve_external_deps(
         stack.layers[i].dep =
             crate::stack::Layer::compute_effective_dep(&stack.layers[i].deps);
     }
+    stack.reduce_transitive_deps();
     Ok(())
 }
 
