@@ -63,9 +63,10 @@ pub struct Layer {
     /// All `Depends-On:` entries as written in the commit message.
     pub dep_specs: Vec<DepSpec>,
     /// Effective single dependency for the GitHub `base` branch. Defaults to
-    /// the previous layer; when 2+ open `Dep::Layer` dependencies exist, the
-    /// pull request targets [`synthetic_base_branch`] until all but one
-    /// dependency have landed.
+    /// the previous layer; when 2+ unsubsumed `Dep::Layer` dependencies exist
+    /// across independent branches, the pull request targets
+    /// [`synthetic_base_branch`] until its dependencies form a single linear
+    /// chain.
     pub dep: Dep,
     /// All resolved dependencies in declared order.
     pub deps: Vec<Dep>,
@@ -96,12 +97,13 @@ impl Layer {
         out
     }
 
-    /// True when this layer depends on 2 or more open layers in the current stack.
+    /// True when this layer depends on 2 or more non-linear open branches in
+    /// the current stack.
     ///
     /// Because GitHub pull requests only have a single `base` branch, a layer
-    /// with multiple open dependencies targets a synthetic merge base branch
-    /// ([`synthetic_base_branch`]) carrying the 3-way merge of its dependencies
-    /// until all but one of its dependencies have landed.
+    /// whose dependencies span multiple open branches targets a synthetic merge
+    /// base branch ([`synthetic_base_branch`]) carrying the 3-way merge of its
+    /// dependencies until the dependency chain is linear again.
     pub fn has_multiple_layer_deps(&self) -> bool {
         self.layer_deps().len() >= 2
     }
@@ -399,7 +401,41 @@ impl Stack {
             layer.dep = dep;
             layer.deps = deps;
         }
+        self.reduce_transitive_deps();
         Ok(())
+    }
+
+    /// Transitive reduction of `layer.deps`: if a layer declares dependencies on
+    /// both `u` and `v` where `v` already transitively depends on `u` (`u` is an
+    /// ancestor of `v` in the dependency DAG), `u` is redundant because `v`'s
+    /// effective tree already includes `u`. Removing subsumed `Dep::Layer(u)`
+    /// entries ensures that whenever a layer's open dependencies form a single
+    /// linear chain, `layer_deps()` has length 1 and the pull request targets
+    /// the tip of that chain directly rather than a synthetic `.base` branch.
+    pub fn reduce_transitive_deps(&mut self) {
+        let n = self.layers.len();
+        let mut ancestors: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for i in 0..n {
+            let mut anc = HashSet::new();
+            for &d in &self.layers[i].deps {
+                if let Dep::Layer(j) = d {
+                    anc.insert(j);
+                    anc.extend(ancestors[j].iter().copied());
+                }
+            }
+            ancestors[i] = anc;
+            let current_layers = self.layers[i].layer_deps();
+            if current_layers.len() >= 2 {
+                self.layers[i].deps.retain(|d| match *d {
+                    Dep::Layer(u) => !current_layers
+                        .iter()
+                        .any(|&v| v != u && ancestors[v].contains(&u)),
+                    _ => true,
+                });
+            }
+            self.layers[i].dep =
+                Layer::compute_effective_dep(&self.layers[i].deps);
+        }
     }
 
     /// The tree the layer's head branch should have.

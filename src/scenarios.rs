@@ -5244,3 +5244,44 @@ fn multi_dependency_tree_merge_and_retarget_when_down_to_one() {
         "stack comment tree should stay identical when secondary dependency B1 is merged"
     );
 }
+
+#[test]
+fn multi_dependency_retargets_as_soon_as_chain_is_linearized() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer A1", &[("a1.txt", "a1")]);
+    w.add_layer("Layer A2", &[("a2.txt", "a2")]);
+    w.add_layer("Layer B1", &[("b1.txt", "b1")]);
+    w.set_trailer(2, crate::trailers::DEPENDS_ON, "main");
+    w.sync();
+    let prs = w.pr_numbers();
+    let (pr_a1, pr_a2, pr_b1) = (prs[0], prs[1], prs[2]);
+
+    // C lists A1, A2, and B1. Because A2 already depends on A1, transitive
+    // reduction simplifies A1 + A2 to A2, leaving two independent branch tips
+    // (A2 and B1).
+    w.add_layer("Layer C", &[("c.txt", "c1")]);
+    w.set_trailer(
+        3,
+        crate::trailers::DEPENDS_ON,
+        &format!("#{pr_a1}, #{pr_a2}, #{pr_b1}"),
+    );
+    let outcomes = w.sync();
+    let syn_base_c = crate::stack::synthetic_base_branch(&outcomes[3].branch);
+    assert_eq!(outcomes[3].base, syn_base_c);
+    w.assert_invariants();
+
+    // Now linearize B1 onto A2 (without landing any PR!) while C still has
+    // `Depends-On: #A2, #B1`. Because the dependency chain `main -> A1 -> A2 ->
+    // B1 -> C` is now completely linear, C immediately retargets from its
+    // synthetic `.base` branch onto B1's branch and deletes `.base`.
+    w.set_trailer(2, crate::trailers::DEPENDS_ON, &format!("#{pr_a2}"));
+    let linear_outcomes = w.sync();
+    assert!(linear_outcomes[3].retargeted);
+    let pr_b1_remote = block_on(w.forge.get_pull_request(pr_b1)).unwrap();
+    assert_eq!(linear_outcomes[3].base, pr_b1_remote.head);
+    assert!(
+        w.forge.branch(&syn_base_c).is_none(),
+        "synthetic .base branch must be deleted as soon as the dependency chain is linear"
+    );
+    w.assert_invariants();
+}
