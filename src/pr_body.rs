@@ -36,7 +36,7 @@ pub fn splice_warning_with_deps(
     body: &str,
     warn_merge_strategy: bool,
     multi_deps: &[String],
-    trunk: &str,
+    _trunk: &str,
 ) -> String {
     let clean = strip_warning(body);
     let has_multi_deps = multi_deps.len() >= 2;
@@ -49,8 +49,8 @@ pub fn splice_warning_with_deps(
         let joined = multi_deps.join(", ");
         sections.push(format!(
             "> [!IMPORTANT]\n\
-             > This pull request depends on multiple open pull requests ({joined}) and targets `{trunk}` until all but one dependency have landed. \
-             **Do not merge this pull request yet** — its diff currently includes changes from its unmerged dependencies."
+             > This pull request depends on multiple open pull requests ({joined}) and targets a synthetic merge base branch until all but one dependency have landed. \
+             **Do not merge this pull request yet.**"
         ));
     }
     if warn_merge_strategy {

@@ -43,6 +43,12 @@ pub enum Dep {
     ExternalPr(u64),
 }
 
+/// Name of the synthetic base branch used on the forge when a pull request has
+/// multiple open dependencies in the stack.
+pub fn synthetic_base_branch(head_branch: &str) -> String {
+    format!("{head_branch}.base")
+}
+
 #[derive(Debug, Clone)]
 pub struct Layer {
     /// The local commit this layer represents.
@@ -57,8 +63,9 @@ pub struct Layer {
     /// All `Depends-On:` entries as written in the commit message.
     pub dep_specs: Vec<DepSpec>,
     /// Effective single dependency for the GitHub `base` branch. Defaults to
-    /// the previous layer; when 2+ open `Dep::Layer` dependencies exist, this
-    /// is `Dep::Main` until all but one dependency have landed.
+    /// the previous layer; when 2+ open `Dep::Layer` dependencies exist, the
+    /// pull request targets [`synthetic_base_branch`] until all but one
+    /// dependency have landed.
     pub dep: Dep,
     /// All resolved dependencies in declared order.
     pub deps: Vec<Dep>,
@@ -92,8 +99,9 @@ impl Layer {
     /// True when this layer depends on 2 or more open layers in the current stack.
     ///
     /// Because GitHub pull requests only have a single `base` branch, a layer
-    /// with multiple open dependencies targets `main` (with a union 3-way merge
-    /// tree) until all but one of its dependencies have landed.
+    /// with multiple open dependencies targets a synthetic merge base branch
+    /// ([`synthetic_base_branch`]) carrying the 3-way merge of its dependencies
+    /// until all but one of its dependencies have landed.
     pub fn has_multiple_layer_deps(&self) -> bool {
         self.layer_deps().len() >= 2
     }
@@ -565,10 +573,7 @@ impl Stack {
         i: usize,
         cache: &mut HashMap<usize, Oid>,
     ) -> Result<Oid> {
-        match self.layers[i].dep {
-            Dep::Main | Dep::ExternalPr(_) => git.tree_of(self.base),
-            Dep::Layer(j) => self.effective_tree_cached(git, j, cache),
-        }
+        self.merge_base_tree_cached(git, i, cache)
     }
 
     /// Effective tree and dependency tree for every layer, in stack order.
