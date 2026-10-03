@@ -5033,17 +5033,14 @@ fn stack_comment_retains_merged_dependencies_after_land() {
         .expect("stack comment must remain on PR #2")
         .body;
     assert!(
-        comment2.contains(&format!("#{} Layer one *(merged)*", prs[0])),
+        comment2.contains(&format!("- #{}\n", prs[0])),
         "merged PR #1 must remain in PR #2's stack comment:\n{comment2}"
     );
     assert!(
-        comment2.contains(&format!("**#{} Layer two**", prs[1])),
+        comment2.contains(&format!("- ➡️ **#{}**\n", prs[1])),
         "{comment2}"
     );
-    assert!(
-        comment2.contains(&format!("#{} Layer three", prs[2])),
-        "{comment2}"
-    );
+    assert!(comment2.contains(&format!("- #{}\n", prs[2])), "{comment2}");
 
     // Land PR #2 (`prs[1]`) so only PR #3 (`prs[2]`) remains open in local history.
     w.land(0);
@@ -5056,15 +5053,15 @@ fn stack_comment_retains_merged_dependencies_after_land() {
         )
         .body;
     assert!(
-        comment3.contains(&format!("#{} Layer one *(merged)*", prs[0])),
+        comment3.contains(&format!("- #{}\n", prs[0])),
         "merged PR #1 must remain in PR #3's stack comment:\n{comment3}"
     );
     assert!(
-        comment3.contains(&format!("#{} Layer two *(merged)*", prs[1])),
+        comment3.contains(&format!("- #{}\n", prs[1])),
         "merged PR #2 must remain in PR #3's stack comment:\n{comment3}"
     );
     assert!(
-        comment3.contains(&format!("**#{} Layer three**", prs[2])),
+        comment3.contains(&format!("- ➡️ **#{}**\n", prs[2])),
         "{comment3}"
     );
 }
@@ -5151,27 +5148,24 @@ fn multi_dependency_tree_merge_and_retarget_when_down_to_one() {
         "unexpected error: {land_err}"
     );
 
-    // Check stack comment on C shows the full DAG and `(depends on ...)`.
+    // Check stack comment on C shows the nested DAG and `(also depends on ...)`.
     w.update_stack_comments();
     let comment_c = w
         .comment_on(pr_c)
         .expect("stack comment must be written on C")
         .body;
     assert!(
-        comment_c.contains(&format!("#{pr_a1} Layer A1")),
+        comment_c.contains(&format!("  - #{pr_a1}\n    - #{pr_a2}\n")),
         "{comment_c}"
     );
     assert!(
-        comment_c.contains(&format!("#{pr_a2} Layer A2")),
-        "{comment_c}"
-    );
-    assert!(
-        comment_c.contains(&format!("#{pr_b1} Layer B1")),
+        comment_c.contains(&format!("  - #{pr_b1}\n")),
         "{comment_c}"
     );
     assert!(
         comment_c.contains(&format!(
-            "**#{pr_c} Layer C (merges A2 and B1)** *(depends on #{pr_a2}, #{pr_b1})*"
+            "      - ➡️ **#{pr_c}** *(also depends on [#{pr_b1}]({}))*",
+            w.config.pull_request_url(pr_b1)
         )),
         "{comment_c}"
     );
@@ -5235,17 +5229,13 @@ fn multi_dependency_tree_merge_and_retarget_when_down_to_one() {
         pr_c_after.body
     );
 
-    // And the stack comment retains merged B1 while showing C under A2 without
-    // the `(depends on ...)` suffix.
+    // And the stack comment retains merged B1 in its branch position under main
+    // (rather than moving it above A1), keeping the tree identical before and
+    // after B1 is merged.
     w.update_stack_comments();
     let comment_c_after = w.comment_on(pr_c).unwrap().body;
-    assert!(
-        comment_c_after.contains(&format!("#{pr_b1} Layer B1 *(merged)*")),
-        "merged B1 must remain in stack comment:\n{comment_c_after}"
-    );
-    assert!(
-        comment_c_after
-            .contains(&format!("**#{pr_c} Layer C (merges A2 and B1)**\n")),
-        "C should no longer have `(depends on ...)` suffix:\n{comment_c_after}"
+    assert_eq!(
+        comment_c_after, comment_c,
+        "stack comment tree should stay identical when secondary dependency B1 is merged"
     );
 }

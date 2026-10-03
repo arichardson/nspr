@@ -927,6 +927,16 @@ impl Stack {
                     };
                     if entry_needs_rewrite {
                         any_entry_needs_rewrite = true;
+                        if !rewrite_explicit_pr_refs
+                            && let Dep::Layer(p) = dep
+                            && let Some(n) = self.layers[p].pr
+                        {
+                            let s = format!("#{n}");
+                            if !new_entries.contains(&s) {
+                                new_entries.push(s);
+                            }
+                            continue;
+                        }
                         let mut inherited = dep;
                         while let Dep::Layer(p) = inherited {
                             if removed.contains(&p) {
