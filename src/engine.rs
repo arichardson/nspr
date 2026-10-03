@@ -541,13 +541,32 @@ pub fn decide(
             continue;
         };
 
-        let remote_base_tip = match stack.layers[i].dep {
-            Dep::Main | Dep::ExternalPr(..) => Some(stack.base),
-            Dep::Layer(j) => prs[j].as_ref().map(|p| p.head_oid),
+        let is_multi_dep = stack.layers[i].has_multiple_layer_deps();
+        let syn_base = crate::stack::synthetic_base_branch(&pr.head);
+        let remote_base_tip = if is_multi_dep {
+            if pr.base == syn_base
+                && pr.base_oid != Oid::ZERO_SHA1
+                && git.repo().find_commit(pr.base_oid).is_ok()
+            {
+                Some(pr.base_oid)
+            } else {
+                Some(stack.base)
+            }
+        } else {
+            match stack.layers[i].dep {
+                Dep::Main | Dep::ExternalPr(..) => Some(stack.base),
+                Dep::Layer(j) => prs[j].as_ref().map(|p| p.head_oid),
+            }
         };
-        let base_branch_changed = match stack.layers[i].dep {
-            Dep::Main | Dep::ExternalPr(..) => pr.base != stack.trunk,
-            Dep::Layer(j) => prs[j].as_ref().is_some_and(|p| p.head != pr.base),
+        let base_branch_changed = if is_multi_dep {
+            pr.base != syn_base
+        } else {
+            match stack.layers[i].dep {
+                Dep::Main | Dep::ExternalPr(..) => pr.base != stack.trunk,
+                Dep::Layer(j) => {
+                    prs[j].as_ref().is_some_and(|p| p.head != pr.base)
+                }
+            }
         };
         if base_branch_changed {
             rewrite_history[i] = true;
@@ -648,7 +667,25 @@ pub fn decide(
                     trees.dep[i],
                     trees.effective[i],
                 )?;
-                if !matches!(stack.layers[i].dep, Dep::Layer(..)) {
+                if is_multi_dep {
+                    if pr.base == syn_base {
+                        if git.tree_of(current_pr_base_tip)? != trees.dep[i]
+                            || would_conflict_or_diverge_on_forge(
+                                git,
+                                current_pr_base_tip,
+                                pr.head_oid,
+                                trees.dep[i],
+                                trees.effective[i],
+                            )?
+                        {
+                            needs_conflict_refresh = true;
+                            rewrite_history[i] = true;
+                        }
+                    } else {
+                        needs_conflict_refresh = true;
+                        rewrite_history[i] = true;
+                    }
+                } else if !matches!(stack.layers[i].dep, Dep::Layer(..)) {
                     needs_conflict_refresh =
                         would_conflict_or_diverge_on_forge(
                             git,
@@ -658,14 +695,7 @@ pub fn decide(
                             trees.effective[i],
                         )?;
                 }
-                if !stack.layers[i].merged_pr_deps.is_empty()
-                    && pr.base == stack.trunk
-                    && matches!(stack.layers[i].dep, Dep::Layer(_))
-                {
-                    git.tree_of(pr.head_oid)? != trees.effective[i]
-                } else if shown != desired
-                    && stack.layers[i].has_multiple_layer_deps()
-                {
+                if is_multi_dep && pr.base != syn_base {
                     if multi_dep_own_patch_unchanged(
                         git,
                         stack,
@@ -675,11 +705,15 @@ pub fn decide(
                         current_pr_base_tip,
                         pr.head_oid,
                     )? {
-                        needs_conflict_refresh = true;
                         false
                     } else {
-                        true
+                        shown != desired
                     }
+                } else if !stack.layers[i].merged_pr_deps.is_empty()
+                    && pr.base == stack.trunk
+                    && matches!(stack.layers[i].dep, Dep::Layer(_))
+                {
+                    git.tree_of(pr.head_oid)? != trees.effective[i]
                 } else {
                     shown != desired
                 }
@@ -711,8 +745,18 @@ pub fn decide(
     // un-pushed changes. Restacking the dependency is the fix, and it cascades:
     // reverse order suffices because forward references are rejected at
     // discovery, so `j < i` always.
+    let mut need_effective_tree = vec![false; n];
     for i in (0..n).rev() {
         if !push[i] {
+            continue;
+        }
+        if stack.layers[i].has_multiple_layer_deps() {
+            for j in stack.layers[i].layer_deps() {
+                if prs[j].is_none() {
+                    push[j] = true;
+                    rewrite_history[j] = true;
+                }
+            }
             continue;
         }
         let Dep::Layer(j) = stack.layers[i].dep else {
@@ -723,7 +767,10 @@ pub fn decide(
             Some(pr) => {
                 if patch_changed[j] {
                     false
-                } else if !opts.sync_all && !opts.refresh_when_behind {
+                } else if !opts.sync_all
+                    && !opts.refresh_when_behind
+                    && !need_effective_tree[i]
+                {
                     let anchor_on_j = current_anchor[i]
                         .filter(|&a| {
                             git.is_ancestor(a, pr.head_oid).unwrap_or(false)
@@ -761,6 +808,9 @@ pub fn decide(
         if !up_to_date {
             push[j] = true;
             rewrite_history[j] = true;
+            if prs[j].is_some() || need_effective_tree[i] {
+                need_effective_tree[j] = true;
+            }
         }
     }
 
@@ -828,39 +878,51 @@ pub fn decide(
                 }
             }
         }
-        let base_moved = match stack.layers[i].dep {
-            Dep::Main | Dep::ExternalPr(_) => match current_anchor[i] {
-                None => true,
-                Some(anchor) => {
-                    !git.is_ancestor(anchor, stack.base)?
-                        || ((opts.sync_all || opts.refresh_when_behind)
-                            && anchor != stack.base)
-                        || pr_i.base != stack.trunk
-                        || !can_keep_anchor_against_base(
-                            git,
-                            anchor,
-                            trees.dep[i],
-                            trees.dep[i],
-                            trees.effective[i],
-                        )?
-                }
-            },
-            Dep::Layer(j) => match (&prs[j], current_anchor[i]) {
-                (Some(pr_j), Some(anchor)) if !rewrite_history[j] => {
-                    !git.is_ancestor(anchor, pr_j.head_oid)?
-                        || ((opts.sync_all || opts.refresh_when_behind)
-                            && (push[j] || anchor != pr_j.head_oid))
-                        || pr_i.base != pr_j.head
-                        || !can_keep_anchor_against_base(
-                            git,
-                            anchor,
-                            resulting_branch_tree[j],
-                            trees.dep[i],
-                            trees.effective[i],
-                        )?
-                }
-                _ => true,
-            },
+        let base_moved = if stack.layers[i].has_multiple_layer_deps() {
+            let syn_base = crate::stack::synthetic_base_branch(&pr_i.head);
+            pr_i.base != syn_base
+                || pr_i.base_oid == Oid::ZERO_SHA1
+                || current_anchor[i] != Some(pr_i.base_oid)
+                || git.tree_of(pr_i.base_oid).ok() != Some(trees.dep[i])
+                || ((opts.sync_all || opts.refresh_when_behind)
+                    && !git
+                        .is_ancestor(stack.base, pr_i.base_oid)
+                        .unwrap_or(false))
+        } else {
+            match stack.layers[i].dep {
+                Dep::Main | Dep::ExternalPr(_) => match current_anchor[i] {
+                    None => true,
+                    Some(anchor) => {
+                        !git.is_ancestor(anchor, stack.base)?
+                            || ((opts.sync_all || opts.refresh_when_behind)
+                                && anchor != stack.base)
+                            || pr_i.base != stack.trunk
+                            || !can_keep_anchor_against_base(
+                                git,
+                                anchor,
+                                trees.dep[i],
+                                trees.dep[i],
+                                trees.effective[i],
+                            )?
+                    }
+                },
+                Dep::Layer(j) => match (&prs[j], current_anchor[i]) {
+                    (Some(pr_j), Some(anchor)) if !rewrite_history[j] => {
+                        !git.is_ancestor(anchor, pr_j.head_oid)?
+                            || ((opts.sync_all || opts.refresh_when_behind)
+                                && (push[j] || anchor != pr_j.head_oid))
+                            || pr_i.base != pr_j.head
+                            || !can_keep_anchor_against_base(
+                                git,
+                                anchor,
+                                resulting_branch_tree[j],
+                                trees.dep[i],
+                                trees.effective[i],
+                            )?
+                    }
+                    _ => true,
+                },
+            }
         };
         if push[i] && (!opts.preserve_commit_history || base_moved) {
             rewrite_history[i] = true;
@@ -1146,6 +1208,17 @@ fn can_keep_anchor_against_base(
 }
 
 fn wanted_base_label(stack: &Stack, config: &Config, i: usize) -> String {
+    if stack.layers[i].has_multiple_layer_deps() {
+        let labels: Vec<String> = stack.layers[i]
+            .layer_deps()
+            .into_iter()
+            .map(|j| match stack.layers[j].pr {
+                Some(n) => format!("#{n}"),
+                None => format!("layer {}", j + 1),
+            })
+            .collect();
+        return labels.join(" + ");
+    }
     match stack.layers[i].dep {
         Dep::Main => config.trunk.clone(),
         Dep::ExternalPr(n) => format!("#{n}"),
@@ -1192,34 +1265,14 @@ async fn execute(
 
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
-        let (parent_tip, base_branch) = match stack.layers[i].dep {
-            Dep::Main | Dep::ExternalPr(_) => {
-                let anchor = match (&prs[i], decision.rewrite_history[i]) {
-                    (Some(pr), false) => find_root_commit(git, pr, stack.base)
-                        .and_then(|r| git.parent_of(r).ok())
-                        .unwrap_or(stack.base),
-                    _ => stack.base,
-                };
-                (anchor, config.trunk.clone())
-            }
-            Dep::Layer(j) => {
-                let anchor = match (&prs[i], decision.rewrite_history[i]) {
-                    (Some(pr), false) => find_root_commit(git, pr, tips[j])
-                        .and_then(|r| git.parent_of(r).ok())
-                        .unwrap_or(tips[j]),
-                    _ => tips[j],
-                };
-                (anchor, branches[j].clone())
-            }
-        };
-        base_branches.push(base_branch);
-
         let desired_tree = trees.effective[i];
         let layer_commit = stack.layers[i].commit;
         let subject = stack.layers[i].subject().to_string();
+        let is_multi_dep = stack.layers[i].has_multiple_layer_deps();
 
         match &prs[i] {
             None if !decision.push[i] => {
+                base_branches.push(String::new());
                 tips.push(stack.base);
                 branches.push(String::new());
             }
@@ -1228,13 +1281,43 @@ async fn execute(
                 let mut candidate =
                     forge.unused_branch_name(&preferred).await?;
                 let mut suffix = 1usize;
-                while reserved_branches.contains(&candidate) {
+                while reserved_branches.contains(&candidate)
+                    || (is_multi_dep
+                        && reserved_branches.contains(
+                            &crate::stack::synthetic_base_branch(&candidate),
+                        ))
+                {
                     candidate = forge
                         .unused_branch_name(&format!("{preferred}-{suffix}"))
                         .await?;
                     suffix += 1;
                 }
                 reserved_branches.insert(candidate.clone());
+
+                let (parent_tip, base_branch) = if is_multi_dep {
+                    let syn_branch =
+                        crate::stack::synthetic_base_branch(&candidate);
+                    reserved_branches.insert(syn_branch.clone());
+                    let syn_tip = git.synthesize_initial_commit(
+                        stack.base,
+                        trees.dep[i],
+                        layer_commit,
+                        "[nspr] synthetic base branch",
+                    )?;
+                    push_specs.push(
+                        PushSpec::forced(&syn_branch, syn_tip)
+                            .with_label(format!("base ({syn_branch})")),
+                    );
+                    (syn_tip, syn_branch)
+                } else {
+                    match stack.layers[i].dep {
+                        Dep::Main | Dep::ExternalPr(_) => {
+                            (stack.base, config.trunk.clone())
+                        }
+                        Dep::Layer(j) => (tips[j], branches[j].clone()),
+                    }
+                };
+                base_branches.push(base_branch);
 
                 // The dependency may be parked behind its own base, in which
                 // case the tree computed against the eventual base does not
@@ -1266,19 +1349,93 @@ async fn execute(
                 branches.push(candidate);
             }
             Some(pr) => {
+                let syn_branch = crate::stack::synthetic_base_branch(&pr.head);
+                let (parent_tip, base_branch) = if is_multi_dep {
+                    reserved_branches.insert(syn_branch.clone());
+                    if !decision.push[i] {
+                        (pr.base_oid, syn_branch.clone())
+                    } else if pr.base == syn_branch
+                        && !decision.rewrite_history[i]
+                        && pr.base_oid != Oid::ZERO_SHA1
+                        && git.repo().find_commit(pr.base_oid).is_ok()
+                        && git.tree_of(pr.base_oid)? == trees.dep[i]
+                    {
+                        (pr.base_oid, syn_branch.clone())
+                    } else {
+                        let syn_tip = git.synthesize_initial_commit(
+                            stack.base,
+                            trees.dep[i],
+                            layer_commit,
+                            "[nspr] synthetic base branch",
+                        )?;
+                        push_specs.push(
+                            PushSpec::forced(&syn_branch, syn_tip)
+                                .with_label(format!("#{} (base)", pr.number)),
+                        );
+                        (syn_tip, syn_branch.clone())
+                    }
+                } else {
+                    match stack.layers[i].dep {
+                        Dep::Main | Dep::ExternalPr(_) => {
+                            let anchor =
+                                match (&prs[i], decision.rewrite_history[i]) {
+                                    (Some(pr), false) => {
+                                        find_root_commit(git, pr, stack.base)
+                                            .and_then(|r| git.parent_of(r).ok())
+                                            .unwrap_or(stack.base)
+                                    }
+                                    _ => stack.base,
+                                };
+                            (anchor, config.trunk.clone())
+                        }
+                        Dep::Layer(j) => {
+                            let anchor =
+                                match (&prs[i], decision.rewrite_history[i]) {
+                                    (Some(pr), false) => {
+                                        find_root_commit(git, pr, tips[j])
+                                            .and_then(|r| git.parent_of(r).ok())
+                                            .unwrap_or(tips[j])
+                                    }
+                                    _ => tips[j],
+                                };
+                            (anchor, branches[j].clone())
+                        }
+                    }
+                };
+                base_branches.push(base_branch);
+
                 if !decision.push[i] {
                     tips.push(pr.head_oid);
                     branches.push(pr.head.clone());
                     continue;
                 }
 
+                // If transitioning away from a synthetic `.base` branch, advance
+                // the synthetic `.base` branch to `parent_tip` in the same `git
+                // push` batch so the retarget is 100% diff-neutral in a single
+                // pass without two-stage parking.
+                let leaving_syn_base = !is_multi_dep && pr.base == syn_branch;
+                if leaving_syn_base {
+                    push_specs.push(
+                        PushSpec::forced(&syn_branch, parent_tip)
+                            .with_label(format!("#{} (base)", pr.number)),
+                    );
+                }
+
                 // Where the branch's own revision chain starts (for replay).
-                let fallback_base_tip = match stack.layers[i].dep {
-                    Dep::Main | Dep::ExternalPr(_) => stack.base,
-                    Dep::Layer(j) => prs[j]
-                        .as_ref()
-                        .map(|p| p.head_oid)
-                        .unwrap_or(stack.base),
+                let fallback_base_tip = if pr.base == syn_branch
+                    && pr.base_oid != Oid::ZERO_SHA1
+                    && git.repo().find_commit(pr.base_oid).is_ok()
+                {
+                    pr.base_oid
+                } else {
+                    match stack.layers[i].dep {
+                        Dep::Main | Dep::ExternalPr(_) => stack.base,
+                        Dep::Layer(j) => prs[j]
+                            .as_ref()
+                            .map(|p| p.head_oid)
+                            .unwrap_or(stack.base),
+                    }
                 };
                 let old_root_parent =
                     match find_root_commit(git, pr, fallback_base_tip) {
@@ -1309,11 +1466,17 @@ async fn execute(
                 // shrinks (or preserves) the displayed diff immediately and
                 // makes `pr.base` already match `base_branches[i]` when
                 // `git push` runs, so no parking or second push is needed.
-                let new_base_current_remote_tip = match stack.layers[i].dep {
-                    Dep::Main | Dep::ExternalPr(_) => Some(stack.base),
-                    Dep::Layer(j) => prs[j].as_ref().map(|p| p.head_oid),
+                let new_base_current_remote_tip = if is_multi_dep {
+                    None
+                } else {
+                    match stack.layers[i].dep {
+                        Dep::Main | Dep::ExternalPr(_) => Some(stack.base),
+                        Dep::Layer(j) => prs[j].as_ref().map(|p| p.head_oid),
+                    }
                 };
-                let retargeted_before_push = if pr.base != base_branches[i]
+                let retargeted_before_push = if !is_multi_dep
+                    && !leaving_syn_base
+                    && pr.base != base_branches[i]
                     && let Some(target_remote_tip) = new_base_current_remote_tip
                     && git.is_ancestor(target_remote_tip, pr.head_oid)?
                     && (git
@@ -1355,7 +1518,10 @@ async fn execute(
                 } else {
                     current_pr_base_tip
                 };
-                let raw_anchor = if retargeted_before_push {
+                let raw_anchor = if is_multi_dep
+                    || leaving_syn_base
+                    || retargeted_before_push
+                {
                     parent_tip
                 } else {
                     safe_retarget_anchor(
@@ -1743,6 +1909,18 @@ async fn execute(
                         action = LayerAction::Updated;
                     }
                     forge.update_pull_request(pr.number, update).await?;
+                }
+                let old_syn_base =
+                    crate::stack::synthetic_base_branch(&pr.head);
+                if retargeted
+                    && pr.base == old_syn_base
+                    && base_branch != old_syn_base
+                {
+                    if let Err(e) = forge.delete_branch(&old_syn_base).await {
+                        log::debug!(
+                            "failed to delete synthetic base branch {old_syn_base}: {e}"
+                        );
+                    }
                 }
 
                 LayerOutcome {

@@ -499,12 +499,7 @@ impl World {
                     .unwrap();
 
             // ...versus the patch this layer is supposed to contribute.
-            let expected_base_tree = match layer.dep {
-                crate::stack::Dep::Layer(j) => {
-                    stack.effective_tree(&self.git, j).unwrap()
-                }
-                _ => self.git.tree_of(stack.base).unwrap(),
-            };
+            let expected_base_tree = stack.dep_tree(&self.git, i).unwrap();
             let expected = tree_patch_id(
                 &repo,
                 expected_base_tree,
@@ -5101,9 +5096,14 @@ fn multi_dependency_tree_merge_and_retarget_when_down_to_one() {
     let outcomes = w.sync();
     assert_eq!(outcomes.len(), 4);
     assert_eq!(outcomes[3].action, LayerAction::Created);
+    let syn_base_c = crate::stack::synthetic_base_branch(&outcomes[3].branch);
     assert_eq!(
-        outcomes[3].base, TRUNK,
-        "PR with multiple open dependencies must target trunk until down to a single dependency"
+        outcomes[3].base, syn_base_c,
+        "PR with multiple open dependencies must target its synthetic .base branch"
+    );
+    assert!(
+        w.forge.branch(&syn_base_c).is_some(),
+        "synthetic .base branch must exist on the remote"
     );
     let pr_c = outcomes[3].number;
     w.assert_invariants();
@@ -5149,7 +5149,7 @@ fn multi_dependency_tree_merge_and_retarget_when_down_to_one() {
         "unexpected error: {land_err}"
     );
 
-    // Check stack comment on C shows the nested DAG and `(also depends on ...)`.
+    // Check stack comment on C shows the nested DAG and `also depends on`.
     w.update_stack_comments();
     let comment_c = w
         .comment_on(pr_c)
@@ -5216,6 +5216,10 @@ fn multi_dependency_tree_merge_and_retarget_when_down_to_one() {
     );
     let pr_a2_remote = block_on(w.forge.get_pull_request(pr_a2)).unwrap();
     assert_eq!(retarget_outcomes[2].base, pr_a2_remote.head);
+    assert!(
+        w.forge.branch(&syn_base_c).is_none(),
+        "synthetic .base branch must be deleted once C is retargeted onto A2"
+    );
 
     // Now that C is a single-dependency PR stacked on A2 (and A1/A2 have been
     // re-anchored onto the new main containing B1), C's displayed diff on

@@ -147,24 +147,46 @@ pub fn from_parts(
 ) -> Result<StackStatus> {
     let mut layers = Vec::with_capacity(stack.layers.len());
     for (i, layer) in stack.layers.iter().enumerate() {
-        let (wanted_base, wanted_base_label) = match layer.dep {
-            Dep::Main => (config.trunk.clone(), config.trunk.clone()),
-            Dep::ExternalPr(n) => (config.trunk.clone(), format!("#{n}")),
-            Dep::Layer(j) => {
-                let branch = stack.layers[j]
-                    .pr
-                    .and_then(|n| {
-                        prs[j]
-                            .as_ref()
-                            .filter(|p| p.number == n)
-                            .map(|p| p.head.clone())
-                    })
-                    .unwrap_or_else(|| "?".to_string());
-                let label = match stack.layers[j].pr {
-                    Some(n) => format!("#{n}"),
-                    None => format!("layer {}", j + 1),
-                };
-                (branch, label)
+        let layer_deps = layer.layer_deps();
+        let dep_labels: Vec<String> = layer_deps
+            .iter()
+            .map(|&j| match stack.layers[j].pr {
+                Some(n) => format!("#{n}"),
+                None => format!("layer {}", j + 1),
+            })
+            .collect();
+
+        let (wanted_base, wanted_base_label) = if layer
+            .has_multiple_layer_deps()
+        {
+            let head_branch = prs[i]
+                .as_ref()
+                .map(|p| p.head.clone())
+                .unwrap_or_else(|| config.branch_name_for(layer.subject()));
+            (
+                crate::stack::synthetic_base_branch(&head_branch),
+                dep_labels.join(" + "),
+            )
+        } else {
+            match layer.dep {
+                Dep::Main => (config.trunk.clone(), config.trunk.clone()),
+                Dep::ExternalPr(n) => (config.trunk.clone(), format!("#{n}")),
+                Dep::Layer(j) => {
+                    let branch = stack.layers[j]
+                        .pr
+                        .and_then(|n| {
+                            prs[j]
+                                .as_ref()
+                                .filter(|p| p.number == n)
+                                .map(|p| p.head.clone())
+                        })
+                        .unwrap_or_else(|| "?".to_string());
+                    let label = match stack.layers[j].pr {
+                        Some(n) => format!("#{n}"),
+                        None => format!("layer {}", j + 1),
+                    };
+                    (branch, label)
+                }
             }
         };
 
@@ -198,15 +220,6 @@ pub fn from_parts(
                 PrState::Open => LayerState::Current,
             },
         };
-
-        let layer_deps = layer.layer_deps();
-        let dep_labels: Vec<String> = layer_deps
-            .iter()
-            .map(|&j| match stack.layers[j].pr {
-                Some(n) => format!("#{n}"),
-                None => format!("layer {}", j + 1),
-            })
-            .collect();
 
         layers.push(LayerStatus {
             index: i,
