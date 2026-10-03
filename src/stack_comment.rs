@@ -21,7 +21,7 @@ use color_eyre::eyre::Result;
 
 use crate::config::Config;
 use crate::forge::{Forge, PrState};
-use crate::stack::{Dep, Stack};
+use crate::stack::Stack;
 
 pub const BEGIN: &str = "<!-- nspr:stack -->";
 pub const END: &str = "<!-- /nspr:stack -->";
@@ -123,6 +123,36 @@ pub fn render(config: &Config, stack: &Stack, current: usize) -> String {
     render_with_merged(config, stack, current, &[])
 }
 
+fn format_layer_entry(layer: &crate::stack::Layer, is_current: bool) -> String {
+    match (layer.pr, is_current) {
+        (Some(n), true) => format!("➡️ **#{n}**"),
+        (Some(n), false) => format!("#{n}"),
+        (None, true) => format!("➡️ **(not submitted) {}**", layer.subject()),
+        (None, false) => format!("(not submitted) {}", layer.subject()),
+    }
+}
+
+fn layer_secondary_merged_prs(
+    layer: &crate::stack::Layer,
+    merged_set: &std::collections::HashSet<u64>,
+) -> Vec<u64> {
+    if layer.layer_deps().is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &n in &layer.merged_pr_deps {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    for n in layer.external_pr_deps() {
+        if merged_set.contains(&n) && !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
 /// Render the stack seen from layer `current`, including any already-merged
 /// dependencies (`merged_deps`) that are no longer in the local commit history.
 pub fn render_with_merged(
@@ -134,49 +164,62 @@ pub fn render_with_merged(
     let mut out = String::from("#### Stack\n\n");
     out.push_str(&format!("- `{}`\n", config.trunk));
 
+    let merged_set: std::collections::HashSet<u64> =
+        merged_deps.iter().map(|m| m.number).collect();
     let component = stack.component_of(current);
-    if stack.is_component_linear(&component) {
-        for m in merged_deps {
-            out.push_str(&format!("- #{} {} *(merged)*\n", m.number, m.title));
-        }
-        for &i in &component {
-            let layer = &stack.layers[i];
-            let reference = match layer.pr {
-                Some(n) => format!("#{n}"),
-                None => "(not submitted)".to_string(),
-            };
-            if i == current {
-                out.push_str(&format!(
-                    "- ➡️ **{reference} {}**\n",
-                    layer.subject(),
-                ));
-            } else {
-                out.push_str(&format!("- {reference} {}\n", layer.subject(),));
+
+    let mut secondary_merged_prs: Vec<u64> = Vec::new();
+    for &i in &component {
+        for n in layer_secondary_merged_prs(&stack.layers[i], &merged_set) {
+            if !secondary_merged_prs.contains(&n) {
+                secondary_merged_prs.push(n);
             }
         }
-    } else {
-        for m in merged_deps {
-            out.push_str(&format!(
-                "  - #{} {} *(merged)*\n",
-                m.number, m.title
-            ));
+    }
+
+    let root_merged_deps: Vec<&MergedPr> = merged_deps
+        .iter()
+        .filter(|m| !secondary_merged_prs.contains(&m.number))
+        .collect();
+
+    if stack.is_component_linear(&component) && secondary_merged_prs.is_empty()
+    {
+        for m in root_merged_deps {
+            out.push_str(&format!("- #{}\n", m.number));
         }
-        // Group children by parent layer within this connected component so DFS
-        // traversal keeps branches intact without leaking independent stacks.
+        for &i in &component {
+            let entry = format_layer_entry(&stack.layers[i], i == current);
+            out.push_str(&format!("- {entry}\n"));
+        }
+    } else {
+        for m in root_merged_deps {
+            out.push_str(&format!("  - #{}\n", m.number));
+        }
+        // Group children by primary parent layer within this connected component
+        // so DFS traversal nests multi-dependency PRs under their primary stack
+        // branch rather than at root level.
         let mut children_map: std::collections::HashMap<
             Option<usize>,
             Vec<usize>,
         > = std::collections::HashMap::new();
         for &i in &component {
-            let layer = &stack.layers[i];
-            let parent = match layer.dep {
-                Dep::Main | Dep::ExternalPr(_) => None,
-                Dep::Layer(j) => Some(j),
-            };
+            let parent = stack.layers[i].layer_deps().first().copied();
             children_map.entry(parent).or_default().push(i);
         }
 
-        render_children(stack, &children_map, None, 1, current, &mut out);
+        render_children(
+            config,
+            stack,
+            &children_map,
+            &merged_set,
+            None,
+            1,
+            current,
+            &mut out,
+        );
+        for n in secondary_merged_prs {
+            out.push_str(&format!("  - #{n}\n"));
+        }
     }
 
     out.push_str(
@@ -186,9 +229,12 @@ pub fn render_with_merged(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_children(
+    config: &Config,
     stack: &Stack,
     children_map: &std::collections::HashMap<Option<usize>, Vec<usize>>,
+    merged_set: &std::collections::HashSet<u64>,
     parent: Option<usize>,
     depth: usize,
     current: usize,
@@ -198,37 +244,35 @@ fn render_children(
         for &i in kids {
             let layer = &stack.layers[i];
             let indent = "  ".repeat(depth);
-            let reference = match layer.pr {
-                Some(n) => format!("#{n}"),
-                None => "(not submitted)".to_string(),
-            };
-            let multi_dep_suffix = if layer.has_multiple_layer_deps() {
-                let labels: Vec<String> = layer
-                    .layer_deps()
-                    .into_iter()
-                    .map(|j| match stack.layers[j].pr {
-                        Some(n) => format!("#{n}"),
-                        None => format!("layer {}", j + 1),
-                    })
-                    .collect();
-                format!(" *(depends on {})*", labels.join(", "))
-            } else {
-                String::new()
-            };
-            if i == current {
-                out.push_str(&format!(
-                    "{indent}- ➡️ **{reference} {}**{multi_dep_suffix}\n",
-                    layer.subject(),
-                ));
-            } else {
-                out.push_str(&format!(
-                    "{indent}- {reference} {}{multi_dep_suffix}\n",
-                    layer.subject(),
-                ));
+            let entry = format_layer_entry(layer, i == current);
+
+            let mut extra_deps: Vec<String> = layer
+                .layer_deps()
+                .into_iter()
+                .skip(1)
+                .map(|j| match stack.layers[j].pr {
+                    Some(n) => {
+                        format!("[#{n}]({})", config.pull_request_url(n))
+                    }
+                    None => format!("layer {}", j + 1),
+                })
+                .collect();
+            for n in layer_secondary_merged_prs(layer, merged_set) {
+                extra_deps
+                    .push(format!("[#{n}]({})", config.pull_request_url(n)));
             }
+            let multi_dep_suffix = if extra_deps.is_empty() {
+                String::new()
+            } else {
+                format!(" *(also depends on {})*", extra_deps.join(", "))
+            };
+
+            out.push_str(&format!("{indent}- {entry}{multi_dep_suffix}\n"));
             render_children(
+                config,
                 stack,
                 children_map,
+                merged_set,
                 Some(i),
                 depth + 1,
                 current,
@@ -262,6 +306,38 @@ pub async fn update_all(
     .await
 }
 
+/// Extract `(layer_pr, secondary_dep_pr)` pairs from `*(also depends on ...)*`
+/// annotations in the generated `<!-- nspr:stack -->` block of an existing comment.
+pub fn extract_secondary_deps(body: &str) -> Vec<(u64, u64)> {
+    let block = if let Some(start) = body.find(BEGIN)
+        && let Some(end) = body[start..].find(END)
+    {
+        &body[start + BEGIN.len()..start + end]
+    } else {
+        return Vec::new();
+    };
+
+    let mut pairs = Vec::new();
+    let line_re = lazy_regex::regex!(
+        r"^\s*-\s*(?:➡️\s*\*\*)?#(\d+)\b.*?\*\((?:also )?depends on (.+)\)\*"
+    );
+    let pr_re = lazy_regex::regex!(r"#(\d+)\b");
+    for line in block.lines() {
+        if let Some(caps) = line_re.captures(line)
+            && let Ok(layer_pr) = caps[1].parse::<u64>()
+        {
+            for dep_caps in pr_re.captures_iter(&caps[2]) {
+                if let Ok(dep_pr) = dep_caps[1].parse::<u64>()
+                    && !pairs.contains(&(layer_pr, dep_pr))
+                {
+                    pairs.push((layer_pr, dep_pr));
+                }
+            }
+        }
+    }
+    pairs
+}
+
 /// Post or update the stack comment on layers selected by `opts` (skipping
 /// unrelated stacks when `nspr diff` is scoped to the current stack).
 pub async fn update_for_opts(
@@ -270,6 +346,7 @@ pub async fn update_for_opts(
     stack: &Stack,
     opts: &crate::engine::SyncOptions,
 ) -> Result<usize> {
+    let mut stack = stack.clone();
     let active_prs: std::collections::HashSet<u64> =
         stack.layers.iter().filter_map(|l| l.pr).collect();
 
@@ -300,6 +377,7 @@ pub async fn update_for_opts(
         }
 
         let mut candidate_merged_nums: Vec<u64> = Vec::new();
+        let mut comment_secondary_pairs: Vec<(u64, u64)> = Vec::new();
         for &i in &component {
             for n in stack.layers[i].external_pr_deps() {
                 if !active_prs.contains(&n)
@@ -321,6 +399,19 @@ pub async fn update_for_opts(
                         && !candidate_merged_nums.contains(&n)
                     {
                         candidate_merged_nums.push(n);
+                    }
+                }
+                for (layer_pr, dep_pr) in extract_secondary_deps(&comment.body)
+                {
+                    if !active_prs.contains(&dep_pr) {
+                        if !candidate_merged_nums.contains(&dep_pr) {
+                            candidate_merged_nums.push(dep_pr);
+                        }
+                        if !comment_secondary_pairs
+                            .contains(&(layer_pr, dep_pr))
+                        {
+                            comment_secondary_pairs.push((layer_pr, dep_pr));
+                        }
                     }
                 }
             }
@@ -346,6 +437,17 @@ pub async fn update_for_opts(
             };
             if let Some(m) = entry {
                 merged_deps.push(m);
+            }
+        }
+
+        for (layer_pr, dep_pr) in comment_secondary_pairs {
+            if merged_deps.iter().any(|m| m.number == dep_pr)
+                && let Some(&i) = component
+                    .iter()
+                    .find(|&&i| stack.layers[i].pr == Some(layer_pr))
+                && !stack.layers[i].merged_pr_deps.contains(&dep_pr)
+            {
+                stack.layers[i].merged_pr_deps.push(dep_pr);
             }
         }
 
@@ -379,7 +481,7 @@ pub async fn update_for_opts(
                 continue;
             }
 
-            let block = render_with_merged(config, stack, i, &merged_deps);
+            let block = render_with_merged(config, &stack, i, &merged_deps);
             match existing {
                 Some(comment) => {
                     let body = splice(&comment.body, &block);
@@ -401,7 +503,7 @@ pub async fn update_for_opts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stack::Layer;
+    use crate::stack::{Dep, Layer};
 
     #[test]
     fn splice_into_an_empty_body() {
@@ -481,8 +583,8 @@ mod tests {
 
         let rendered = render(&config, &stack, 1);
         assert!(rendered.contains("- `main`\n"));
-        assert!(rendered.contains("- #101 Layer 1\n"));
-        assert!(rendered.contains("- ➡️ **#102 Layer 2**\n"));
+        assert!(rendered.contains("- #101\n"));
+        assert!(rendered.contains("- ➡️ **#102**\n"));
         // Ensure no indented bullet points
         assert!(!rendered.contains("  -"));
     }
@@ -540,9 +642,110 @@ mod tests {
 
         let rendered = render(&config, &stack, 1);
         assert!(!stack.is_linear());
-        assert!(rendered.contains("  - #101 Layer 1\n"));
-        assert!(rendered.contains("    - ➡️ **#102 Layer 2**\n"));
-        assert!(rendered.contains("    - #103 Layer 3 sibling\n"));
+        assert!(rendered.contains("  - #101\n"));
+        assert!(rendered.contains("    - ➡️ **#102**\n"));
+        assert!(rendered.contains("    - #103\n"));
+    }
+
+    #[test]
+    fn render_multi_dependency_stack_before_and_after_merge() {
+        let config = Config::new(
+            "owner".into(),
+            "repo".into(),
+            "main".into(),
+            "user".into(),
+        );
+        let oid = git2::Oid::ZERO_SHA1;
+        let stack_before = Stack {
+            trunk: "main".into(),
+            base: oid,
+            layers: vec![
+                Layer {
+                    commit: oid,
+                    parent: oid,
+                    message: crate::trailers::CommitMessage::parse("A1\n"),
+                    pr: Some(56),
+                    dep_spec: None,
+                    dep_specs: Vec::new(),
+                    dep: Dep::Main,
+                    deps: vec![Dep::Main],
+                    merged_pr_deps: Vec::new(),
+                },
+                Layer {
+                    commit: oid,
+                    parent: oid,
+                    message: crate::trailers::CommitMessage::parse("A2\n"),
+                    pr: Some(57),
+                    dep_spec: None,
+                    dep_specs: Vec::new(),
+                    dep: Dep::Layer(0),
+                    deps: vec![Dep::Layer(0)],
+                    merged_pr_deps: Vec::new(),
+                },
+                Layer {
+                    commit: oid,
+                    parent: oid,
+                    message: crate::trailers::CommitMessage::parse("B1\n"),
+                    pr: Some(58),
+                    dep_spec: None,
+                    dep_specs: Vec::new(),
+                    dep: Dep::Main,
+                    deps: vec![Dep::Main],
+                    merged_pr_deps: Vec::new(),
+                },
+                Layer {
+                    commit: oid,
+                    parent: oid,
+                    message: crate::trailers::CommitMessage::parse("Top\n"),
+                    pr: Some(59),
+                    dep_spec: None,
+                    dep_specs: Vec::new(),
+                    dep: Dep::Main,
+                    deps: vec![Dep::Layer(1), Dep::Layer(2)],
+                    merged_pr_deps: Vec::new(),
+                },
+            ],
+        };
+
+        let before = render(&config, &stack_before, 1);
+        assert!(
+            before.contains(
+                "- `main`\n  - #56\n    - ➡️ **#57**\n      - #59 *(also depends on [#58](https://github.com/owner/repo/pull/58))*\n  - #58\n"
+            ),
+            "{before}"
+        );
+
+        // After #58 is merged into main, #59 has 1 open layer_dep (#57) and
+        // #58 in merged_pr_deps. The rendered tree stays identical.
+        let stack_after = Stack {
+            trunk: "main".into(),
+            base: oid,
+            layers: vec![
+                stack_before.layers[0].clone(),
+                stack_before.layers[1].clone(),
+                Layer {
+                    commit: oid,
+                    parent: oid,
+                    message: crate::trailers::CommitMessage::parse("Top\n"),
+                    pr: Some(59),
+                    dep_spec: None,
+                    dep_specs: Vec::new(),
+                    dep: Dep::Layer(1),
+                    deps: vec![Dep::Layer(1), Dep::Main],
+                    merged_pr_deps: vec![58],
+                },
+            ],
+        };
+        let after = render_with_merged(
+            &config,
+            &stack_after,
+            1,
+            &[MergedPr {
+                number: 58,
+                title: "B1".into(),
+            }],
+        );
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -606,15 +809,15 @@ mod tests {
         };
 
         let comment_a = render(&config, &stack, 0);
-        assert!(comment_a.contains("- ➡️ **#101 ToolA 1**\n"));
-        assert!(comment_a.contains("- #102 ToolA 2\n"));
+        assert!(comment_a.contains("- ➡️ **#101**\n"));
+        assert!(comment_a.contains("- #102\n"));
         assert!(!comment_a.contains("#201"));
         assert!(!comment_a.contains("#202"));
         assert!(!comment_a.contains("  -"));
 
         let comment_b = render(&config, &stack, 3);
-        assert!(comment_b.contains("- #201 ToolB 1\n"));
-        assert!(comment_b.contains("- ➡️ **#202 ToolB 2**\n"));
+        assert!(comment_b.contains("- #201\n"));
+        assert!(comment_b.contains("- ➡️ **#202**\n"));
         assert!(!comment_b.contains("#101"));
         assert!(!comment_b.contains("#102"));
         assert!(!comment_b.contains("  -"));
