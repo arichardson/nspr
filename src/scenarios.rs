@@ -1586,19 +1586,31 @@ fn the_comment_renders_a_diamond_as_a_tree() {
     w.update_stack_comments();
 
     let body = w.comment_on(prs[0]).unwrap().body;
-    let indent = |needle: &str| -> usize {
-        let line = body
-            .lines()
-            .find(|l| l.contains(needle))
-            .unwrap_or_else(|| panic!("no line for {needle}: {body}"));
-        line.len() - line.trim_start().len()
-    };
-
-    // Both siblings sit one level below the layer they share, and level with
-    // each other.
-    let base = indent(&format!("#{}", prs[0]));
-    assert_eq!(indent(&format!("#{}", prs[1])), base + 2);
-    assert_eq!(indent(&format!("#{}", prs[2])), base + 2);
+    let base_url = w.config.pull_request_url(prs[0]);
+    assert!(
+        body.contains(&format!("- ➡️ **#{}** *(on `main`)*\n", prs[0])),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "- #{} *(depends on [#{base_pr}]({base_url}))*\n",
+            prs[1],
+            base_pr = prs[0]
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "- #{} *(depends on [#{base_pr}]({base_url}))*\n",
+            prs[2],
+            base_pr = prs[0]
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains("<details><summary>Dependency graph</summary>"),
+        "{body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5148,25 +5160,26 @@ fn multi_dependency_tree_merge_and_retarget_when_down_to_one() {
         "unexpected error: {land_err}"
     );
 
-    // Check stack comment on C shows the nested DAG and `also depends on`.
+    // Check stack comment on C shows the flat topological DAG and Mermaid graph.
     w.update_stack_comments();
     let comment_c = w
         .comment_on(pr_c)
         .expect("stack comment must be written on C")
         .body;
     assert!(
-        comment_c.contains(&format!("  - #{pr_a1}\n    - #{pr_a2}\n")),
-        "{comment_c}"
-    );
-    assert!(
-        comment_c.contains(&format!("  - #{pr_b1}\n")),
-        "{comment_c}"
-    );
-    assert!(
         comment_c.contains(&format!(
-            "      - ➡️ **#{pr_c}** *(also depends on [#{pr_b1}]({}))*",
-            w.config.pull_request_url(pr_b1)
+            "- #{pr_a1} *(on `main`)*\n\
+             - #{pr_a2} *(depends on [#{pr_a1}]({}))*\n\
+             - #{pr_b1} *(on `main`)*\n\
+             - ➡️ **#{pr_c}** *(depends on [#{pr_a2}]({}), [#{pr_b1}]({}))*\n",
+            w.config.pull_request_url(pr_a1),
+            w.config.pull_request_url(pr_a2),
+            w.config.pull_request_url(pr_b1),
         )),
+        "{comment_c}"
+    );
+    assert!(
+        comment_c.contains("<details><summary>Dependency graph</summary>"),
         "{comment_c}"
     );
 

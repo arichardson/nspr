@@ -132,13 +132,10 @@ fn format_layer_entry(layer: &crate::stack::Layer, is_current: bool) -> String {
     }
 }
 
-fn layer_secondary_merged_prs(
+fn layer_direct_merged_prs(
     layer: &crate::stack::Layer,
     merged_set: &std::collections::HashSet<u64>,
 ) -> Vec<u64> {
-    if layer.layer_deps().is_empty() {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     for &n in &layer.merged_pr_deps {
         if !out.contains(&n) {
@@ -153,6 +150,20 @@ fn layer_secondary_merged_prs(
     out
 }
 
+fn layer_secondary_merged_prs(
+    layer: &crate::stack::Layer,
+    merged_set: &std::collections::HashSet<u64>,
+) -> Vec<u64> {
+    if layer.layer_deps().is_empty() {
+        return Vec::new();
+    }
+    layer_direct_merged_prs(layer, merged_set)
+}
+
+fn escape_mermaid_label(s: &str) -> String {
+    s.replace('"', "#quot;")
+}
+
 /// Render the stack seen from layer `current`, including any already-merged
 /// dependencies (`merged_deps`) that are no longer in the local commit history.
 pub fn render_with_merged(
@@ -162,7 +173,6 @@ pub fn render_with_merged(
     merged_deps: &[MergedPr],
 ) -> String {
     let mut out = String::from("#### Stack\n\n");
-    out.push_str(&format!("- `{}`\n", config.trunk));
 
     let merged_set: std::collections::HashSet<u64> =
         merged_deps.iter().map(|m| m.number).collect();
@@ -177,14 +187,10 @@ pub fn render_with_merged(
         }
     }
 
-    let root_merged_deps: Vec<&MergedPr> = merged_deps
-        .iter()
-        .filter(|m| !secondary_merged_prs.contains(&m.number))
-        .collect();
-
     if stack.is_component_linear(&component) && secondary_merged_prs.is_empty()
     {
-        for m in root_merged_deps {
+        out.push_str(&format!("- `{}`\n", config.trunk));
+        for m in merged_deps {
             out.push_str(&format!("- #{}\n", m.number));
         }
         for &i in &component {
@@ -192,34 +198,229 @@ pub fn render_with_merged(
             out.push_str(&format!("- {entry}\n"));
         }
     } else {
-        for m in root_merged_deps {
-            out.push_str(&format!("  - #{}\n", m.number));
-        }
-        // Group children by primary parent layer within this connected component
-        // so DFS traversal nests multi-dependency PRs under their primary stack
-        // branch rather than at root level.
-        let mut children_map: std::collections::HashMap<
-            Option<usize>,
-            Vec<usize>,
+        let mut raw_merged_for_layer: std::collections::HashMap<
+            usize,
+            Vec<u64>,
         > = std::collections::HashMap::new();
         for &i in &component {
-            let parent = stack.layers[i].layer_deps().first().copied();
-            children_map.entry(parent).or_default().push(i);
+            raw_merged_for_layer.insert(
+                i,
+                layer_direct_merged_prs(&stack.layers[i], &merged_set),
+            );
         }
 
-        render_children(
-            config,
-            stack,
-            &children_map,
-            &merged_set,
-            None,
-            1,
-            current,
-            &mut out,
-        );
-        for n in secondary_merged_prs {
-            out.push_str(&format!("  - #{n}\n"));
+        // Transitive reduction for merged PR deps: if layer `i` depends on an
+        // ancestor layer `j` in `component` that already depends on merged PR
+        // `n`, do not redundantly attach `n` directly to `i`.
+        let mut reduced_merged_for_layer: std::collections::HashMap<
+            usize,
+            Vec<u64>,
+        > = std::collections::HashMap::new();
+        for &i in &component {
+            let mut ancestor_merged = std::collections::HashSet::new();
+            let mut stack_dfs = stack.layers[i].layer_deps();
+            let mut visited = std::collections::HashSet::new();
+            while let Some(anc) = stack_dfs.pop() {
+                if visited.insert(anc) {
+                    if let Some(ms) = raw_merged_for_layer.get(&anc) {
+                        ancestor_merged.extend(ms.iter().copied());
+                    }
+                    stack_dfs.extend(stack.layers[anc].layer_deps());
+                }
+            }
+            let reduced: Vec<u64> = raw_merged_for_layer[&i]
+                .iter()
+                .copied()
+                .filter(|n| !ancestor_merged.contains(n))
+                .collect();
+            reduced_merged_for_layer.insert(i, reduced);
         }
+
+        let referenced_merged: std::collections::HashSet<u64> =
+            reduced_merged_for_layer
+                .values()
+                .flatten()
+                .copied()
+                .collect();
+
+        enum DagNode {
+            Merged(MergedPr),
+            Layer(usize),
+        }
+
+        let merged_by_num: std::collections::HashMap<u64, &MergedPr> =
+            merged_deps.iter().map(|m| (m.number, m)).collect();
+        let mut emitted_merged = std::collections::HashSet::new();
+        let mut nodes: Vec<DagNode> = Vec::new();
+
+        for m in merged_deps {
+            if !referenced_merged.contains(&m.number)
+                && emitted_merged.insert(m.number)
+            {
+                nodes.push(DagNode::Merged(m.clone()));
+            }
+        }
+
+        for &i in &component {
+            if let Some(ms) = reduced_merged_for_layer.get(&i) {
+                for &n in ms {
+                    if emitted_merged.insert(n) {
+                        let m = merged_by_num.get(&n).map_or_else(
+                            || MergedPr {
+                                number: n,
+                                title: String::new(),
+                            },
+                            |&m| m.clone(),
+                        );
+                        nodes.push(DagNode::Merged(m));
+                    }
+                }
+            }
+            nodes.push(DagNode::Layer(i));
+        }
+
+        for node in &nodes {
+            match node {
+                DagNode::Merged(m) => {
+                    out.push_str(&format!(
+                        "- #{} *(on `{}`)*\n",
+                        m.number, config.trunk
+                    ));
+                }
+                DagNode::Layer(i) => {
+                    let i = *i;
+                    let layer = &stack.layers[i];
+                    let entry = format_layer_entry(layer, i == current);
+                    let mut dep_links: Vec<String> = layer
+                        .layer_deps()
+                        .into_iter()
+                        .map(|j| match stack.layers[j].pr {
+                            Some(n) => {
+                                format!(
+                                    "[#{n}]({})",
+                                    config.pull_request_url(n)
+                                )
+                            }
+                            None => format!("layer {}", j + 1),
+                        })
+                        .collect();
+                    if let Some(ms) = reduced_merged_for_layer.get(&i) {
+                        for &n in ms {
+                            dep_links.push(format!(
+                                "[#{n}]({})",
+                                config.pull_request_url(n)
+                            ));
+                        }
+                    }
+                    if dep_links.is_empty() {
+                        out.push_str(&format!(
+                            "- {entry} *(on `{}`)*\n",
+                            config.trunk
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "- {entry} *(depends on {})*\n",
+                            dep_links.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+
+        let trunk_id = if config
+            .trunk
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            config.trunk.as_str()
+        } else {
+            "trunk"
+        };
+        out.push_str("\n<details><summary>Dependency graph</summary>\n\n```mermaid\nflowchart BT\n");
+        out.push_str(&format!(
+            "  {trunk_id}[(\"{}\")]\n",
+            escape_mermaid_label(&config.trunk)
+        ));
+
+        let mut clicks: Vec<(String, String)> = Vec::new();
+        for node in &nodes {
+            match node {
+                DagNode::Merged(m) => {
+                    let node_id = format!("PR{}", m.number);
+                    let label = if m.title.is_empty() {
+                        format!("#{}", m.number)
+                    } else {
+                        format!(
+                            "#{} {}",
+                            m.number,
+                            escape_mermaid_label(&m.title)
+                        )
+                    };
+                    out.push_str(&format!(
+                        "  {node_id}[\"{label}\"] --> {trunk_id}\n"
+                    ));
+                    clicks.push((node_id, config.pull_request_url(m.number)));
+                }
+                DagNode::Layer(i) => {
+                    let i = *i;
+                    let layer = &stack.layers[i];
+                    let (node_id, label) = match layer.pr {
+                        Some(n) => {
+                            let id = format!("PR{n}");
+                            clicks
+                                .push((id.clone(), config.pull_request_url(n)));
+                            (
+                                id,
+                                format!(
+                                    "#{n} {}",
+                                    escape_mermaid_label(layer.subject())
+                                ),
+                            )
+                        }
+                        None => (
+                            format!("L{i}"),
+                            format!(
+                                "(not submitted) {}",
+                                escape_mermaid_label(layer.subject())
+                            ),
+                        ),
+                    };
+                    let mut targets: Vec<String> = layer
+                        .layer_deps()
+                        .into_iter()
+                        .map(|j| match stack.layers[j].pr {
+                            Some(n) => format!("PR{n}"),
+                            None => format!("L{j}"),
+                        })
+                        .collect();
+                    if let Some(ms) = reduced_merged_for_layer.get(&i) {
+                        for &n in ms {
+                            targets.push(format!("PR{n}"));
+                        }
+                    }
+                    if targets.is_empty() {
+                        out.push_str(&format!(
+                            "  {node_id}[\"{label}\"] --> {trunk_id}\n"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  {node_id}[\"{label}\"] --> {}\n",
+                            targets.join(" & ")
+                        ));
+                    }
+                }
+            }
+        }
+        for (node_id, url) in clicks {
+            out.push_str(&format!("  click {node_id} \"{url}\" \"_blank\"\n"));
+        }
+        let current_node_id = match stack.layers[current].pr {
+            Some(n) => format!("PR{n}"),
+            None => format!("L{current}"),
+        };
+        out.push_str("  classDef current stroke:#f78166,stroke-width:3px\n");
+        out.push_str(&format!("  class {current_node_id} current\n"));
+        out.push_str("```\n</details>\n");
     }
 
     out.push_str(
@@ -227,59 +428,6 @@ pub fn render_with_merged(
          Each pull request shows only its own changes.</sub>",
     );
     out
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_children(
-    config: &Config,
-    stack: &Stack,
-    children_map: &std::collections::HashMap<Option<usize>, Vec<usize>>,
-    merged_set: &std::collections::HashSet<u64>,
-    parent: Option<usize>,
-    depth: usize,
-    current: usize,
-    out: &mut String,
-) {
-    if let Some(kids) = children_map.get(&parent) {
-        for &i in kids {
-            let layer = &stack.layers[i];
-            let indent = "  ".repeat(depth);
-            let entry = format_layer_entry(layer, i == current);
-
-            let mut extra_deps: Vec<String> = layer
-                .layer_deps()
-                .into_iter()
-                .skip(1)
-                .map(|j| match stack.layers[j].pr {
-                    Some(n) => {
-                        format!("[#{n}]({})", config.pull_request_url(n))
-                    }
-                    None => format!("layer {}", j + 1),
-                })
-                .collect();
-            for n in layer_secondary_merged_prs(layer, merged_set) {
-                extra_deps
-                    .push(format!("[#{n}]({})", config.pull_request_url(n)));
-            }
-            let multi_dep_suffix = if extra_deps.is_empty() {
-                String::new()
-            } else {
-                format!(" *(also depends on {})*", extra_deps.join(", "))
-            };
-
-            out.push_str(&format!("{indent}- {entry}{multi_dep_suffix}\n"));
-            render_children(
-                config,
-                stack,
-                children_map,
-                merged_set,
-                Some(i),
-                depth + 1,
-                current,
-                out,
-            );
-        }
-    }
 }
 
 /// Post or update the stack comment on every layer that is part of a stack, and
@@ -642,9 +790,28 @@ mod tests {
 
         let rendered = render(&config, &stack, 1);
         assert!(!stack.is_linear());
-        assert!(rendered.contains("  - #101\n"));
-        assert!(rendered.contains("    - ➡️ **#102**\n"));
-        assert!(rendered.contains("    - #103\n"));
+        assert!(rendered.contains("- #101 *(on `main`)*\n"), "{rendered}");
+        assert!(
+            rendered.contains("- ➡️ **#102** *(depends on [#101](https://github.com/owner/repo/pull/101))*\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- #103 *(depends on [#101](https://github.com/owner/repo/pull/101))*\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<details><summary>Dependency graph</summary>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("PR102[\"#102 Layer 2\"] --> PR101\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("PR103[\"#103 Layer 3 sibling\"] --> PR101\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("class PR102 current\n"), "{rendered}");
     }
 
     #[test]
@@ -710,13 +877,28 @@ mod tests {
         let before = render(&config, &stack_before, 1);
         assert!(
             before.contains(
-                "- `main`\n  - #56\n    - ➡️ **#57**\n      - #59 *(also depends on [#58](https://github.com/owner/repo/pull/58))*\n  - #58\n"
+                "- #56 *(on `main`)*\n\
+                 - ➡️ **#57** *(depends on [#56](https://github.com/owner/repo/pull/56))*\n\
+                 - #58 *(on `main`)*\n\
+                 - #59 *(depends on [#57](https://github.com/owner/repo/pull/57), [#58](https://github.com/owner/repo/pull/58))*\n"
+            ),
+            "{before}"
+        );
+        assert!(
+            before.contains(
+                "```mermaid\n\
+                 flowchart BT\n\
+                 \x20 main[(\"main\")]\n\
+                 \x20 PR56[\"#56 A1\"] --> main\n\
+                 \x20 PR57[\"#57 A2\"] --> PR56\n\
+                 \x20 PR58[\"#58 B1\"] --> main\n\
+                 \x20 PR59[\"#59 Top\"] --> PR57 & PR58\n"
             ),
             "{before}"
         );
 
         // After #58 is merged into main, #59 has 1 open layer_dep (#57) and
-        // #58 in merged_pr_deps. The rendered tree stays identical.
+        // #58 in merged_pr_deps. The rendered DAG stays identical.
         let stack_after = Stack {
             trunk: "main".into(),
             base: oid,
