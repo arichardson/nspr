@@ -857,17 +857,38 @@ impl Forge for GitHubForge {
     async fn update_comment(&self, id: u64, body: &str) -> Result<()> {
         // octocrab's `issues().update_comment()` sends POST; GitHub documents
         // this endpoint as PATCH, so the call is made directly.
+        //
+        // The response body is deliberately not deserialised: nothing uses it,
+        // and GitHub has been seen answering with an empty body, which
+        // octocrab reports as `EOF while parsing a value` even though the
+        // edit went through.
         let route =
             format!("/repos/{}/{}/issues/comments/{id}", self.owner, self.repo);
         debug!("API PATCH {route}");
-        self.api
-            .patch::<octocrab::models::issues::Comment, _, _>(
-                route,
-                Some(&serde_json::json!({ "body": body })),
-            )
+        let response = self
+            .api
+            ._patch(route, Some(&serde_json::json!({ "body": body })))
             .await
             .wrap_err_with(|| format!("could not update comment {id}"))?;
-        Ok(())
+        let status = response.status().as_u16();
+        let response_body =
+            self.api.body_to_string(response).await.unwrap_or_default();
+        debug!("  -> HTTP {status} ({} byte body)", response_body.len());
+
+        let current = if (200..300).contains(&status) {
+            None
+        } else {
+            // An error status does not prove the edit was lost, so check
+            // before failing the whole run over it.
+            self.api
+                .issues(&self.owner, &self.repo)
+                .get_comment(octocrab::models::CommentId(id))
+                .await
+                .ok()
+                .and_then(|c| c.body)
+        };
+        comment_edit_result(status, &response_body, current.as_deref(), body)
+            .map_err(|reason| eyre!("could not update comment {id}: {reason}"))
     }
 
     async fn delete_comment(&self, id: u64) -> Result<()> {
@@ -1300,6 +1321,41 @@ fn unused_name(preferred: &str, taken: impl Fn(&str) -> bool) -> String {
         }
     }
     unreachable!()
+}
+
+/// Decide whether a `PATCH /issues/comments/{id}` succeeded.
+///
+/// Any 2xx counts, whatever the body (it may be empty). For anything else,
+/// `current` is the comment's body as re-read afterwards: if it already holds
+/// `wanted`, GitHub applied the edit despite the error status. Otherwise the
+/// reason names the status and GitHub's message, or says the body was empty.
+fn comment_edit_result(
+    status: u16,
+    response_body: &str,
+    current: Option<&str>,
+    wanted: &str,
+) -> std::result::Result<(), String> {
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    if current == Some(wanted) {
+        debug!(
+            "comment edit answered HTTP {status}, but the comment already has the new text"
+        );
+        return Ok(());
+    }
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        message: String,
+    }
+    let detail = if response_body.trim().is_empty() {
+        "empty response".to_string()
+    } else {
+        serde_json::from_str::<ErrorBody>(response_body)
+            .map(|e| e.message)
+            .unwrap_or_else(|_| response_body.trim().to_string())
+    };
+    Err(format!("GitHub returned HTTP {status} ({detail})"))
 }
 
 fn status_code(error: &octocrab::Error) -> Option<u16> {
@@ -2214,5 +2270,43 @@ mod tests {
         assert_eq!(nodes[0].number, 4242);
         assert_eq!(nodes[1].number, 4243);
         assert_eq!(nodes[1].title, "Second PR");
+    }
+
+    /// The bug this guards against: a successful edit whose response has no
+    /// body used to abort `nspr diff` with `EOF while parsing a value`.
+    #[test]
+    fn comment_edit_with_success_status_and_empty_body_succeeds() {
+        assert_eq!(comment_edit_result(200, "", None, "new"), Ok(()));
+        assert_eq!(comment_edit_result(204, "", None, "new"), Ok(()));
+    }
+
+    #[test]
+    fn comment_edit_with_error_status_succeeds_if_the_edit_landed() {
+        assert_eq!(comment_edit_result(502, "", Some("new"), "new"), Ok(()));
+    }
+
+    #[test]
+    fn comment_edit_with_error_status_and_empty_body_names_the_status() {
+        assert_eq!(
+            comment_edit_result(502, "", Some("old"), "new"),
+            Err("GitHub returned HTTP 502 (empty response)".to_string())
+        );
+        assert_eq!(
+            comment_edit_result(502, "  \n", None, "new"),
+            Err("GitHub returned HTTP 502 (empty response)".to_string())
+        );
+    }
+
+    #[test]
+    fn comment_edit_with_error_status_reports_githubs_message() {
+        let body = r#"{"message":"Validation Failed","documentation_url":"x"}"#;
+        assert_eq!(
+            comment_edit_result(422, body, Some("old"), "new"),
+            Err("GitHub returned HTTP 422 (Validation Failed)".to_string())
+        );
+        assert_eq!(
+            comment_edit_result(500, "<html>oops</html>", None, "new"),
+            Err("GitHub returned HTTP 500 (<html>oops</html>)".to_string())
+        );
     }
 }
