@@ -1587,23 +1587,15 @@ fn the_comment_renders_a_diamond_as_a_tree() {
 
     let body = w.comment_on(prs[0]).unwrap().body;
     let base_url = w.config.pull_request_url(prs[0]);
-    assert!(
-        body.contains(&format!("- ➡️ **#{}** *(on `main`)*\n", prs[0])),
-        "{body}"
-    );
+    // Both siblings share one dependency, so they are listed together under a
+    // single heading naming it, rather than one appearing to stack on the other.
     assert!(
         body.contains(&format!(
-            "- #{} *(depends on [#{base_pr}]({base_url}))*\n",
-            prs[1],
-            base_pr = prs[0]
-        )),
-        "{body}"
-    );
-    assert!(
-        body.contains(&format!(
-            "- #{} *(depends on [#{base_pr}]({base_url}))*\n",
-            prs[2],
-            base_pr = prs[0]
+            "- **On `main`:**\n  - ➡️ **#{base}**\n\
+             - **After [#{base}]({base_url}):**\n  - #{left}\n  - #{right}\n",
+            base = prs[0],
+            left = prs[1],
+            right = prs[2],
         )),
         "{body}"
     );
@@ -5160,7 +5152,7 @@ fn multi_dependency_tree_merge_and_retarget_when_down_to_one() {
         "unexpected error: {land_err}"
     );
 
-    // Check stack comment on C shows the flat topological DAG and Mermaid graph.
+    // Check stack comment on C groups PRs under their shared dependencies.
     w.update_stack_comments();
     let comment_c = w
         .comment_on(pr_c)
@@ -5168,10 +5160,9 @@ fn multi_dependency_tree_merge_and_retarget_when_down_to_one() {
         .body;
     assert!(
         comment_c.contains(&format!(
-            "- #{pr_a1} *(on `main`)*\n\
-             - #{pr_a2} *(depends on [#{pr_a1}]({}))*\n\
-             - #{pr_b1} *(on `main`)*\n\
-             - ➡️ **#{pr_c}** *(depends on [#{pr_a2}]({}), [#{pr_b1}]({}))*\n",
+            "- **On `main`:**\n  - #{pr_a1}\n  - #{pr_b1}\n\
+             - **After [#{pr_a1}]({}):**\n  - #{pr_a2}\n\
+             - **After [#{pr_a2}]({}) + [#{pr_b1}]({}):**\n  - ➡️ **#{pr_c}**\n",
             w.config.pull_request_url(pr_a1),
             w.config.pull_request_url(pr_a2),
             w.config.pull_request_url(pr_b1),

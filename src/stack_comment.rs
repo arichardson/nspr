@@ -279,51 +279,48 @@ pub fn render_with_merged(
             nodes.push(DagNode::Layer(i));
         }
 
+        // Group entries by their exact dependency set so each PR line is just
+        // the PR (GitHub expands a bare `#N` list item into its status icon and
+        // title) and the dependencies are stated once in a short heading.
+        // A group is placed at the position of its first member; every later
+        // member depends only on the group's key, which is already listed
+        // above, so the grouped order stays topological.
+        let dep_link =
+            |n: u64| format!("[#{n}]({})", config.pull_request_url(n));
+        let mut groups: Vec<(Vec<String>, Vec<String>)> = Vec::new();
         for node in &nodes {
-            match node {
-                DagNode::Merged(m) => {
-                    out.push_str(&format!(
-                        "- #{} *(on `{}`)*\n",
-                        m.number, config.trunk
-                    ));
-                }
+            let (key, entry) = match node {
+                DagNode::Merged(m) => (Vec::new(), format!("#{}", m.number)),
                 DagNode::Layer(i) => {
                     let i = *i;
                     let layer = &stack.layers[i];
-                    let entry = format_layer_entry(layer, i == current);
-                    let mut dep_links: Vec<String> = layer
+                    let mut key: Vec<String> = layer
                         .layer_deps()
                         .into_iter()
                         .map(|j| match stack.layers[j].pr {
-                            Some(n) => {
-                                format!(
-                                    "[#{n}]({})",
-                                    config.pull_request_url(n)
-                                )
-                            }
+                            Some(n) => dep_link(n),
                             None => format!("layer {}", j + 1),
                         })
                         .collect();
                     if let Some(ms) = reduced_merged_for_layer.get(&i) {
-                        for &n in ms {
-                            dep_links.push(format!(
-                                "[#{n}]({})",
-                                config.pull_request_url(n)
-                            ));
-                        }
+                        key.extend(ms.iter().map(|&n| dep_link(n)));
                     }
-                    if dep_links.is_empty() {
-                        out.push_str(&format!(
-                            "- {entry} *(on `{}`)*\n",
-                            config.trunk
-                        ));
-                    } else {
-                        out.push_str(&format!(
-                            "- {entry} *(depends on {})*\n",
-                            dep_links.join(", ")
-                        ));
-                    }
+                    (key, format_layer_entry(layer, i == current))
                 }
+            };
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, entries)) => entries.push(entry),
+                None => groups.push((key, vec![entry])),
+            }
+        }
+        for (key, entries) in &groups {
+            if key.is_empty() {
+                out.push_str(&format!("- **On `{}`:**\n", config.trunk));
+            } else {
+                out.push_str(&format!("- **After {}:**\n", key.join(" + ")));
+            }
+            for entry in entries {
+                out.push_str(&format!("  - {entry}\n"));
             }
         }
 
@@ -454,8 +451,12 @@ pub async fn update_all(
     .await
 }
 
-/// Extract `(layer_pr, secondary_dep_pr)` pairs from `*(also depends on ...)*`
-/// annotations in the generated `<!-- nspr:stack -->` block of an existing comment.
+/// Extract `(layer_pr, dep_pr)` pairs from the generated `<!-- nspr:stack -->`
+/// block of an existing comment.
+///
+/// Understands the grouped layout (`- **After #a + #b:**` followed by nested
+/// `  - #n` entries) as well as the older inline `*(depends on ...)*` and
+/// `*(also depends on ...)*` annotations.
 pub fn extract_secondary_deps(body: &str) -> Vec<(u64, u64)> {
     let block = if let Some(start) = body.find(BEGIN)
         && let Some(end) = body[start..].find(END)
@@ -466,20 +467,47 @@ pub fn extract_secondary_deps(body: &str) -> Vec<(u64, u64)> {
     };
 
     let mut pairs = Vec::new();
+    let push = |pairs: &mut Vec<(u64, u64)>, layer_pr: u64, dep_pr: u64| {
+        if !pairs.contains(&(layer_pr, dep_pr)) {
+            pairs.push((layer_pr, dep_pr));
+        }
+    };
     let line_re = lazy_regex::regex!(
         r"^\s*-\s*(?:➡️\s*\*\*)?#(\d+)\b.*?\*\((?:also )?depends on (.+)\)\*"
     );
+    let heading_re =
+        lazy_regex::regex!(r"^-\s*\*\*(?:After (.+)|On .+):\*\*\s*$");
+    let entry_re = lazy_regex::regex!(r"^\s+-\s*(?:➡️\s*\*\*)?#(\d+)\b");
     let pr_re = lazy_regex::regex!(r"#(\d+)\b");
+    let mut group_deps: Vec<u64> = Vec::new();
     for line in block.lines() {
+        if let Some(caps) = heading_re.captures(line) {
+            group_deps = caps
+                .get(1)
+                .map(|m| {
+                    pr_re
+                        .captures_iter(m.as_str())
+                        .filter_map(|c| c[1].parse::<u64>().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            continue;
+        }
         if let Some(caps) = line_re.captures(line)
             && let Ok(layer_pr) = caps[1].parse::<u64>()
         {
             for dep_caps in pr_re.captures_iter(&caps[2]) {
-                if let Ok(dep_pr) = dep_caps[1].parse::<u64>()
-                    && !pairs.contains(&(layer_pr, dep_pr))
-                {
-                    pairs.push((layer_pr, dep_pr));
+                if let Ok(dep_pr) = dep_caps[1].parse::<u64>() {
+                    push(&mut pairs, layer_pr, dep_pr);
                 }
+            }
+            continue;
+        }
+        if let Some(caps) = entry_re.captures(line)
+            && let Ok(layer_pr) = caps[1].parse::<u64>()
+        {
+            for &dep_pr in &group_deps {
+                push(&mut pairs, layer_pr, dep_pr);
             }
         }
     }
@@ -790,13 +818,14 @@ mod tests {
 
         let rendered = render(&config, &stack, 1);
         assert!(!stack.is_linear());
-        assert!(rendered.contains("- #101 *(on `main`)*\n"), "{rendered}");
         assert!(
-            rendered.contains("- ➡️ **#102** *(depends on [#101](https://github.com/owner/repo/pull/101))*\n"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("- #103 *(depends on [#101](https://github.com/owner/repo/pull/101))*\n"),
+            rendered.contains(
+                "- **On `main`:**\n\
+                 \x20 - #101\n\
+                 - **After [#101](https://github.com/owner/repo/pull/101):**\n\
+                 \x20 - ➡️ **#102**\n\
+                 \x20 - #103\n"
+            ),
             "{rendered}"
         );
         assert!(
@@ -877,10 +906,13 @@ mod tests {
         let before = render(&config, &stack_before, 1);
         assert!(
             before.contains(
-                "- #56 *(on `main`)*\n\
-                 - ➡️ **#57** *(depends on [#56](https://github.com/owner/repo/pull/56))*\n\
-                 - #58 *(on `main`)*\n\
-                 - #59 *(depends on [#57](https://github.com/owner/repo/pull/57), [#58](https://github.com/owner/repo/pull/58))*\n"
+                "- **On `main`:**\n\
+                 \x20 - #56\n\
+                 \x20 - #58\n\
+                 - **After [#56](https://github.com/owner/repo/pull/56):**\n\
+                 \x20 - ➡️ **#57**\n\
+                 - **After [#57](https://github.com/owner/repo/pull/57) + [#58](https://github.com/owner/repo/pull/58):**\n\
+                 \x20 - #59\n"
             ),
             "{before}"
         );
@@ -1003,5 +1035,100 @@ mod tests {
         assert!(!comment_b.contains("#101"));
         assert!(!comment_b.contains("#102"));
         assert!(!comment_b.contains("  -"));
+    }
+
+    fn dag_layer(subject: &str, pr: u64, deps: Vec<Dep>) -> Layer {
+        let oid = git2::Oid::ZERO_SHA1;
+        let dep = Layer::compute_effective_dep(&deps);
+        Layer {
+            commit: oid,
+            parent: oid,
+            message: crate::trailers::CommitMessage::parse(&format!(
+                "{subject}\n"
+            )),
+            pr: Some(pr),
+            dep_spec: None,
+            dep_specs: Vec::new(),
+            dep,
+            deps,
+            merged_pr_deps: Vec::new(),
+        }
+    }
+
+    /// `B`, `C`, `E` on main; `A -> B & C`; `D -> A & E`; `F -> D`.
+    fn complex_dag() -> Stack {
+        Stack {
+            trunk: "main".into(),
+            base: git2::Oid::ZERO_SHA1,
+            layers: vec![
+                dag_layer("B", 64, vec![Dep::Main]),
+                dag_layer("C", 65, vec![Dep::Main]),
+                dag_layer("A", 66, vec![Dep::Layer(0), Dep::Layer(1)]),
+                dag_layer("E", 67, vec![Dep::Main]),
+                dag_layer("D", 68, vec![Dep::Layer(2), Dep::Layer(3)]),
+                dag_layer("F", 69, vec![Dep::Layer(4)]),
+            ],
+        }
+    }
+
+    #[test]
+    fn render_complex_dag_groups_prs_by_shared_dependencies() {
+        let config = Config::new(
+            "owner".into(),
+            "repo".into(),
+            "main".into(),
+            "user".into(),
+        );
+        let rendered = render(&config, &complex_dag(), 2);
+        let url = |n: u64| format!("https://github.com/owner/repo/pull/{n}");
+        let expected = format!(
+            "- **On `main`:**\n\
+             \x20 - #64\n\
+             \x20 - #65\n\
+             \x20 - #67\n\
+             - **After [#64]({}) + [#65]({}):**\n\
+             \x20 - ➡️ **#66**\n\
+             - **After [#66]({}) + [#67]({}):**\n\
+             \x20 - #68\n\
+             - **After [#68]({}):**\n\
+             \x20 - #69\n",
+            url(64),
+            url(65),
+            url(66),
+            url(67),
+            url(68),
+        );
+        assert!(rendered.contains(&expected), "{rendered}");
+        assert!(!rendered.contains("depends on"), "{rendered}");
+    }
+
+    #[test]
+    fn grouped_comment_round_trips_through_extract_functions() {
+        let config = Config::new(
+            "owner".into(),
+            "repo".into(),
+            "main".into(),
+            "user".into(),
+        );
+        let body = splice("", &render(&config, &complex_dag(), 5));
+        assert_eq!(
+            extract_stack_pr_numbers(&body),
+            vec![64, 65, 67, 66, 68, 69]
+        );
+        assert_eq!(
+            extract_secondary_deps(&body),
+            vec![(66, 64), (66, 65), (68, 66), (68, 67), (69, 68)]
+        );
+    }
+
+    #[test]
+    fn extract_secondary_deps_still_reads_inline_annotations() {
+        let body = format!(
+            "{BEGIN}\n- #57\n  - #59 *(also depends on [#58](https://x/58))*\n- #60 *(depends on [#57](https://x/57), [#58](https://x/58))*\n{END}"
+        );
+        assert_eq!(
+            extract_secondary_deps(&body),
+            vec![(59, 58), (60, 57), (60, 58)]
+        );
     }
 }
