@@ -34,6 +34,11 @@ textwrap = "0.16"
 tokio = { version = "1.47", features = ["macros", "rt", "time"] }
 unicode-normalization = "0.1"
 
+# Asks the Secret Service whether the keyring is locked before running
+# `gh auth token`, which would otherwise block until someone unlocks it.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+
 [dev-dependencies]
 tempfile = "3"
 
