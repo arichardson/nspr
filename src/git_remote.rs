@@ -32,15 +32,17 @@
 //!
 //! `auth-git2` handles all of that, and bounds its attempts.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use auth_git2::GitAuthenticator;
-use color_eyre::eyre::{Result, WrapErr as _, bail};
+use color_eyre::eyre::{Result, bail};
 use git2::{Direction, Oid, PushOptions, RemoteCallbacks, Repository};
-use log::{trace, warn};
+use log::trace;
 
 use crate::ssh_agent::{self, SshAgentStatus};
 
@@ -155,8 +157,13 @@ impl GitRemote {
         let mut callbacks = RemoteCallbacks::new();
         callbacks.credentials(auth.credentials(&config));
 
-        let res = func(&mut remote, callbacks).wrap_err_with(|| {
-            if is_ssh {
+        // A refused ref update means the connection and credentials worked, so
+        // the transport diagnosis below would only mislead.
+        let res = func(&mut remote, callbacks).map_err(|e| {
+            if e.downcast_ref::<PushRejected>().is_some() {
+                return e;
+            }
+            e.wrap_err(if is_ssh {
                 ssh_agent::format_ssh_auth_error(
                     &effective_url,
                     &self.url,
@@ -172,7 +179,7 @@ impl GitRemote {
                      do not apply to the other.",
                     &self.url
                 )
-            }
+            })
         });
         if res.is_ok() {
             log::debug!("  -> git {action_desc} finished");
@@ -287,32 +294,141 @@ impl GitRemote {
             .filter_map(|s| s.strip_prefix(':').map(str::to_owned))
             .collect();
         self.with_remote(Direction::Push, &desc, |remote, mut callbacks| {
+            // Rejections are collected rather than failing the callback, so
+            // that every refused branch is reported together with what the
+            // server printed about it (e.g. which repository rule blocked it).
+            let rejected: Rc<RefCell<Vec<(String, String)>>> = Rc::default();
+            let sideband: Rc<RefCell<Vec<u8>>> = Rc::default();
+            let rejected_cb = Rc::clone(&rejected);
             callbacks.push_update_reference(move |reference, status| {
                 match status {
                     Some(status) if deleted_refs.contains(reference) => {
                         log::debug!(
                             "delete of {reference} reported `{status}` (already deleted by remote; ignoring)"
                         );
-                        Ok(())
                     }
                     Some(status) => {
-                        warn!("{reference} rejected: {status}");
-                        Err(git2::Error::from_str(&format!(
-                            "{reference} rejected: {status}"
-                        )))
+                        log::debug!("  -> {reference} rejected: {status}");
+                        rejected_cb
+                            .borrow_mut()
+                            .push((reference.to_string(), status.to_string()));
                     }
                     None => {
                         log::debug!("  -> pushed {reference}: ok");
                         trace!("pushed {reference}");
-                        Ok(())
                     }
                 }
+                Ok(())
+            });
+            let sideband_cb = Rc::clone(&sideband);
+            callbacks.sideband_progress(move |data| {
+                sideband_cb.borrow_mut().extend_from_slice(data);
+                true
             });
             let mut options = PushOptions::new();
             options.remote_callbacks(callbacks);
-            Ok(remote.push(&specs, Some(&mut options))?)
+            let pushed = remote.push(&specs, Some(&mut options));
+            let mut rejected = rejected.take();
+            // libgit2 refuses a non-forced update it can already tell is not a
+            // fast-forward without asking the server; that is the same
+            // refusal, not a connection problem.
+            if let Err(e) = &pushed
+                && e.code() == git2::ErrorCode::NotFastForward
+            {
+                let candidates: Vec<&str> = specs
+                    .iter()
+                    .filter(|s| !s.starts_with('+') && !s.starts_with(':'))
+                    .filter_map(|s| s.split_once(':').map(|(_, dst)| dst))
+                    .collect();
+                let reference = match candidates.as_slice() {
+                    [one] => (*one).to_string(),
+                    many => format!("one of {}", many.join(", ")),
+                };
+                rejected.push((reference, "non-fast-forward".into()));
+            }
+            if !rejected.is_empty() {
+                return Err(PushRejected {
+                    rejected,
+                    remote_messages: remote_messages(&sideband.borrow()),
+                }
+                .into());
+            }
+            Ok(pushed?)
         })
     }
+}
+
+/// The remote was reached and authenticated, but refused to update one or
+/// more refs.
+///
+/// Kept distinct from connection failures so that callers do not bury it under
+/// advice about SSH keys or credentials that are evidently working.
+#[derive(Debug)]
+pub struct PushRejected {
+    /// `(ref, reason)` for every refused update.
+    pub rejected: Vec<(String, String)>,
+    /// What the server printed during the push (git shows these as
+    /// `remote: ...`), minus progress meters.
+    pub remote_messages: Vec<String>,
+}
+
+impl PushRejected {
+    /// Whether the refusal is the ordinary "the branch moved under you" kind,
+    /// as opposed to e.g. a repository rule or a server-side hook.
+    pub fn is_non_fast_forward(&self) -> bool {
+        self.rejected.iter().all(|(_, reason)| {
+            let reason = reason.to_ascii_lowercase();
+            reason.contains("fast-forward")
+                || reason.contains("fastforward")
+                || reason.contains("fetch first")
+                || reason.contains("stale info")
+        })
+    }
+}
+
+impl std::fmt::Display for PushRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the remote refused to update")?;
+        for (reference, reason) in &self.rejected {
+            let branch =
+                reference.strip_prefix("refs/heads/").unwrap_or(reference);
+            write!(f, "\n  {branch}: {reason}")?;
+        }
+        if !self.remote_messages.is_empty() {
+            write!(f, "\nThe remote said:")?;
+            for line in &self.remote_messages {
+                write!(f, "\n  remote: {line}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PushRejected {}
+
+/// The human-readable part of the server's sideband output: split into lines
+/// and drop the progress meters (`Resolving deltas:  50% (1/2)`), which arrive
+/// on the same channel.
+fn remote_messages(raw: &[u8]) -> Vec<String> {
+    let progress = lazy_regex::regex!(r"^[A-Za-z][A-Za-z ]*:\s+\d+%");
+    let text = String::from_utf8_lossy(raw);
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.split(['\n', '\r']).map(str::trim_end) {
+        if progress.is_match(line.trim_start()) {
+            continue;
+        }
+        // Keep blank lines that separate paragraphs, but not runs of them.
+        if line.trim().is_empty()
+            && lines.last().is_none_or(|l| l.trim().is_empty())
+        {
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    lines
 }
 
 fn describe_push_refspecs(refspecs: &[String]) -> String {
@@ -458,6 +574,85 @@ mod tests {
             err.contains("could not connect to SSH agent"),
             "expected agent diagnosis, got: {err}"
         );
+    }
+
+    #[test]
+    fn remote_messages_keep_rule_violations_and_drop_progress() {
+        let raw = b"Resolving deltas:   0% (0/3)\rResolving deltas: 100% (3/3), completed with 3 local objects.\n\
+error: GH013: Repository rule violations found for refs/heads/users/me/a.\n\
+Review all repository rules at https://github.com/o/r/rules?ref=refs%2Fheads%2Fusers%2Fme%2Fa\n\
+\n\
+- Cannot create ref due to creations being restricted.\n\
+\n\
+\n";
+        assert_eq!(
+            remote_messages(raw),
+            vec![
+                "error: GH013: Repository rule violations found for refs/heads/users/me/a.",
+                "Review all repository rules at https://github.com/o/r/rules?ref=refs%2Fheads%2Fusers%2Fme%2Fa",
+                "",
+                "- Cannot create ref due to creations being restricted.",
+            ]
+        );
+    }
+
+    #[test]
+    fn rule_violation_is_reported_with_the_remote_explanation() {
+        let rejected = PushRejected {
+            rejected: vec![(
+                "refs/heads/users/me/a".into(),
+                "push declined due to repository rule violations".into(),
+            )],
+            remote_messages: vec![
+                "- Cannot create ref due to creations being restricted.".into(),
+            ],
+        };
+        assert!(!rejected.is_non_fast_forward());
+        assert_eq!(
+            rejected.to_string(),
+            "the remote refused to update\n  \
+             users/me/a: push declined due to repository rule violations\n\
+             The remote said:\n  \
+             remote: - Cannot create ref due to creations being restricted."
+        );
+    }
+
+    #[test]
+    fn non_fast_forward_is_recognised() {
+        let rejected = PushRejected {
+            rejected: vec![
+                ("refs/heads/a".into(), "non-fast-forward".into()),
+                ("refs/heads/b".into(), "fetch first".into()),
+            ],
+            remote_messages: Vec::new(),
+        };
+        assert!(rejected.is_non_fast_forward());
+    }
+
+    #[test]
+    fn non_fast_forward_push_to_a_real_remote_is_a_push_rejection() {
+        let t = crate::testutil::TestRepo::new();
+        let first = t.commit_file("first", "a.txt", "one", &[]);
+        let unrelated = t.commit_file("unrelated", "b.txt", "two", &[]);
+        let bare = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(bare.path()).unwrap();
+        let remote = GitRemote::new(
+            Arc::new(t.open()),
+            bare.path().to_str().unwrap().into(),
+            String::new(),
+        );
+
+        remote
+            .push(&[format!("{unrelated}:refs/heads/topic")])
+            .unwrap();
+        let err = remote
+            .push(&[format!("{first}:refs/heads/topic")])
+            .unwrap_err();
+        let rejected = err
+            .downcast_ref::<PushRejected>()
+            .unwrap_or_else(|| panic!("expected PushRejected, got: {err:?}"));
+        assert!(rejected.is_non_fast_forward(), "{rejected}");
+        assert!(!err.to_string().contains("could not connect"), "{err:?}");
     }
 
     #[test]

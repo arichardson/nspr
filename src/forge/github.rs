@@ -38,7 +38,7 @@ use super::{
     PrState, Protection, PullRequest, PullRequestUpdate, PushSpec,
     RepoMergeSettings, ReviewDecision, ReviewSummary, SquashMerge,
 };
-use crate::git_remote::GitRemote;
+use crate::git_remote::{GitRemote, PushRejected};
 
 const PULL_REQUEST_QUERY: &str =
     include_str!("../gql/pullrequest_query.graphql");
@@ -779,10 +779,13 @@ impl Forge for GitHubForge {
         };
         self.remote
             .push_with_desc(&refspecs, custom_desc.as_deref())
-            .wrap_err(
-                "the push was rejected. If this was a fast-forward push, somebody \
-                 else has pushed to the branch: run `nspr sync` and try again.",
-            )
+            .map_err(|e| match e.downcast_ref::<PushRejected>() {
+                Some(rejected) if rejected.is_non_fast_forward() => e.wrap_err(
+                    "the push was rejected because somebody else has pushed \
+                     to the branch: run `nspr sync` and try again.",
+                ),
+                _ => e,
+            })
     }
 
     async fn unused_branch_name(&self, preferred: &str) -> Result<String> {
