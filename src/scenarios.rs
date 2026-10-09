@@ -5474,3 +5474,138 @@ fn detaching_or_landing_remaining_pr_after_external_merge_unstacks_remote_stack(
         "remote stack must be unstacked when landing"
     );
 }
+
+#[test]
+fn unsubmitted_and_legacy_spr_commits_never_bridge_or_receive_stack_comments() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    // Bottom 2-PR stack (#101 -> #102)
+    w.add_layer("Stack A part 1", &[("a1.txt", "a1")]);
+    w.add_layer("Stack A part 2", &[("a2.txt", "a2")]);
+    w.sync();
+    w.update_stack_comments();
+    let stack_a_prs = w.pr_numbers();
+    assert_eq!(stack_a_prs, vec![101, 102]);
+
+    // Add an unsubmitted local WIP commit above Stack A.
+    w.add_layer("Local WIP commit", &[("wip.txt", "wip")]);
+
+    // Add a legacy `spr` PR commit (`Pull Request:` with a space) and an
+    // already-merged PR commit above the WIP commit.
+    w.add_layer("Legacy spr commit", &[("legacy.txt", "legacy")]);
+    let legacy_pr =
+        block_on(w.forge.create_pull_request(crate::forge::CreatePr {
+            title: "Legacy spr commit".into(),
+            body: String::new(),
+            base: TRUNK.into(),
+            head: "users/tester/spr/legacy".into(),
+            draft: false,
+        }))
+        .unwrap();
+    w.layers[3].message.set(
+        crate::trailers::LEGACY_SPR_PULL_REQUEST,
+        &format!("https://github.com/o/r/pull/{legacy_pr}"),
+    );
+
+    w.add_layer("Old merged commit", &[("merged.txt", "merged")]);
+    let merged_tip = w.t.commit(
+        "Old merged commit",
+        &[("merged.txt", "merged")],
+        &[w.base_oid],
+    );
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        "users/tester/old-merged",
+        merged_tip,
+    )]))
+    .unwrap();
+    let merged_pr =
+        block_on(w.forge.create_pull_request(crate::forge::CreatePr {
+            title: "Old merged commit".into(),
+            body: String::new(),
+            base: TRUNK.into(),
+            head: "users/tester/old-merged".into(),
+            draft: false,
+        }))
+        .unwrap();
+    w.forge.external_squash_merge(merged_pr).unwrap();
+    w.layers[4]
+        .message
+        .set(crate::trailers::PULL_REQUEST, &format!("#{merged_pr}"));
+
+    // Add another legacy `spr` PR commit at the top before a `--cherry-pick` PR.
+    w.add_layer("Top legacy spr commit", &[("legacy2.txt", "legacy2")]);
+    let legacy2_pr =
+        block_on(w.forge.create_pull_request(crate::forge::CreatePr {
+            title: "Top legacy spr commit".into(),
+            body: String::new(),
+            base: TRUNK.into(),
+            head: "users/tester/spr/legacy2".into(),
+            draft: false,
+        }))
+        .unwrap();
+    w.layers[5].message.set(
+        crate::trailers::LEGACY_SPR_PULL_REQUEST,
+        &format!("https://github.com/o/r/pull/{legacy2_pr}"),
+    );
+
+    // Add a standalone PR at the tip (`Depends-On: main`).
+    w.add_layer("Standalone cherry-pick PR", &[("cp.txt", "cp")]);
+    w.set_trailer(6, crate::trailers::DEPENDS_ON, TRUNK);
+    w.sync_with(SyncOptions {
+        selection: crate::stack::LayerSelection::one(6),
+        ..Default::default()
+    });
+    let cp_pr = w.discover().layers[6].pr.unwrap();
+
+    // Landing `cp_pr` has zero affected remaining PRs in the stack.
+    let stack_before_land = w.discover();
+    let affected = stack_before_land
+        .affected_prs_for_removal(&std::collections::HashSet::from([cp_pr]));
+    assert!(
+        affected.is_empty(),
+        "landing standalone cherry-pick PR must not mark unrelated PRs as affected: {affected:?}"
+    );
+
+    // Even if `stack_comment::update_all` is invoked across the entire branch,
+    // it must never post comments on `legacy_pr`, `merged_pr`, `legacy2_pr`, or
+    // `cp_pr`, and must never leak `(not submitted)` or unrelated PRs into
+    // `#101`/`#102`'s stack comments.
+    w.update_stack_comments();
+    assert!(w.comment_on(legacy_pr).is_none());
+    assert!(w.comment_on(merged_pr).is_none());
+    assert!(w.comment_on(legacy2_pr).is_none());
+    assert!(w.comment_on(cp_pr).is_none());
+
+    let c101 = w.comment_on(101).unwrap().body;
+    assert!(c101.contains("- ➡️ **#101**\n"), "{c101}");
+    assert!(c101.contains("- #102\n"), "{c101}");
+    assert!(!c101.contains("not submitted"), "{c101}");
+    assert!(!c101.contains(&format!("#{legacy_pr}")), "{c101}");
+    assert!(!c101.contains(&format!("#{merged_pr}")), "{c101}");
+    assert!(!c101.contains(&format!("#{legacy2_pr}")), "{c101}");
+    assert!(!c101.contains(&format!("#{cp_pr}")), "{c101}");
+
+    // Simulate a previously polluted comment on #101 that listed `merged_pr`
+    // and `legacy2_pr` *after* #101 and #102: updating #101/#102 must discard
+    // trailing PRs rather than keeping `merged_pr` as a false merged dependency.
+    let existing_id = w.comment_on(101).unwrap().id;
+    block_on(w.forge.update_comment(
+        existing_id,
+        &format!(
+            "<!-- nspr:stack -->\n\
+             - `main`\n\
+             - ➡️ **#101**\n\
+             - #102\n\
+             - #{merged_pr}\n\
+             - #{legacy2_pr}\n\
+             <!-- /nspr:stack -->"
+        ),
+    ))
+    .unwrap();
+
+    w.update_stack_comments();
+    let cleaned_101 = w.comment_on(101).unwrap().body;
+    assert!(
+        !cleaned_101.contains(&format!("#{merged_pr}")),
+        "merged PR appearing after the component in a polluted comment must be dropped:\n{cleaned_101}"
+    );
+}

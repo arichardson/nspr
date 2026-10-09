@@ -248,8 +248,11 @@ pub async fn land_layer(
     index: usize,
     opts: &LandOptions,
 ) -> Result<LandOutcome> {
-    let comp_selection =
-        LayerSelection::from_indices(stack.component_of(index));
+    let mut comp = stack.pr_component_of(index);
+    if !comp.contains(&index) {
+        comp.push(index);
+    }
+    let comp_selection = LayerSelection::from_indices(comp);
     check_land_preconditions(git, forge, config, stack, &comp_selection)
         .await?;
 
@@ -696,11 +699,11 @@ pub async fn land_all(
                     anchor_tip: None,
                 },
             );
-        } else if stack
-            .dependents_of(i)
-            .into_iter()
-            .any(|d| stack.layers[d].pr.is_some())
-        {
+        } else if stack.dependents_of(i).into_iter().any(|d| {
+            opts.selection.contains(d)
+                && stack.layers[d].pr.is_some()
+                && !stack.layers[d].message.has_legacy_spr_trailer()
+        }) {
             bail!(
                 "`{}` has no pull request yet, but a layer above it does; run \
                  `nspr diff` first so it can be retargeted",
@@ -1507,13 +1510,22 @@ async fn snapshot_dependents(
 ) -> Result<Vec<Dependent>> {
     let mut out = Vec::new();
     for layer in stack.dependents_of(index) {
-        let number = stack.layers[layer].pr.ok_or_else(|| {
-            eyre!(
-                "`{}` depends on this layer but has no pull request yet; run \
-                 `nspr diff` first so it can be retargeted",
-                stack.layers[layer].subject()
-            )
-        })?;
+        if stack.layers[layer].message.has_legacy_spr_trailer() {
+            continue;
+        }
+        let Some(number) = stack.layers[layer].pr else {
+            if stack.dependents_of(layer).into_iter().any(|d| {
+                stack.layers[d].pr.is_some()
+                    && !stack.layers[d].message.has_legacy_spr_trailer()
+            }) {
+                bail!(
+                    "`{}` depends on this layer but has no pull request yet; run \
+                     `nspr diff` first so it can be retargeted",
+                    stack.layers[layer].subject()
+                );
+            }
+            continue;
+        };
         let pr = get_synced_pull_request(git, forge, number, false).await?;
         if pr.state != PrState::Open {
             warnings.push(format!("#{number} is not open; leaving it alone."));

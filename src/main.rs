@@ -907,7 +907,13 @@ impl Session {
         Ok(())
     }
 
-    async fn refresh_remaining_metadata(&self) -> Result<()> {
+    async fn refresh_remaining_metadata(
+        &self,
+        affected_prs: &std::collections::HashSet<u64>,
+    ) -> Result<()> {
+        if affected_prs.is_empty() {
+            return Ok(());
+        }
         let Ok(mut stack) =
             Stack::discover(&self.git, self.trunk_oid, &self.config.trunk)
         else {
@@ -916,18 +922,36 @@ impl Session {
         if stack.layers.is_empty() {
             return Ok(());
         }
-        let _ = engine::resolve_external_deps(
-            &self.forge,
-            &mut stack,
-            &SyncOptions::default(),
-        )
-        .await;
+        let affected_indices: Vec<usize> = stack
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                l.pr.filter(|n| affected_prs.contains(n)).map(|_| i)
+            })
+            .collect();
+        if affected_indices.is_empty() {
+            return Ok(());
+        }
+        let opts = SyncOptions {
+            selection: LayerSelection::from_indices(affected_indices),
+            ..Default::default()
+        };
+        let _ =
+            engine::resolve_external_deps(&self.forge, &mut stack, &opts).await;
 
-        self.forge.sync_stacks(&stack.pr_chains()).await?;
+        self.forge
+            .sync_stacks(&stack.pr_chains_for(&opts.selection))
+            .await?;
 
         if self.config.stack_comments {
-            stack_comment::update_all(&self.forge, &self.config, &stack)
-                .await?;
+            stack_comment::update_for_opts(
+                &self.forge,
+                &self.config,
+                &stack,
+                &opts,
+            )
+            .await?;
         }
 
         let merge_settings = self.forge.repo_merge_settings().await?;
@@ -935,8 +959,11 @@ impl Session {
             self.config.preserve_commit_history.resolve(merge_settings);
         let warn_merge_strategy =
             preserve_commit_history && !merge_settings.is_squash_only();
-        let prs = engine::gather(&self.forge, &stack).await?;
+        let prs = engine::gather_for(&self.forge, &stack, &opts).await?;
         for (i, pr) in prs.into_iter().enumerate() {
+            if !opts.is_layer_selected(i) {
+                continue;
+            }
             let Some(pr) = pr else { continue };
             let multi_deps = stack.multi_dep_labels(i);
             let body = nspr::pr_body::splice_warning_with_deps(
@@ -962,6 +989,8 @@ impl Session {
 
     async fn close(&self, args: CloseArgs) -> Result<()> {
         let stack = self.discover()?;
+        let removed_prs = std::collections::HashSet::from([args.number]);
+        let affected_prs = stack.affected_prs_for_removal(&removed_prs);
         let Some(index) =
             stack.layers.iter().position(|l| l.pr == Some(args.number))
         else {
@@ -1020,7 +1049,7 @@ impl Session {
                 )
                 .await?;
             } else {
-                self.refresh_remaining_metadata().await?;
+                self.refresh_remaining_metadata(&affected_prs).await?;
             }
             return Ok(());
         };
@@ -1062,7 +1091,7 @@ impl Session {
             )
             .await?;
         } else {
-            self.refresh_remaining_metadata().await?;
+            self.refresh_remaining_metadata(&affected_prs).await?;
         }
         Ok(())
     }
@@ -1191,7 +1220,10 @@ impl Session {
             )
             .await?;
         } else if !report.merged.is_empty() {
-            self.refresh_remaining_metadata().await?;
+            let removed_prs: std::collections::HashSet<u64> =
+                report.merged.iter().copied().collect();
+            let affected_prs = stack.affected_prs_for_removal(&removed_prs);
+            self.refresh_remaining_metadata(&affected_prs).await?;
         }
         Ok(())
     }
@@ -1215,8 +1247,11 @@ impl Session {
                             "#{pr_num} is not in this stack. Run `nspr status` to see your stack."
                         )
                     })?;
-                opts.selection =
-                    LayerSelection::from_indices(stack.component_of(idx));
+                let mut comp = stack.pr_component_of(idx);
+                if !comp.contains(&idx) {
+                    comp.push(idx);
+                }
+                opts.selection = LayerSelection::from_indices(comp);
             }
             land::land_all(&self.git, &self.forge, &self.config, &stack, &opts)
                 .await?
@@ -1249,7 +1284,15 @@ impl Session {
             }
         }
 
-        self.refresh_remaining_metadata().await?;
+        let removed_prs: std::collections::HashSet<u64> =
+            outcomes.iter().map(|o| o.number).collect();
+        let mut affected_prs = stack.affected_prs_for_removal(&removed_prs);
+        for outcome in &outcomes {
+            for r in &outcome.repaired {
+                affected_prs.insert(r.number);
+            }
+        }
+        self.refresh_remaining_metadata(&affected_prs).await?;
         println!(
             "{} ({} landed)",
             style("✓ Done").green().bold(),

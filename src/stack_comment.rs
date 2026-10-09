@@ -176,7 +176,7 @@ pub fn render_with_merged(
 
     let merged_set: std::collections::HashSet<u64> =
         merged_deps.iter().map(|m| m.number).collect();
-    let component = stack.component_of(current);
+    let component = stack.pr_component_of(current);
 
     let mut secondary_merged_prs: Vec<u64> = Vec::new();
     for &i in &component {
@@ -218,14 +218,23 @@ pub fn render_with_merged(
         > = std::collections::HashMap::new();
         for &i in &component {
             let mut ancestor_merged = std::collections::HashSet::new();
-            let mut stack_dfs = stack.layers[i].layer_deps();
+            let mut stack_dfs: Vec<usize> = stack.layers[i]
+                .layer_deps()
+                .into_iter()
+                .filter(|j| component.contains(j))
+                .collect();
             let mut visited = std::collections::HashSet::new();
             while let Some(anc) = stack_dfs.pop() {
                 if visited.insert(anc) {
                     if let Some(ms) = raw_merged_for_layer.get(&anc) {
                         ancestor_merged.extend(ms.iter().copied());
                     }
-                    stack_dfs.extend(stack.layers[anc].layer_deps());
+                    stack_dfs.extend(
+                        stack.layers[anc]
+                            .layer_deps()
+                            .into_iter()
+                            .filter(|j| component.contains(j)),
+                    );
                 }
             }
             let reduced: Vec<u64> = raw_merged_for_layer[&i]
@@ -297,6 +306,7 @@ pub fn render_with_merged(
                     let mut key: Vec<String> = layer
                         .layer_deps()
                         .into_iter()
+                        .filter(|j| component.contains(j))
                         .map(|j| match stack.layers[j].pr {
                             Some(n) => dep_link(n),
                             None => format!("layer {}", j + 1),
@@ -385,6 +395,7 @@ pub fn render_with_merged(
                     let mut targets: Vec<String> = layer
                         .layer_deps()
                         .into_iter()
+                        .filter(|j| component.contains(j))
                         .map(|j| match stack.layers[j].pr {
                             Some(n) => format!("PR{n}"),
                             None => format!("L{j}"),
@@ -523,6 +534,44 @@ pub async fn update_for_opts(
     opts: &crate::engine::SyncOptions,
 ) -> Result<usize> {
     let mut stack = stack.clone();
+
+    let candidate_indices: Vec<usize> = stack
+        .pr_components()
+        .into_iter()
+        .filter(|c| c.iter().any(|&i| opts.is_layer_selected(i)))
+        .flatten()
+        .collect();
+    if candidate_indices.is_empty() {
+        return Ok(0);
+    }
+
+    let candidate_nums: Vec<u64> = candidate_indices
+        .iter()
+        .filter_map(|&i| stack.layers[i].pr)
+        .collect();
+    let candidate_prs = forge.get_pull_requests(&candidate_nums).await?;
+    for (&i, pr) in candidate_indices.iter().zip(candidate_prs) {
+        if pr.state != PrState::Open {
+            stack.layers[i].pr = None;
+        } else if !opts.is_layer_selected(i)
+            && stack.layers[i].dep_specs.is_empty()
+            && matches!(stack.layers[i].dep, crate::stack::Dep::Layer(_))
+            && pr.base == config.trunk
+        {
+            stack.layers[i].dep = crate::stack::Dep::Main;
+            stack.layers[i].deps = vec![crate::stack::Dep::Main];
+        }
+    }
+
+    let selected_components: Vec<Vec<usize>> = stack
+        .pr_components()
+        .into_iter()
+        .filter(|c| c.iter().any(|&i| opts.is_layer_selected(i)))
+        .collect();
+    if selected_components.is_empty() {
+        return Ok(0);
+    }
+
     let active_prs: std::collections::HashSet<u64> =
         stack.layers.iter().filter_map(|l| l.pr).collect();
 
@@ -530,8 +579,10 @@ pub async fn update_for_opts(
         usize,
         Option<crate::forge::Comment>,
     > = std::collections::HashMap::new();
-    for (i, layer) in stack.layers.iter().enumerate() {
-        let Some(number) = layer.pr else { continue };
+    for &i in selected_components.iter().flatten() {
+        let Some(number) = stack.layers[i].pr else {
+            continue;
+        };
         let existing =
             forge
                 .list_own_comments(number)
@@ -547,11 +598,11 @@ pub async fn update_for_opts(
         std::collections::HashMap::new();
 
     let mut updated = 0;
-    for component in stack.components() {
-        if !component.iter().any(|&i| opts.is_layer_selected(i)) {
-            continue;
-        }
-
+    for component in selected_components {
+        let comp_prs: std::collections::HashSet<u64> = component
+            .iter()
+            .filter_map(|&i| stack.layers[i].pr)
+            .collect();
         let mut candidate_merged_nums: Vec<u64> = Vec::new();
         let mut comment_secondary_pairs: Vec<(u64, u64)> = Vec::new();
         for &i in &component {
@@ -570,7 +621,12 @@ pub async fn update_for_opts(
                 }
             }
             if let Some(Some(comment)) = existing_comments.get(&i) {
-                for n in extract_stack_pr_numbers(&comment.body) {
+                let all_nums = extract_stack_pr_numbers(&comment.body);
+                let cutoff = all_nums
+                    .iter()
+                    .rposition(|n| comp_prs.contains(n))
+                    .unwrap_or(0);
+                for &n in &all_nums[..cutoff] {
                     if !active_prs.contains(&n)
                         && !candidate_merged_nums.contains(&n)
                     {
@@ -579,7 +635,9 @@ pub async fn update_for_opts(
                 }
                 for (layer_pr, dep_pr) in extract_secondary_deps(&comment.body)
                 {
-                    if !active_prs.contains(&dep_pr) {
+                    if comp_prs.contains(&layer_pr)
+                        && !active_prs.contains(&dep_pr)
+                    {
                         if !candidate_merged_nums.contains(&dep_pr) {
                             candidate_merged_nums.push(dep_pr);
                         }
@@ -977,5 +1035,42 @@ mod tests {
             extract_secondary_deps(&body),
             vec![(59, 58), (60, 57), (60, 58)]
         );
+    }
+
+    #[test]
+    fn render_excludes_unsubmitted_and_legacy_spr_layers_and_does_not_bridge_components()
+     {
+        let config = Config::new(
+            "owner".into(),
+            "repo".into(),
+            "main".into(),
+            "user".into(),
+        );
+        let mut legacy = Layer::stub("Legacy spr PR", Some(900), Dep::Layer(2));
+        legacy.message.set(
+            crate::trailers::LEGACY_SPR_PULL_REQUEST,
+            "https://github.com/owner/repo/pull/900",
+        );
+        let stack = Stack {
+            trunk: "main".into(),
+            base: git2::Oid::ZERO_SHA1,
+            layers: vec![
+                Layer::stub("Part 1", Some(101), Dep::Main),
+                Layer::stub("Part 2", Some(102), Dep::Layer(0)),
+                Layer::stub("WIP local commit", None, Dep::Layer(1)),
+                legacy,
+                Layer::stub("Unrelated PR", Some(301), Dep::Layer(3)),
+            ],
+        };
+
+        assert_eq!(stack.pr_components(), vec![vec![0, 1], vec![4]]);
+
+        let rendered = render(&config, &stack, 0);
+        assert!(rendered.contains("- ➡️ **#101**\n"), "{rendered}");
+        assert!(rendered.contains("- #102\n"), "{rendered}");
+        assert!(!rendered.contains("not submitted"), "{rendered}");
+        assert!(!rendered.contains("WIP"), "{rendered}");
+        assert!(!rendered.contains("#900"), "{rendered}");
+        assert!(!rendered.contains("#301"), "{rendered}");
     }
 }

@@ -814,7 +814,7 @@ impl Stack {
     }
 
     /// Ordered bottom-to-top pull request number chains for the current stack
-    /// when `selection` selects at least one layer.
+    /// that contain at least one layer selected by `selection`.
     pub fn pr_chains_for(&self, selection: &LayerSelection) -> Vec<Vec<u64>> {
         if !(0..self.layers.len()).any(|i| selection.contains(i)) {
             return Vec::new();
@@ -840,6 +840,7 @@ impl Stack {
                 continue;
             }
             let mut chain = Vec::new();
+            let mut chain_indices = Vec::new();
             let mut cur = Some(start);
             while let Some(idx) = cur {
                 if visited[idx]
@@ -852,6 +853,7 @@ impl Stack {
                 };
                 visited[idx] = true;
                 chain.push(pr_num);
+                chain_indices.push(idx);
                 cur =
                     self.direct_dependents_of(idx).into_iter().find(|&child| {
                         !visited[child]
@@ -861,7 +863,9 @@ impl Stack {
                                 .has_legacy_spr_trailer()
                     });
             }
-            if !chain.is_empty() {
+            if !chain.is_empty()
+                && chain_indices.iter().any(|&i| selection.contains(i))
+            {
                 chains.push(chain);
             }
         }
@@ -919,13 +923,21 @@ impl Stack {
         let Some(&first) = component.first() else {
             return true;
         };
-        if component
-            .iter()
-            .any(|&i| self.layers[i].has_multiple_layer_deps())
-        {
+        if component.iter().any(|&i| {
+            self.layers[i]
+                .layer_deps()
+                .into_iter()
+                .filter(|d| component.contains(d))
+                .count()
+                >= 2
+        }) {
             return false;
         }
-        if !matches!(self.layers[first].dep, Dep::Main | Dep::ExternalPr(_)) {
+        if self.layers[first]
+            .layer_deps()
+            .iter()
+            .any(|d| component.contains(d))
+        {
             return false;
         }
         for window in component.windows(2) {
@@ -937,12 +949,14 @@ impl Stack {
     }
 
     /// Layers grouped into connected components of the dependency graph,
-    /// counting only layers that have a pull request.
+    /// counting only layers that have a pull request (and excluding un-upgraded
+    /// legacy `spr` commits).
     ///
     /// Two layers belong to the same component when one depends on the other,
-    /// directly or through a chain of other layers. A component of one is a
-    /// standalone pull request: it shares nothing with its neighbours in the
-    /// local commit order and must not be presented to reviewers as if it did.
+    /// directly or through a chain of other layers that also have pull requests.
+    /// A component of one is a standalone pull request: it shares nothing with
+    /// its neighbours in the local commit order and must not be presented to
+    /// reviewers as if it did.
     pub fn pr_components(&self) -> Vec<Vec<usize>> {
         let n = self.layers.len();
         let mut parent: Vec<usize> = (0..n).collect();
@@ -956,11 +970,15 @@ impl Stack {
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
-            if self.layers[i].pr.is_none() {
+            if self.layers[i].pr.is_none()
+                || self.layers[i].message.has_legacy_spr_trailer()
+            {
                 continue;
             }
             for j in layer.layer_deps() {
-                if self.layers[j].pr.is_some() {
+                if self.layers[j].pr.is_some()
+                    && !self.layers[j].message.has_legacy_spr_trailer()
+                {
                     let (a, b) = (find(&mut parent, i), find(&mut parent, j));
                     parent[a] = b;
                 }
@@ -970,7 +988,9 @@ impl Stack {
         let mut components: Vec<Vec<usize>> = Vec::new();
         let mut root_to_component: HashMap<usize, usize> = HashMap::new();
         for i in 0..n {
-            if self.layers[i].pr.is_none() {
+            if self.layers[i].pr.is_none()
+                || self.layers[i].message.has_legacy_spr_trailer()
+            {
                 continue;
             }
             let root = find(&mut parent, i);
@@ -983,6 +1003,42 @@ impl Stack {
             }
         }
         components
+    }
+
+    /// Return the connected component of pull-request layers containing `index`.
+    pub fn pr_component_of(&self, index: usize) -> Vec<usize> {
+        self.pr_components()
+            .into_iter()
+            .find(|c| c.contains(&index))
+            .unwrap_or_default()
+    }
+
+    /// Return all pull request numbers in the same `pr_component` as any layer
+    /// whose pull request is in `removed_prs` (or that explicitly declared
+    /// `Depends-On: #<removed_pr>`), excluding `removed_prs` themselves.
+    pub fn affected_prs_for_removal(
+        &self,
+        removed_prs: &HashSet<u64>,
+    ) -> HashSet<u64> {
+        let mut affected = HashSet::new();
+        for comp in self.pr_components() {
+            let comp_touched = comp.iter().any(|&i| {
+                self.layers[i].pr.is_some_and(|n| removed_prs.contains(&n))
+                    || self.layers[i].dep_specs.iter().any(
+                        |s| matches!(s, DepSpec::Pr(n) if removed_prs.contains(n)),
+                    )
+            });
+            if comp_touched {
+                for &i in &comp {
+                    if let Some(n) = self.layers[i].pr
+                        && !removed_prs.contains(&n)
+                    {
+                        affected.insert(n);
+                    }
+                }
+            }
+        }
+        affected
     }
 
     /// True if layer `i` either depends on another layer in the stack or has
