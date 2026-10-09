@@ -346,7 +346,9 @@ pub trait Forge {
         head: &str,
     ) -> Result<Option<PullRequest>>;
     /// Create or update native GitHub Stack objects for each bottom-to-top
-    /// chain of pull request numbers (`chain.len() >= 2`).
+    /// chain of pull request numbers (`chain.len() >= 2`), and unstack any
+    /// standalone (`chain.len() == 1`) pull request that was previously part of
+    /// a remote stack.
     async fn sync_stacks(&self, chains: &[Vec<u64>]) -> Result<()> {
         let _ = chains;
         Ok(())

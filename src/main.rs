@@ -1188,6 +1188,8 @@ impl Session {
                 false,
             )
             .await?;
+        } else if !report.merged.is_empty() {
+            self.refresh_remaining_metadata().await?;
         }
         Ok(())
     }

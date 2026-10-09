@@ -5425,3 +5425,52 @@ fn multi_dependency_retargets_as_soon_as_chain_is_linearized() {
     );
     w.assert_invariants();
 }
+
+#[test]
+fn detaching_or_landing_remaining_pr_after_external_merge_unstacks_remote_stack()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+    assert_eq!(*w.forge.stacks.borrow(), vec![prs.clone()]);
+
+    // Simulate a manual merge of the bottom PR in the GitHub web UI, where
+    // GitHub auto-retargets the upper PR's base to `main` while leaving the
+    // native stack object intact.
+    w.forge.external_squash_merge(prs[0]).unwrap();
+    block_on(w.forge.update_pull_request(
+        prs[1],
+        crate::forge::PullRequestUpdate {
+            base: Some(TRUNK.to_string()),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    *w.forge.stacks.borrow_mut() = vec![prs.clone()];
+
+    // Detaching the upper commit to target `main` (as `nspr diff -c` does)
+    // must unstack the stale remote stack even though `base` is already `main`
+    // and only a single PR remains.
+    w.set_trailer(1, crate::trailers::DEPENDS_ON, TRUNK);
+    w.sync_with(SyncOptions {
+        selection: crate::stack::LayerSelection::one(1),
+        ..Default::default()
+    });
+    assert!(
+        w.forge.stacks.borrow().is_empty(),
+        "stale remote stack must be unstacked when a PR becomes standalone"
+    );
+
+    // Even if the remote stack is still present when `land` runs directly,
+    // `merge_pull_request` must unstack the PR before merging.
+    w.sync_trunk();
+    *w.forge.stacks.borrow_mut() = vec![prs.clone()];
+    let outcome = w.land(0);
+    assert_eq!(outcome.number, prs[1]);
+    assert!(
+        w.forge.stacks.borrow().is_empty(),
+        "remote stack must be unstacked when landing"
+    );
+}

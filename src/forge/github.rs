@@ -407,8 +407,10 @@ impl Forge for GitHubForge {
         if let Some(body) = update.body {
             request = request.body(body);
         }
-        if let Some(base) = update.base {
+        if update.base.is_some() || update.state == Some(PrState::Closed) {
             self.unstack_pr_if_stacked(number).await;
+        }
+        if let Some(base) = update.base {
             request = request.base(base);
         }
         if let Some(state) = update.state {
@@ -436,6 +438,14 @@ impl Forge for GitHubForge {
         number: u64,
         req: SquashMerge,
     ) -> Result<Oid> {
+        // GitHub's synchronous `PUT /repos/{owner}/{repo}/pulls/{number}/merge`
+        // endpoint rejects pull requests that belong to a native GitHub Stack
+        // ("Merging stacked PRs via this endpoint is not supported. Use the
+        // asynchronous merge endpoint instead."). Unstack before merging; the
+        // caller (`Session::land`) re-syncs any remaining multi-PR stack once
+        // landing completes.
+        self.unstack_pr_if_stacked(number).await;
+
         // Title and message are always sent: left out, GitHub falls back to
         // the repository's `squash_merge_commit_message` setting, which may be
         // `COMMIT_MESSAGES` — every `[nspr]` revision commit on the head
@@ -483,6 +493,15 @@ impl Forge for GitHubForge {
                             m.to_ascii_lowercase()
                                 .contains("merge already in progress")
                         });
+                    let is_stacked_pr_error = github_error_message(&e)
+                        .is_some_and(|m| {
+                            let lower = m.to_ascii_lowercase();
+                            lower.contains("merging stacked prs")
+                                || lower.contains("asynchronous merge")
+                        });
+                    if is_stacked_pr_error {
+                        self.unstack_pr_if_stacked(number).await;
+                    }
 
                     match self.get_pull_request(number).await {
                         Ok(pr) if pr.state == PrState::Merged => {
@@ -512,6 +531,7 @@ impl Forge for GitHubForge {
                             }
                             if (is_transport_or_5xx
                                 || is_merge_in_progress
+                                || is_stacked_pr_error
                                 || (matches!(code, Some(405 | 409))
                                     && (pr.head_oid != req.expected_head
                                         || pr.mergeable == Mergeable::Unknown
@@ -1030,9 +1050,7 @@ impl Forge for GitHubForge {
     }
 
     async fn sync_stacks(&self, chains: &[Vec<u64>]) -> Result<()> {
-        let valid_chains: Vec<&Vec<u64>> =
-            chains.iter().filter(|c| c.len() >= 2).collect();
-        if valid_chains.is_empty() {
+        if chains.is_empty() {
             return Ok(());
         }
 
@@ -1040,6 +1058,25 @@ impl Forge for GitHubForge {
             return Ok(());
         };
 
+        // Any pull request in a single-element chain is standalone (for
+        // example, after its base PR was merged on GitHub or after
+        // `nspr diff --cherry-pick` detached it to target the trunk) and must
+        // be unstacked if a stale remote stack still contains it.
+        for standalone in chains.iter().filter(|c| c.len() == 1) {
+            let pr_num = standalone[0];
+            let stale: Vec<u64> = remote_stacks
+                .iter()
+                .filter(|s| s.pull_requests.iter().any(|p| p.number == pr_num))
+                .map(|s| s.number)
+                .collect();
+            for stack_num in stale {
+                self.unstack_remote_stack(stack_num).await;
+                remote_stacks.retain(|rs| rs.number != stack_num);
+            }
+        }
+
+        let valid_chains: Vec<&Vec<u64>> =
+            chains.iter().filter(|c| c.len() >= 2).collect();
         for desired in valid_chains {
             let overlapping: Vec<RemoteStack> = remote_stacks
                 .iter()

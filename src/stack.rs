@@ -803,27 +803,38 @@ impl Stack {
             .collect()
     }
 
-    /// Ordered bottom-to-top pull request number chains (`len >= 2`) suitable
-    /// for registering with GitHub's native Stacks API (`/repos/{owner}/{repo}/stacks`).
+    /// Ordered bottom-to-top pull request number chains for registering or
+    /// unstacking with GitHub's native Stacks API (`/repos/{owner}/{repo}/stacks`).
+    ///
+    /// Chains of length `>= 2` represent active multi-PR stacks; chains of
+    /// length `1` represent standalone pull requests that must be unstacked if
+    /// they were previously part of a remote stack.
     pub fn pr_chains(&self) -> Vec<Vec<u64>> {
         self.pr_chains_for(&LayerSelection::All)
     }
 
-    /// Ordered bottom-to-top pull request number chains (`len >= 2`), optionally
-    /// restricted to layers selected by `selection`.
+    /// Ordered bottom-to-top pull request number chains for the current stack
+    /// when `selection` selects at least one layer.
     pub fn pr_chains_for(&self, selection: &LayerSelection) -> Vec<Vec<u64>> {
+        if !(0..self.layers.len()).any(|i| selection.contains(i)) {
+            return Vec::new();
+        }
         let mut visited = vec![false; self.layers.len()];
         let mut chains = Vec::new();
         for start in 0..self.layers.len() {
-            if visited[start] || self.layers[start].pr.is_none() {
-                continue;
-            }
-            if !selection.contains(start) {
+            if visited[start]
+                || self.layers[start].pr.is_none()
+                || self.layers[start].message.has_legacy_spr_trailer()
+            {
                 continue;
             }
             let is_root = match self.layers[start].dep {
                 Dep::Main | Dep::ExternalPr(_) => true,
-                Dep::Layer(p) => visited[p] || self.layers[p].pr.is_none(),
+                Dep::Layer(p) => {
+                    visited[p]
+                        || self.layers[p].pr.is_none()
+                        || self.layers[p].message.has_legacy_spr_trailer()
+                }
             };
             if !is_root {
                 continue;
@@ -831,7 +842,9 @@ impl Stack {
             let mut chain = Vec::new();
             let mut cur = Some(start);
             while let Some(idx) = cur {
-                if visited[idx] {
+                if visited[idx]
+                    || self.layers[idx].message.has_legacy_spr_trailer()
+                {
                     break;
                 }
                 let Some(pr_num) = self.layers[idx].pr else {
@@ -841,10 +854,14 @@ impl Stack {
                 chain.push(pr_num);
                 cur =
                     self.direct_dependents_of(idx).into_iter().find(|&child| {
-                        !visited[child] && self.layers[child].pr.is_some()
+                        !visited[child]
+                            && self.layers[child].pr.is_some()
+                            && !self.layers[child]
+                                .message
+                                .has_legacy_spr_trailer()
                     });
             }
-            if chain.len() >= 2 {
+            if !chain.is_empty() {
                 chains.push(chain);
             }
         }

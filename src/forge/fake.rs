@@ -446,6 +446,9 @@ impl Forge for FakeForge {
         update: PullRequestUpdate,
     ) -> Result<()> {
         let base_changed = update.base.is_some();
+        if base_changed || update.state == Some(PrState::Closed) {
+            self.stacks.borrow_mut().retain(|s| !s.contains(&number));
+        }
         {
             let mut prs = self.prs.borrow_mut();
             let pr = prs.iter_mut().find(|p| p.number == number).ok_or_else(
@@ -475,6 +478,7 @@ impl Forge for FakeForge {
         number: u64,
         req: SquashMerge,
     ) -> Result<Oid> {
+        self.stacks.borrow_mut().retain(|s| !s.contains(&number));
         self.do_squash_merge(number, Some(&req), true)
     }
 
@@ -689,7 +693,15 @@ impl Forge for FakeForge {
     }
 
     async fn sync_stacks(&self, chains: &[Vec<u64>]) -> Result<()> {
-        *self.stacks.borrow_mut() = chains.to_vec();
+        let mut stacks = self.stacks.borrow_mut();
+        for chain in chains {
+            stacks.retain(|existing| {
+                !existing.iter().any(|pr| chain.contains(pr))
+            });
+            if chain.len() >= 2 {
+                stacks.push(chain.clone());
+            }
+        }
         Ok(())
     }
 
