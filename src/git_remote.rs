@@ -271,7 +271,46 @@ impl GitRemote {
     }
 
     /// Push raw refspecs with an optional custom progress description.
+    ///
+    /// If the remote refuses the push because it updates too many refs at
+    /// once (GitHub's `max_ref_updates` push rule, which is invisible to
+    /// non-admins through the API), the refused refspecs are pushed again in
+    /// batches of the size the server named.
     pub fn push_with_desc(
+        &self,
+        refspecs: &[String],
+        custom_desc: Option<&str>,
+    ) -> Result<()> {
+        let err = match self.push_once(refspecs, custom_desc) {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+        let Some(rejected) = err.downcast_ref::<PushRejected>() else {
+            return Err(err);
+        };
+        let Some(limit) = rejected.max_ref_updates() else {
+            return Err(err);
+        };
+        let retry = refspecs_to_retry(refspecs, rejected);
+        if limit == 0 || retry.len() <= limit {
+            return Err(err);
+        }
+        eprintln!(
+            "{}",
+            console::style(format!(
+                "the remote accepts at most {limit} branch updates per push; \
+                 pushing the remaining {} in batches",
+                retry.len()
+            ))
+            .dim()
+        );
+        for batch in retry.chunks(limit) {
+            self.push_once(batch, custom_desc)?;
+        }
+        Ok(())
+    }
+
+    fn push_once(
         &self,
         refspecs: &[String],
         custom_desc: Option<&str>,
@@ -373,6 +412,24 @@ pub struct PushRejected {
 }
 
 impl PushRejected {
+    /// The per-push ref limit, if that is why every ref was refused: GitHub
+    /// explains a `max_ref_updates` violation with "Pushes can not update
+    /// more than N branches or tags."
+    pub fn max_ref_updates(&self) -> Option<usize> {
+        let re = lazy_regex::regex!(
+            r"(?i)pushes can ?not update more than (\d+) branches or tags"
+        );
+        let all_rule_violations = self
+            .rejected
+            .iter()
+            .all(|(_, reason)| reason.contains("rule violation"));
+        if !all_rule_violations {
+            return None;
+        }
+        self.remote_messages
+            .iter()
+            .find_map(|line| re.captures(line)?[1].parse().ok())
+    }
     /// Whether the refusal is the ordinary "the branch moved under you" kind,
     /// as opposed to e.g. a repository rule or a server-side hook.
     pub fn is_non_fast_forward(&self) -> bool {
@@ -405,6 +462,28 @@ impl std::fmt::Display for PushRejected {
 }
 
 impl std::error::Error for PushRejected {}
+
+/// The refspecs whose destination ref the remote refused, in their original
+/// order. Refs the remote accepted are not pushed again.
+fn refspecs_to_retry(
+    refspecs: &[String],
+    rejected: &PushRejected,
+) -> Vec<String> {
+    refspecs
+        .iter()
+        .filter(|spec| {
+            let dst = spec
+                .trim_start_matches('+')
+                .split_once(':')
+                .map_or(spec.as_str(), |(_, dst)| dst);
+            rejected
+                .rejected
+                .iter()
+                .any(|(reference, _)| reference == dst)
+        })
+        .cloned()
+        .collect()
+}
 
 /// The human-readable part of the server's sideband output: split into lines,
 /// strip terminal control sequences, and drop the progress meters
@@ -666,6 +745,54 @@ Review all repository rules at https://github.com/o/r/rules?ref=refs%2Fheads%2Fu
             .unwrap_or_else(|| panic!("expected PushRejected, got: {err:?}"));
         assert!(rejected.is_non_fast_forward(), "{rejected}");
         assert!(!err.to_string().contains("could not connect"), "{err:?}");
+    }
+
+    #[test]
+    fn ref_update_limit_is_read_from_the_rule_violation_message() {
+        let reason = "push declined due to repository rule violations";
+        let mut rejected = PushRejected {
+            rejected: vec![
+                ("refs/heads/a".into(), reason.into()),
+                ("refs/heads/b".into(), reason.into()),
+            ],
+            remote_messages: vec![
+                "error: GH013: Repository rule violations found for refs/heads/a.".into(),
+                "- Pushes can not update more than 5 branches or tags.".into(),
+            ],
+        };
+        assert_eq!(rejected.max_ref_updates(), Some(5));
+
+        rejected.rejected[1].1 = "non-fast-forward".into();
+        assert_eq!(rejected.max_ref_updates(), None, "mixed reasons");
+
+        rejected.rejected[1].1 = reason.into();
+        rejected.remote_messages[1] =
+            "- Cannot create ref due to creations being restricted.".into();
+        assert_eq!(rejected.max_ref_updates(), None, "a different rule");
+    }
+
+    #[test]
+    fn only_refused_refspecs_are_retried_in_their_original_order() {
+        let refspecs: Vec<String> = vec![
+            "aaaa:refs/heads/a".into(),
+            "+bbbb:refs/heads/b".into(),
+            "cccc:refs/heads/c".into(),
+            ":refs/heads/old".into(),
+        ];
+        let rejected = PushRejected {
+            rejected: vec![
+                ("refs/heads/old".into(), "rule violations".into()),
+                ("refs/heads/b".into(), "rule violations".into()),
+            ],
+            remote_messages: Vec::new(),
+        };
+        assert_eq!(
+            refspecs_to_retry(&refspecs, &rejected),
+            vec![
+                "+bbbb:refs/heads/b".to_string(),
+                ":refs/heads/old".to_string()
+            ]
+        );
     }
 
     #[test]
