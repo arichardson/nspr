@@ -41,7 +41,7 @@ use crate::config::Config;
 use crate::forge::{Forge, PrState, PullRequestUpdate, PushSpec, SquashMerge};
 use crate::git::Git;
 use crate::review_diff::displayed_patch_id;
-use crate::stack::{Dep, Stack};
+use crate::stack::{Dep, LayerSelection, Stack};
 use crate::trailers::DEPENDS_ON;
 
 #[derive(Debug, Clone, Default)]
@@ -52,9 +52,9 @@ pub struct LandOptions {
     /// commit. Only useful for inspection; the next `nspr diff` would try to
     /// re-create the landed pull request.
     pub keep_local: bool,
-    /// When set, only land layers in this set (for example, a single connected
+    /// Which layers in the stack to land (for example, a single connected
     /// stack component selected via `nspr land --all <PR>`).
-    pub only_layers: Option<HashSet<usize>>,
+    pub selection: LayerSelection,
 }
 
 /// What happened to one dependent layer.
@@ -107,13 +107,13 @@ pub async fn land_layer(
     opts: &LandOptions,
 ) -> Result<LandOutcome> {
     git.check_no_uncommitted_changes()?;
-    let comp_set: HashSet<usize> =
-        stack.component_of(index).into_iter().collect();
+    let comp_selection =
+        LayerSelection::from_indices(stack.component_of(index));
     let prs_for_check = crate::engine::gather_for(
         forge,
         stack,
         &crate::engine::SyncOptions {
-            only_layers: Some(comp_set.clone()),
+            selection: comp_selection.clone(),
             ..Default::default()
         },
     )
@@ -123,8 +123,7 @@ pub async fn land_layer(
         config,
         stack,
         &prs_for_check,
-        None,
-        Some(&comp_set),
+        &comp_selection,
     )?;
 
     let layer = &stack.layers[index];
@@ -496,7 +495,7 @@ pub async fn land_all(
         forge,
         stack,
         &crate::engine::SyncOptions {
-            only_layers: opts.only_layers.clone(),
+            selection: opts.selection.clone(),
             ..Default::default()
         },
     )
@@ -506,8 +505,7 @@ pub async fn land_all(
         config,
         stack,
         &prs_for_check,
-        None,
-        opts.only_layers.as_ref(),
+        &opts.selection,
     )?;
 
     if stack.layers.is_empty() {
@@ -528,9 +526,7 @@ pub async fn land_all(
     // Snapshot pull requests for all layers up front before mutating anything.
     let mut pr_states: HashMap<usize, LayerPrState> = HashMap::new();
     for (i, layer) in stack.layers.iter().enumerate() {
-        if let Some(allowed) = &opts.only_layers
-            && !allowed.contains(&i)
-        {
+        if !opts.selection.contains(i) {
             continue;
         }
         if let Some(number) = layer.pr {
@@ -584,9 +580,7 @@ pub async fn land_all(
     let mut first_error: Option<color_eyre::Report> = None;
 
     for index in 0..stack.layers.len() {
-        if let Some(allowed) = &opts.only_layers
-            && !allowed.contains(&index)
-        {
+        if !opts.selection.contains(index) {
             continue;
         }
         let dep_ready = stack.layers[index].external_pr_deps().is_empty()

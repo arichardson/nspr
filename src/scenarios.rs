@@ -2343,10 +2343,10 @@ fn cherry_pick_diff_creates_only_head_pr_targeting_trunk() {
     w.add_layer("Cherry-picked bugfix", &[("c.txt", "c1")]);
 
     // Simulate `nspr diff --cherry-pick`: set `Depends-On: main` on HEAD and
-    // sync with `only_layer: Some(2)`.
+    // sync with `selection: LayerSelection::one(2)`.
     w.set_trailer(2, crate::trailers::DEPENDS_ON, TRUNK);
     let outcomes = w.sync_with(SyncOptions {
-        only_layer: Some(2),
+        selection: crate::stack::LayerSelection::one(2),
         ..Default::default()
     });
 
@@ -2847,7 +2847,7 @@ fn retargeting_onto_a_moved_trunk_never_displays_the_upstream_commits() {
     w.set_trailer(1, crate::trailers::DEPENDS_ON, TRUNK);
     w.forge.clear_diff_observations();
     w.sync_with(SyncOptions {
-        only_layer: Some(1),
+        selection: crate::stack::LayerSelection::one(1),
         ..Default::default()
     });
 
@@ -4191,14 +4191,11 @@ fn multi_stack_diff_scopes_to_current_stack_ignoring_legacy_spr_in_earlier_stack
     // default when multiple stacks exist) must succeed and create PRs only for
     // layers 1 and 2 without touching layer 0.
     let stack = w.discover();
-    let head_comp: std::collections::HashSet<usize> = stack
-        .component_of(stack.layers.len() - 1)
-        .into_iter()
-        .collect();
-    assert_eq!(head_comp, std::collections::HashSet::from([1usize, 2usize]));
+    let head_comp = stack.component_of(stack.layers.len() - 1);
+    assert_eq!(head_comp, vec![1usize, 2usize]);
 
     let outcomes = w.sync_with(SyncOptions {
-        only_layers: Some(head_comp),
+        selection: crate::stack::LayerSelection::from_indices(head_comp),
         ..Default::default()
     });
     assert_eq!(outcomes.len(), 2);
@@ -4497,10 +4494,10 @@ fn cherry_pick_diff_succeeds_when_lower_layer_conflicts_with_declared_dependency
         "expected full all_trees to fail on Layer 2, got: {full_err}"
     );
 
-    // Updating Layer 3 via `--cherry-pick` (`only_layer: Some(3)`) or scoped
-    // current-stack diff (`only_layers: Some({3})`) must NOT fail on Layer 2.
+    // Updating Layer 3 via `--cherry-pick` (`selection: LayerSelection::one(3)`)
+    // must NOT fail on Layer 2.
     let outcomes = w.sync_with(SyncOptions {
-        only_layer: Some(3),
+        selection: crate::stack::LayerSelection::one(3),
         update_message: true,
         ..Default::default()
     });
@@ -4512,7 +4509,7 @@ fn cherry_pick_diff_succeeds_when_lower_layer_conflicts_with_declared_dependency
     w.layers[3].message.body = "Updated specification notes.".into();
     w.rebuild();
     let outcomes2 = w.sync_with(SyncOptions {
-        only_layer: Some(3),
+        selection: crate::stack::LayerSelection::one(3),
         update_message: true,
         ..Default::default()
     });

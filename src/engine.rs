@@ -22,7 +22,7 @@ use crate::forge::{
 use crate::git::Git;
 use crate::patch_id::tree_patch_id;
 use crate::review_diff::displayed_patch_id;
-use crate::stack::{Dep, Stack, Trees};
+use crate::stack::{Dep, LayerSelection, Stack, Trees};
 use crate::trailers::{CommitMessage, DEPENDS_ON, PULL_REQUEST};
 
 /// Default message for the initial commit on a PR branch when
@@ -60,11 +60,8 @@ pub struct SyncOptions {
     /// merging. Only then is a "behind" layer worth refreshing; see
     /// [`crate::forge::PullRequest::needs_refresh`].
     pub refresh_when_behind: bool,
-    /// Only sync this specific layer index (used by `nspr diff --cherry-pick`).
-    pub only_layer: Option<usize>,
-    /// Only sync this specific set of layer indices (used when scoping `nspr diff`
-    /// to the current stack component by default).
-    pub only_layers: Option<std::collections::HashSet<usize>>,
+    /// Which layers in the stack to sync.
+    pub selection: LayerSelection,
     /// Whether to push incremental `[nspr]` commits (`true`) or rewrite each
     /// PR branch as a single commit with force-pushes (`false`).
     pub preserve_commit_history: bool,
@@ -76,7 +73,7 @@ pub struct SyncOptions {
 impl SyncOptions {
     /// Whether layer `i` is included in the current sync scope.
     pub fn is_layer_selected(&self, i: usize) -> bool {
-        Stack::is_layer_selected(i, self.only_layer, self.only_layers.as_ref())
+        self.selection.contains(i)
     }
 }
 
@@ -88,8 +85,7 @@ impl Default for SyncOptions {
             update_message: false,
             draft: false,
             refresh_when_behind: false,
-            only_layer: None,
-            only_layers: None,
+            selection: LayerSelection::All,
             preserve_commit_history: true,
             declined_relink_commits: std::collections::HashSet::new(),
         }
@@ -112,7 +108,15 @@ pub trait Prompter {
         existing_pr_title: &str,
         branch: &str,
     ) -> Result<bool> {
-        let _ = (subject, existing_pr_number, existing_pr_title, branch);
+        eprintln!(
+            "{} commit \"{}\" has no `Pull-Request:` trailer, but open PR #{} (\"{}\") already uses branch `{}`; linking to #{}.",
+            console::style("warning:").yellow().bold(),
+            subject,
+            existing_pr_number,
+            existing_pr_title,
+            branch,
+            existing_pr_number,
+        );
         Ok(true)
     }
 }
@@ -258,18 +262,16 @@ pub async fn sync_stack(
         .await?;
     resolve_external_deps(forge, stack, &opts).await?;
 
-    let trees =
-        stack.trees_for(git, opts.only_layer, opts.only_layers.as_ref())?;
+    let trees = stack.trees_for(git, &opts.selection)?;
 
     let prs = gather_for(forge, stack, &opts).await?;
-    reject_unusable_for(&prs, opts.only_layer, opts.only_layers.as_ref())?;
+    reject_unusable_for(&prs, &opts.selection)?;
     crate::upgrade::reject_if_legacy_spr_with_prs(
         git,
         config,
         stack,
         &prs,
-        opts.only_layer,
-        opts.only_layers.as_ref(),
+        &opts.selection,
     )?;
     let decision = decide(git, stack, &prs, &trees, &opts)?;
 
@@ -314,17 +316,9 @@ pub async fn sync_stack(
         );
         let mut catchup_opts = opts.clone();
         catchup_opts.refresh_when_behind = true;
-        let trees = stack.trees_for(
-            git,
-            catchup_opts.only_layer,
-            catchup_opts.only_layers.as_ref(),
-        )?;
+        let trees = stack.trees_for(git, &catchup_opts.selection)?;
         let prs = gather_for(forge, stack, &catchup_opts).await?;
-        reject_unusable_for(
-            &prs,
-            catchup_opts.only_layer,
-            catchup_opts.only_layers.as_ref(),
-        )?;
+        reject_unusable_for(&prs, &catchup_opts.selection)?;
         let decision = decide(git, stack, &prs, &trees, &catchup_opts)?;
         let mut staged_again = false;
         let second = execute(
@@ -372,9 +366,7 @@ pub async fn sync_stack(
     };
 
     forge
-        .sync_stacks(
-            &stack.pr_chains_for(opts.only_layer, opts.only_layers.as_ref()),
-        )
+        .sync_stacks(&stack.pr_chains_for(&opts.selection))
         .await?;
     Ok(final_outcomes)
 }
@@ -399,15 +391,7 @@ pub async fn gather_for(
     opts: &SyncOptions,
 ) -> Result<Vec<Option<PullRequest>>> {
     let n = stack.layers.len();
-    let mut needed = vec![false; n];
-    for i in (0..n).rev() {
-        if opts.is_layer_selected(i) || needed[i] {
-            needed[i] = true;
-            for j in stack.layers[i].layer_deps() {
-                needed[j] = true;
-            }
-        }
-    }
+    let needed = stack.needed_layers(&opts.selection);
 
     let mut needed_indices = Vec::with_capacity(n);
     let mut needed_numbers = Vec::with_capacity(n);
@@ -433,18 +417,17 @@ pub async fn gather_for(
 /// Separate from [`gather`] because `status` wants to *show* you a closed or
 /// merged pull request rather than fail on it.
 pub fn reject_unusable(prs: &[Option<PullRequest>]) -> Result<()> {
-    reject_unusable_for(prs, None, None)
+    reject_unusable_for(prs, &LayerSelection::All)
 }
 
 /// Refuse to push to a pull request among the selected layers that is closed
 /// or already merged.
 pub fn reject_unusable_for(
     prs: &[Option<PullRequest>],
-    only_layer: Option<usize>,
-    only_layers: Option<&std::collections::HashSet<usize>>,
+    selection: &LayerSelection,
 ) -> Result<()> {
     for (i, pr) in prs.iter().enumerate() {
-        if !Stack::is_layer_selected(i, only_layer, only_layers) {
+        if !selection.contains(i) {
             continue;
         }
         let Some(pr) = pr else { continue };
@@ -1996,16 +1979,7 @@ pub async fn resolve_external_deps(
     stack: &mut Stack,
     opts: &SyncOptions,
 ) -> Result<()> {
-    let n = stack.layers.len();
-    let mut needed = vec![false; n];
-    for i in (0..n).rev() {
-        if opts.is_layer_selected(i) || needed[i] {
-            needed[i] = true;
-            for j in stack.layers[i].layer_deps() {
-                needed[j] = true;
-            }
-        }
-    }
+    let needed = stack.needed_layers(&opts.selection);
     for (i, &is_needed) in needed.iter().enumerate() {
         if !is_needed {
             continue;

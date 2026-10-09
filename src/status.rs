@@ -122,8 +122,7 @@ pub async fn status_for(
     stack: &Stack,
     opts: &SyncOptions,
 ) -> Result<StackStatus> {
-    let trees =
-        stack.trees_for(git, opts.only_layer, opts.only_layers.as_ref())?;
+    let trees = stack.trees_for(git, &opts.selection)?;
     let prs = engine::gather_for(forge, stack, opts).await?;
     let mut status_opts = opts.clone();
     status_opts.preserve_commit_history = match config.preserve_commit_history {

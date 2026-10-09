@@ -13,12 +13,13 @@ use git2::Oid;
 
 use nspr::config::{self, Config};
 use nspr::engine::{
-    self, AUTO_UPDATE_MESSAGE, LayerAction, LayerOutcome, Prompter, SyncOptions,
+    self, AUTO_UPDATE_MESSAGE, FixedPrompter, LayerAction, LayerOutcome,
+    Prompter, SyncOptions,
 };
 use nspr::forge::Forge as _;
 use nspr::forge::github::GitHubForge;
 use nspr::git::Git;
-use nspr::stack::Stack;
+use nspr::stack::{LayerSelection, Stack};
 use nspr::{
     amend, auth, close, forge, guardrails, land, list, patch, stack_comment,
     status, sync,
@@ -346,7 +347,7 @@ fn resolve_diff_range(
     stack: &Stack,
     from: Option<&str>,
     to: Option<&str>,
-) -> Result<std::collections::HashSet<usize>> {
+) -> Result<LayerSelection> {
     let lo = from
         .map(|spec| resolve_diff_target(git, stack, spec))
         .transpose()?;
@@ -360,7 +361,7 @@ fn inclusive_layer_range(
     lo: Option<usize>,
     hi: Option<usize>,
     len: usize,
-) -> Result<std::collections::HashSet<usize>> {
+) -> Result<LayerSelection> {
     let lo = lo.unwrap_or(0);
     let hi = hi.unwrap_or(len.saturating_sub(1));
     if lo > hi {
@@ -371,7 +372,7 @@ fn inclusive_layer_range(
             hi + 1
         );
     }
-    Ok((lo..=hi).collect())
+    Ok(LayerSelection::range(lo..=hi))
 }
 
 #[derive(Args, Default)]
@@ -624,37 +625,35 @@ impl Session {
             None
         };
 
-        let range = if args.from.is_some() || args.to.is_some() {
-            Some(resolve_diff_range(
+        let selection = if let Some(idx) = only_layer {
+            LayerSelection::one(idx)
+        } else if args.from.is_some() || args.to.is_some() {
+            resolve_diff_range(
                 &self.git,
                 &stack,
                 args.from.as_deref(),
                 args.to.as_deref(),
-            )?)
+            )?
         } else {
-            None
-        };
-
-        let components = stack.components();
-        let only_layers = if range.is_some() {
-            range
-        } else if !args.all && only_layer.is_none() && components.len() > 1 {
-            let head_idx = stack.layers.len() - 1;
-            let current_comp = stack.component_of(head_idx);
-            let commit_word = if current_comp.len() == 1 {
-                "commit"
+            let components = stack.components();
+            if !args.all && components.len() > 1 {
+                let head_idx = stack.layers.len() - 1;
+                let current_comp = stack.component_of(head_idx);
+                let commit_word = if current_comp.len() == 1 {
+                    "commit"
+                } else {
+                    "commits"
+                };
+                eprintln!(
+                    "{} branch has {} independent stacks; only updating the current stack ({} {commit_word}). Use `nspr diff --all` to push all stacks.",
+                    style("warning:").yellow().bold(),
+                    components.len(),
+                    current_comp.len(),
+                );
+                LayerSelection::from_indices(current_comp)
             } else {
-                "commits"
-            };
-            eprintln!(
-                "{} branch has {} independent stacks; only updating the current stack ({} {commit_word}). Use `nspr diff --all` to push all stacks.",
-                style("warning:").yellow().bold(),
-                components.len(),
-                current_comp.len(),
-            );
-            Some(current_comp.into_iter().collect())
-        } else {
-            None
+                LayerSelection::All
+            }
         };
 
         let mut opts = SyncOptions {
@@ -662,8 +661,7 @@ impl Session {
             message: args.message.clone(),
             update_message: args.update_message,
             draft: args.draft,
-            only_layer,
-            only_layers,
+            selection,
             ..Default::default()
         };
 
@@ -733,24 +731,15 @@ impl Session {
         dry_run: bool,
     ) -> Result<status::StackStatus> {
         engine::resolve_external_deps(&self.forge, stack, opts).await?;
-        let trees = stack.trees_for(
-            &self.git,
-            opts.only_layer,
-            opts.only_layers.as_ref(),
-        )?;
+        let trees = stack.trees_for(&self.git, &opts.selection)?;
         let prs = engine::gather_for(&self.forge, stack, opts).await?;
-        engine::reject_unusable_for(
-            &prs,
-            opts.only_layer,
-            opts.only_layers.as_ref(),
-        )?;
+        engine::reject_unusable_for(&prs, &opts.selection)?;
         nspr::upgrade::reject_if_legacy_spr_with_prs(
             &self.git,
             &self.config,
             stack,
             &prs,
-            opts.only_layer,
-            opts.only_layers.as_ref(),
+            &opts.selection,
         )?;
         let merge_settings = self.forge.repo_merge_settings().await?;
         opts.preserve_commit_history =
@@ -1236,7 +1225,7 @@ impl Session {
         let mut opts = land::LandOptions {
             message: args.message.clone(),
             keep_local: false,
-            only_layers: None,
+            selection: LayerSelection::All,
         };
 
         let outcomes = if args.all && !args.cherry_pick {
@@ -1250,8 +1239,8 @@ impl Session {
                             "#{pr_num} is not in this stack. Run `nspr status` to see your stack."
                         )
                     })?;
-                opts.only_layers =
-                    Some(stack.component_of(idx).into_iter().collect());
+                opts.selection =
+                    LayerSelection::from_indices(stack.component_of(idx));
             }
             land::land_all(&self.git, &self.forge, &self.config, &stack, &opts)
                 .await?
@@ -1353,35 +1342,6 @@ impl Session {
 // ---------------------------------------------------------------------------
 // Prompting
 // ---------------------------------------------------------------------------
-
-/// Never prompts. Used with `--no-prompt`, and for updates that do not change
-/// the displayed diff.
-struct FixedPrompter(String);
-
-impl Prompter for FixedPrompter {
-    fn update_message(&self, _subject: &str) -> Result<String> {
-        Ok(self.0.clone())
-    }
-
-    fn confirm_relink_existing_pr(
-        &self,
-        subject: &str,
-        existing_pr_number: u64,
-        existing_pr_title: &str,
-        branch: &str,
-    ) -> Result<bool> {
-        eprintln!(
-            "{} commit \"{}\" has no `Pull-Request:` trailer, but open PR #{} (\"{}\") already uses branch `{}`; linking to #{}.",
-            style("warning:").yellow().bold(),
-            subject,
-            existing_pr_number,
-            existing_pr_title,
-            branch,
-            existing_pr_number,
-        );
-        Ok(true)
-    }
-}
 
 /// Asks what changed, but only when the engine has decided the reviewer will
 /// actually see a difference — so this does not fire on every `nspr diff`.
@@ -1868,22 +1828,22 @@ mod tests {
 
     #[test]
     fn diff_range_is_inclusive_and_defaults_to_the_whole_branch() {
-        let set = |v: &[usize]| v.iter().copied().collect();
+        let sel = |v: &[usize]| LayerSelection::Only(v.to_vec());
         assert_eq!(
             inclusive_layer_range(Some(1), Some(3), 5).unwrap(),
-            set(&[1, 2, 3])
+            sel(&[1, 2, 3])
         );
         assert_eq!(
             inclusive_layer_range(Some(2), Some(2), 5).unwrap(),
-            set(&[2])
+            sel(&[2])
         );
         assert_eq!(
             inclusive_layer_range(Some(3), None, 5).unwrap(),
-            set(&[3, 4])
+            sel(&[3, 4])
         );
         assert_eq!(
             inclusive_layer_range(None, Some(1), 5).unwrap(),
-            set(&[0, 1])
+            sel(&[0, 1])
         );
         let err = inclusive_layer_range(Some(3), Some(1), 5).unwrap_err();
         assert!(err.to_string().contains("at or below"), "{err}");

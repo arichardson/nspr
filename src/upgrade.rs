@@ -27,7 +27,7 @@ use git2::Oid;
 use crate::config::Config;
 use crate::forge::{Forge, PullRequest, PullRequestUpdate, PushSpec};
 use crate::git::Git;
-use crate::stack::{Dep, Stack};
+use crate::stack::{Dep, LayerSelection, Stack};
 use crate::trailers::{CommitMessage, DEPENDS_ON, PULL_REQUEST};
 
 #[derive(Debug, Clone)]
@@ -112,7 +112,13 @@ pub async fn reject_if_legacy_spr(
     stack: &Stack,
 ) -> Result<()> {
     let prs = crate::engine::gather(forge, stack).await?;
-    reject_if_legacy_spr_with_prs(git, config, stack, &prs, None, None)
+    reject_if_legacy_spr_with_prs(
+        git,
+        config,
+        stack,
+        &prs,
+        &LayerSelection::All,
+    )
 }
 
 pub fn reject_if_legacy_spr_with_prs(
@@ -120,11 +126,10 @@ pub fn reject_if_legacy_spr_with_prs(
     config: &Config,
     stack: &Stack,
     prs: &[Option<PullRequest>],
-    only_layer: Option<usize>,
-    only_layers: Option<&HashSet<usize>>,
+    selection: &LayerSelection,
 ) -> Result<()> {
     for (i, layer) in stack.layers.iter().enumerate() {
-        if !Stack::is_layer_selected(i, only_layer, only_layers) {
+        if !selection.contains(i) {
             continue;
         }
         let is_spr = match &prs[i] {
@@ -172,7 +177,7 @@ pub async fn upgrade_stack_with_options(
 
     let prs = crate::engine::gather(forge, stack).await?;
 
-    let mut upgrade_layers: HashSet<usize> = HashSet::new();
+    let mut upgrade_indices: Vec<usize> = Vec::new();
     for comp in stack.components() {
         let mut comp_needs_upgrade = false;
         for &i in &comp {
@@ -188,16 +193,17 @@ pub async fn upgrade_stack_with_options(
             }
         }
         if comp_needs_upgrade {
-            upgrade_layers.extend(comp);
+            upgrade_indices.extend(comp);
         }
     }
 
-    if upgrade_layers.is_empty() {
+    if upgrade_indices.is_empty() {
         return Ok(Vec::new());
     }
 
-    let trees = stack.trees_for(git, None, Some(&upgrade_layers))?;
-    crate::engine::reject_unusable_for(&prs, None, Some(&upgrade_layers))?;
+    let upgrade_layers = LayerSelection::from_indices(upgrade_indices);
+    let trees = stack.trees_for(git, &upgrade_layers)?;
+    crate::engine::reject_unusable_for(&prs, &upgrade_layers)?;
 
     let n = stack.layers.len();
     let head_branches: HashSet<String> =
@@ -222,7 +228,7 @@ pub async fn upgrade_stack_with_options(
         preserve_commit_history && !merge_settings.is_squash_only();
 
     for (i, pr) in prs.iter().enumerate() {
-        if !upgrade_layers.contains(&i) {
+        if !upgrade_layers.contains(i) {
             base_branches.push(config.trunk.clone());
             pass1_tips.push(stack.base);
             final_tips.push(stack.base);
@@ -375,7 +381,7 @@ pub async fn upgrade_stack_with_options(
 
     if config.draft_while_retargeting {
         for i in 0..n {
-            if !upgrade_layers.contains(&i) {
+            if !upgrade_layers.contains(i) {
                 continue;
             }
             let Some(pr) = &prs[i] else { continue };
@@ -396,7 +402,7 @@ pub async fn upgrade_stack_with_options(
     }
 
     for (i, pr) in prs.iter().enumerate() {
-        if !upgrade_layers.contains(&i) {
+        if !upgrade_layers.contains(i) {
             continue;
         }
         let Some(pr) = pr else {
@@ -511,7 +517,7 @@ pub async fn upgrade_stack_with_options(
 
     crate::engine::apply_message_edits(git, stack, &messages)?;
     forge
-        .sync_stacks(&stack.pr_chains_for(None, Some(&upgrade_layers)))
+        .sync_stacks(&stack.pr_chains_for(&upgrade_layers))
         .await?;
 
     if config.stack_comments {
@@ -520,7 +526,7 @@ pub async fn upgrade_stack_with_options(
             config,
             stack,
             &crate::engine::SyncOptions {
-                only_layers: Some(upgrade_layers),
+                selection: upgrade_layers,
                 ..Default::default()
             },
         )

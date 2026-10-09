@@ -49,6 +49,38 @@ pub fn synthetic_base_branch(head_branch: &str) -> String {
     format!("{head_branch}.base")
 }
 
+/// Which layers in a [`Stack`] an operation should act on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum LayerSelection {
+    #[default]
+    All,
+    Only(Vec<usize>),
+}
+
+impl LayerSelection {
+    pub fn one(index: usize) -> Self {
+        Self::Only(vec![index])
+    }
+
+    pub fn range(range: std::ops::RangeInclusive<usize>) -> Self {
+        Self::Only(range.collect())
+    }
+
+    pub fn from_indices(indices: impl IntoIterator<Item = usize>) -> Self {
+        let mut v: Vec<usize> = indices.into_iter().collect();
+        v.sort_unstable();
+        v.dedup();
+        Self::Only(v)
+    }
+
+    pub fn contains(&self, index: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(indices) => indices.contains(&index),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Layer {
     /// The local commit this layer represents.
@@ -612,37 +644,42 @@ impl Stack {
         self.merge_base_tree_cached(git, i, cache)
     }
 
-    /// Effective tree and dependency tree for every layer, in stack order.
-    ///
-    /// Computed with a single shared cache, so a deep DAG costs one merge per
-    /// layer rather than one per layer per query.
-    pub fn all_trees(&self, git: &Git) -> Result<Trees> {
-        self.trees_for(git, None, None)
-    }
-
-    /// Effective tree and dependency tree for the layers selected by
-    /// `only_layer` / `only_layers` (and their transitive `Dep::Layer`
-    /// ancestors). Unselected layers that no selected layer depends on are
-    /// filled with their raw local commit/parent trees so a conflict in an
-    /// unrelated layer lower in the branch does not block `--cherry-pick` or
-    /// updating another stack.
-    pub fn trees_for(
-        &self,
-        git: &Git,
-        only_layer: Option<usize>,
-        only_layers: Option<&HashSet<usize>>,
-    ) -> Result<Trees> {
+    /// Boolean mask of layers included in `selection` together with all of
+    /// their transitive `Dep::Layer` dependencies.
+    pub fn needed_layers(&self, selection: &LayerSelection) -> Vec<bool> {
         let n = self.layers.len();
         let mut needed = vec![false; n];
         for i in (0..n).rev() {
-            if Self::is_layer_selected(i, only_layer, only_layers) || needed[i]
-            {
+            if selection.contains(i) || needed[i] {
                 needed[i] = true;
                 for j in self.layers[i].layer_deps() {
                     needed[j] = true;
                 }
             }
         }
+        needed
+    }
+
+    /// Effective tree and dependency tree for every layer, in stack order.
+    ///
+    /// Computed with a single shared cache, so a deep DAG costs one merge per
+    /// layer rather than one per layer per query.
+    pub fn all_trees(&self, git: &Git) -> Result<Trees> {
+        self.trees_for(git, &LayerSelection::All)
+    }
+
+    /// Effective tree and dependency tree for the layers selected by
+    /// `selection` (and their transitive `Dep::Layer` ancestors). Unselected
+    /// layers that no selected layer depends on are filled with their raw
+    /// local commit/parent trees so a conflict in an unrelated layer lower in
+    /// the branch does not block `--cherry-pick` or updating another stack.
+    pub fn trees_for(
+        &self,
+        git: &Git,
+        selection: &LayerSelection,
+    ) -> Result<Trees> {
+        let n = self.layers.len();
+        let needed = self.needed_layers(selection);
 
         let mut cache = HashMap::new();
         let mut effective = Vec::with_capacity(n);
@@ -722,45 +759,22 @@ impl Stack {
             .collect()
     }
 
-    /// Whether layer `i` is included in the active selection (`only_layer` / `only_layers`).
-    pub fn is_layer_selected(
-        i: usize,
-        only_layer: Option<usize>,
-        only_layers: Option<&HashSet<usize>>,
-    ) -> bool {
-        if let Some(only) = only_layer
-            && i != only
-        {
-            return false;
-        }
-        if let Some(set) = only_layers
-            && !set.contains(&i)
-        {
-            return false;
-        }
-        true
-    }
-
     /// Ordered bottom-to-top pull request number chains (`len >= 2`) suitable
     /// for registering with GitHub's native Stacks API (`/repos/{owner}/{repo}/stacks`).
     pub fn pr_chains(&self) -> Vec<Vec<u64>> {
-        self.pr_chains_for(None, None)
+        self.pr_chains_for(&LayerSelection::All)
     }
 
     /// Ordered bottom-to-top pull request number chains (`len >= 2`), optionally
-    /// restricted to layers selected by `only_layer` / `only_layers`.
-    pub fn pr_chains_for(
-        &self,
-        only_layer: Option<usize>,
-        only_layers: Option<&HashSet<usize>>,
-    ) -> Vec<Vec<u64>> {
+    /// restricted to layers selected by `selection`.
+    pub fn pr_chains_for(&self, selection: &LayerSelection) -> Vec<Vec<u64>> {
         let mut visited = vec![false; self.layers.len()];
         let mut chains = Vec::new();
         for start in 0..self.layers.len() {
             if visited[start] || self.layers[start].pr.is_none() {
                 continue;
             }
-            if !Self::is_layer_selected(start, only_layer, only_layers) {
+            if !selection.contains(start) {
                 continue;
             }
             let is_root = match self.layers[start].dep {
