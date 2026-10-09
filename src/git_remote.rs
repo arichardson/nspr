@@ -406,15 +406,19 @@ impl std::fmt::Display for PushRejected {
 
 impl std::error::Error for PushRejected {}
 
-/// The human-readable part of the server's sideband output: split into lines
-/// and drop the progress meters (`Resolving deltas:  50% (1/2)`), which arrive
-/// on the same channel.
+/// The human-readable part of the server's sideband output: split into lines,
+/// strip terminal control sequences, and drop the progress meters
+/// (`Resolving deltas:  50% (1/2)`), which arrive on the same channel.
 fn remote_messages(raw: &[u8]) -> Vec<String> {
-    let progress = lazy_regex::regex!(r"^[A-Za-z][A-Za-z ]*:\s+\d+%");
+    let control =
+        lazy_regex::regex!(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]");
+    let progress = lazy_regex::regex!(r"\d{1,3}%\s*\(\d+/\d+\)");
     let text = String::from_utf8_lossy(raw);
     let mut lines: Vec<String> = Vec::new();
-    for line in text.split(['\n', '\r']).map(str::trim_end) {
-        if progress.is_match(line.trim_start()) {
+    for line in text.split(['\n', '\r']) {
+        let line = control.replace_all(line, "");
+        let line = line.trim_end();
+        if progress.is_match(line) {
             continue;
         }
         // Keep blank lines that separate paragraphs, but not runs of them.
@@ -593,6 +597,15 @@ Review all repository rules at https://github.com/o/r/rules?ref=refs%2Fheads%2Fu
                 "",
                 "- Cannot create ref due to creations being restricted.",
             ]
+        );
+    }
+
+    #[test]
+    fn remote_messages_drop_progress_wrapped_in_terminal_escapes() {
+        let raw = b"\x1b[K  Resolving deltas:   0% (0/27)\x1b[K\n- Pushes can not update more than 5 branches or tags.\x1b[K\n";
+        assert_eq!(
+            remote_messages(raw),
+            vec!["- Pushes can not update more than 5 branches or tags."]
         );
     }
 
