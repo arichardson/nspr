@@ -545,33 +545,48 @@ impl Session {
         Ok(stack)
     }
 
+    fn ensure_layer_targets_trunk(
+        &self,
+        stack: &mut Stack,
+        idx: usize,
+        dry_run: bool,
+    ) -> Result<()> {
+        if stack.layers[idx].is_root_landable() {
+            return Ok(());
+        }
+        if dry_run {
+            stack.layers[idx].set_dep_main(&self.config.trunk);
+            return Ok(());
+        }
+        let mut msg = stack.layers[idx].message.clone();
+        msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
+        let pairs: Vec<(git2::Oid, String)> = stack
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == idx {
+                    (l.commit, msg.render())
+                } else {
+                    (l.commit, l.message.render())
+                }
+            })
+            .collect();
+        self.git.rewrite_messages(stack.base, &pairs)?;
+        *stack = self.discover()?;
+        Ok(())
+    }
+
     async fn diff(&self, args: DiffArgs, verbose: bool) -> Result<()> {
         let mut stack = self.discover()?;
 
         let only_layer = if args.cherry_pick {
             let head_idx = stack.layers.len() - 1;
-            if !stack.layers[head_idx].is_root_landable() {
-                if args.dry_run {
-                    stack.layers[head_idx].set_dep_main(&self.config.trunk);
-                } else {
-                    let mut msg = stack.layers[head_idx].message.clone();
-                    msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
-                    let pairs: Vec<(git2::Oid, String)> = stack
-                        .layers
-                        .iter()
-                        .enumerate()
-                        .map(|(i, l)| {
-                            if i == head_idx {
-                                (l.commit, msg.render())
-                            } else {
-                                (l.commit, l.message.render())
-                            }
-                        })
-                        .collect();
-                    self.git.rewrite_messages(stack.base, &pairs)?;
-                    stack = self.discover()?;
-                }
-            }
+            self.ensure_layer_targets_trunk(
+                &mut stack,
+                head_idx,
+                args.dry_run,
+            )?;
             Some(head_idx)
         } else if args.new_stack {
             let target_idx = stack
@@ -579,27 +594,12 @@ impl Session {
                 .iter()
                 .position(|l| l.pr.is_none())
                 .unwrap_or(stack.layers.len() - 1);
-            if target_idx > 0 && !stack.layers[target_idx].is_root_landable() {
-                if args.dry_run {
-                    stack.layers[target_idx].set_dep_main(&self.config.trunk);
-                } else {
-                    let mut msg = stack.layers[target_idx].message.clone();
-                    msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
-                    let pairs: Vec<(git2::Oid, String)> = stack
-                        .layers
-                        .iter()
-                        .enumerate()
-                        .map(|(i, l)| {
-                            if i == target_idx {
-                                (l.commit, msg.render())
-                            } else {
-                                (l.commit, l.message.render())
-                            }
-                        })
-                        .collect();
-                    self.git.rewrite_messages(stack.base, &pairs)?;
-                    stack = self.discover()?;
-                }
+            if target_idx > 0 {
+                self.ensure_layer_targets_trunk(
+                    &mut stack,
+                    target_idx,
+                    args.dry_run,
+                )?;
             }
             None
         } else if let Some(spec) = args.target_spec() {
@@ -936,19 +936,7 @@ impl Session {
         let prs = engine::gather(&self.forge, &stack).await?;
         for (i, pr) in prs.into_iter().enumerate() {
             let Some(pr) = pr else { continue };
-            let multi_deps: Vec<String> =
-                if stack.layers[i].has_multiple_layer_deps() {
-                    stack.layers[i]
-                        .layer_deps()
-                        .into_iter()
-                        .map(|j| match stack.layers[j].pr {
-                            Some(n) => format!("#{n}"),
-                            None => format!("layer {}", j + 1),
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+            let multi_deps = stack.multi_dep_labels(i);
             let body = nspr::pr_body::splice_warning_with_deps(
                 &pr.body,
                 warn_merge_strategy,

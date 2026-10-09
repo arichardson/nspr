@@ -491,242 +491,107 @@ pub struct Decision {
     pub push: Vec<bool>,
 }
 
-/// Passes B and C: decide which layers to push.
-pub fn decide(
+struct LayerMetadataDiff {
+    message_changed: bool,
+    author_changed: bool,
+    github_message_edited: bool,
+    rewrite_history: bool,
+}
+
+fn inspect_layer_metadata(
+    git: &Git,
+    layer: &crate::stack::Layer,
+    pr: &PullRequest,
+    first_oid: Option<Oid>,
+    preserve_commit_history: bool,
+) -> Result<LayerMetadataDiff> {
+    let mut diff = LayerMetadataDiff {
+        message_changed: false,
+        author_changed: false,
+        github_message_edited: false,
+        rewrite_history: false,
+    };
+
+    let recorded_msg = crate::refs::get_message(git, pr.number)
+        .map(|m| CommitMessage::parse(&m));
+    let msg_differs = pr_message_differs_from(pr, &layer.message);
+    if !msg_differs && recorded_msg.is_none() {
+        let _ = crate::refs::update_message(
+            git,
+            pr.number,
+            &layer.message.clean_for_branch(),
+        );
+    }
+    if let Some(first_oid) = first_oid {
+        let current_msg = git.message_of(first_oid)?;
+        let trimmed_current = current_msg.trim();
+        let baseline_msg = if let Some(msg) = recorded_msg {
+            msg
+        } else if !trimmed_current.starts_with("[nspr]")
+            && !trimmed_current.starts_with("[spr]")
+        {
+            CommitMessage::parse(&current_msg)
+        } else {
+            layer.message.clone()
+        };
+        diff.github_message_edited = if msg_differs {
+            pr_was_edited_on_forge(pr, &baseline_msg)
+        } else {
+            false
+        };
+
+        if preserve_commit_history {
+            if msg_differs {
+                diff.message_changed = true;
+            }
+        } else {
+            let desired_msg = layer.message.clean_for_branch();
+            if trimmed_current != desired_msg.trim() {
+                diff.message_changed = true;
+                diff.rewrite_history = true;
+            } else if msg_differs {
+                diff.message_changed = true;
+            }
+        }
+        let local_author = git.author_of(layer.commit)?;
+        if git.author_of(first_oid)? != local_author
+            || git.author_of(pr.head_oid)? != local_author
+        {
+            diff.author_changed = true;
+            diff.rewrite_history = true;
+        }
+        if !preserve_commit_history && first_oid != pr.head_oid {
+            diff.rewrite_history = true;
+        }
+    } else {
+        let baseline_msg =
+            recorded_msg.unwrap_or_else(|| layer.message.clone());
+        diff.github_message_edited = if msg_differs {
+            pr_was_edited_on_forge(pr, &baseline_msg)
+        } else {
+            false
+        };
+        if msg_differs {
+            diff.message_changed = true;
+        }
+    }
+
+    Ok(diff)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cascade_stale_dependency_pushes(
     git: &Git,
     stack: &Stack,
     prs: &[Option<PullRequest>],
     trees: &Trees,
     opts: &SyncOptions,
-) -> Result<Decision> {
+    current_anchor: &[Option<Oid>],
+    patch_changed: &[bool],
+    push: &mut [bool],
+    rewrite_history: &mut [bool],
+) -> Result<()> {
     let n = stack.layers.len();
-    let mut patch_changed = vec![false; n];
-    let mut message_changed = vec![false; n];
-    let mut author_changed = vec![false; n];
-    let mut github_message_edited = vec![false; n];
-    let mut rewrite_history = vec![false; n];
-    let mut push = vec![false; n];
-
-    let mut current_anchor: Vec<Option<Oid>> = vec![None; n];
-
-    // Pass B: compare what each pull request displays *right now* against what
-    // it ought to display. Both sides are computed from local state on the
-    // right and remote state on the left, which is the whole point: the target
-    // is `dep_tree(i)`, the dependency's local effective tree, never the
-    // dependency's remote tip, which may be several amends out of date.
-    for i in 0..n {
-        if !opts.is_layer_selected(i) {
-            continue;
-        }
-        let Some(pr) = &prs[i] else {
-            push[i] = true; // Nothing exists yet; it must be created.
-            continue;
-        };
-
-        let is_multi_dep = stack.layers[i].has_multiple_layer_deps();
-        let syn_base = crate::stack::synthetic_base_branch(&pr.head);
-        let remote_base_tip = if is_multi_dep {
-            if pr.base == syn_base
-                && pr.base_oid != Oid::ZERO_SHA1
-                && git.repo().find_commit(pr.base_oid).is_ok()
-            {
-                Some(pr.base_oid)
-            } else {
-                Some(stack.base)
-            }
-        } else {
-            match stack.layers[i].dep {
-                Dep::Main | Dep::ExternalPr(..) => Some(stack.base),
-                Dep::Layer(j) => prs[j].as_ref().map(|p| p.head_oid),
-            }
-        };
-        let base_branch_changed = if is_multi_dep {
-            pr.base != syn_base
-        } else {
-            match stack.layers[i].dep {
-                Dep::Main | Dep::ExternalPr(..) => pr.base != stack.trunk,
-                Dep::Layer(j) => {
-                    prs[j].as_ref().is_some_and(|p| p.head != pr.base)
-                }
-            }
-        };
-        if base_branch_changed {
-            rewrite_history[i] = true;
-        }
-
-        let mut needs_conflict_refresh = false;
-        patch_changed[i] = match remote_base_tip {
-            // The dependency has no pull request yet, so there is nothing
-            // meaningful to compare against.
-            None => true,
-            Some(base_tip) => {
-                let has_base_oid = pr.base_oid != Oid::ZERO_SHA1
-                    && git.repo().find_commit(pr.base_oid).is_ok();
-                let fallback_base_tip =
-                    if has_base_oid { pr.base_oid } else { base_tip };
-                let first_oid = find_root_commit(git, pr, fallback_base_tip);
-                current_anchor[i] =
-                    first_oid.and_then(|r| git.parent_of(r).ok());
-                let current_pr_base_tip = if has_base_oid {
-                    pr.base_oid
-                } else {
-                    current_anchor[i].unwrap_or(base_tip)
-                };
-                let recorded_msg = crate::refs::get_message(git, pr.number)
-                    .map(|m| CommitMessage::parse(&m));
-                let msg_differs =
-                    pr_message_differs_from(pr, &stack.layers[i].message);
-                if !msg_differs && recorded_msg.is_none() {
-                    let _ = crate::refs::update_message(
-                        git,
-                        pr.number,
-                        &stack.layers[i].message.clean_for_branch(),
-                    );
-                }
-                if let Some(first_oid) = first_oid {
-                    let current_msg = git.message_of(first_oid)?;
-                    let trimmed_current = current_msg.trim();
-                    let baseline_msg = if let Some(msg) = recorded_msg {
-                        msg
-                    } else if !trimmed_current.starts_with("[nspr]")
-                        && !trimmed_current.starts_with("[spr]")
-                    {
-                        CommitMessage::parse(&current_msg)
-                    } else {
-                        stack.layers[i].message.clone()
-                    };
-                    github_message_edited[i] = if msg_differs {
-                        pr_was_edited_on_forge(pr, &baseline_msg)
-                    } else {
-                        false
-                    };
-
-                    if opts.preserve_commit_history {
-                        if msg_differs {
-                            message_changed[i] = true;
-                        }
-                    } else {
-                        let desired_msg =
-                            stack.layers[i].message.clean_for_branch();
-                        if trimmed_current != desired_msg.trim() {
-                            message_changed[i] = true;
-                            rewrite_history[i] = true;
-                        } else if msg_differs {
-                            message_changed[i] = true;
-                        }
-                    }
-                    let local_author = git.author_of(stack.layers[i].commit)?;
-                    if git.author_of(first_oid)? != local_author
-                        || git.author_of(pr.head_oid)? != local_author
-                    {
-                        author_changed[i] = true;
-                        rewrite_history[i] = true;
-                    }
-                    if !opts.preserve_commit_history && first_oid != pr.head_oid
-                    {
-                        rewrite_history[i] = true;
-                    }
-                } else {
-                    let baseline_msg = recorded_msg
-                        .unwrap_or_else(|| stack.layers[i].message.clone());
-                    github_message_edited[i] = if msg_differs {
-                        pr_was_edited_on_forge(pr, &baseline_msg)
-                    } else {
-                        false
-                    };
-                    if msg_differs {
-                        message_changed[i] = true;
-                    }
-                }
-
-                let shown = displayed_patch_id(
-                    git.repo(),
-                    current_pr_base_tip,
-                    pr.head_oid,
-                )?;
-                let desired = tree_patch_id(
-                    git.repo(),
-                    trees.dep[i],
-                    trees.effective[i],
-                )?;
-                if is_multi_dep {
-                    if pr.base == syn_base {
-                        if git.tree_of(current_pr_base_tip)? != trees.dep[i]
-                            || would_conflict_or_diverge_on_forge(
-                                git,
-                                current_pr_base_tip,
-                                pr.head_oid,
-                                trees.dep[i],
-                                trees.effective[i],
-                            )?
-                        {
-                            needs_conflict_refresh = true;
-                            rewrite_history[i] = true;
-                        }
-                    } else {
-                        needs_conflict_refresh = true;
-                        rewrite_history[i] = true;
-                    }
-                } else if !matches!(stack.layers[i].dep, Dep::Layer(..)) {
-                    needs_conflict_refresh =
-                        would_conflict_or_diverge_on_forge(
-                            git,
-                            base_tip,
-                            pr.head_oid,
-                            trees.dep[i],
-                            trees.effective[i],
-                        )?;
-                }
-                if is_multi_dep && pr.base != syn_base {
-                    if multi_dep_own_patch_unchanged(
-                        git,
-                        stack,
-                        prs,
-                        trees,
-                        i,
-                        current_pr_base_tip,
-                        pr.head_oid,
-                    )? {
-                        false
-                    } else {
-                        shown != desired
-                    }
-                } else if !stack.layers[i].merged_pr_deps.is_empty()
-                    && pr.base == stack.trunk
-                    && matches!(stack.layers[i].dep, Dep::Layer(_))
-                {
-                    git.tree_of(pr.head_oid)? != trees.effective[i]
-                } else {
-                    shown != desired
-                }
-            }
-        };
-
-        let behind_base = opts.refresh_when_behind
-            && remote_base_tip.is_some_and(|base_tip| {
-                current_anchor[i] != Some(base_tip)
-                    || !git.is_ancestor(base_tip, pr.head_oid).unwrap_or(false)
-            });
-
-        push[i] = patch_changed[i]
-            || author_changed[i]
-            || rewrite_history[i]
-            || base_branch_changed
-            || needs_conflict_refresh
-            || opts.sync_all
-            || pr.needs_refresh(opts.refresh_when_behind)
-            || behind_base;
-    }
-
-    // Pass C: a push is only safe once its dependency's remote tip already
-    // carries the dependency's effective tree.
-    //
-    // Pushing layer `i` requires its base branch tip `tip_dep` to carry
-    // `effective(dep)`, so GitHub will display `diff(tree(tip_dep), effective(i))`.
-    // If `tip_dep` is stale, that diff would wrongly include the dependency's
-    // un-pushed changes. Restacking the dependency is the fix, and it cascades:
-    // reverse order suffices because forward references are rejected at
-    // discovery, so `j < i` always.
     let mut need_effective_tree = vec![false; n];
     for i in (0..n).rev() {
         if !push[i] {
@@ -795,18 +660,21 @@ pub fn decide(
             }
         }
     }
+    Ok(())
+}
 
-    // Keep every pull request branch 1-parent linear (zero merge commits) so
-    // GitHub's native "Merge full stack" and "Rebase stack" buttons work:
-    // - If a layer's base has not moved (`!base_moved`) and its commit message
-    //   is unchanged, we append a 1-parent fast-forward commit (`rewrite_history = false`),
-    //   leaving untouched upper layers alone (`0` pushes to upper layers).
-    // - Whenever a layer `i` is pushed and its patch cannot remain anchored at
-    //   its current branch root's parent (`base_moved`), we replay `i`'s 1-parent
-    //   revision chain onto the new base tip (`rewrite_history[i] = true`), and
-    //   cascade that re-anchoring to any open dependent layers above `i`.
-    // - When `!opts.preserve_commit_history`, any pushed layer rewrites its
-    //   branch as a single clean commit (`rewrite_history[i] = true`).
+#[allow(clippy::too_many_arguments)]
+fn cascade_branch_rewrites(
+    git: &Git,
+    stack: &Stack,
+    prs: &[Option<PullRequest>],
+    trees: &Trees,
+    opts: &SyncOptions,
+    current_anchor: &[Option<Oid>],
+    push: &mut [bool],
+    rewrite_history: &mut [bool],
+) -> Result<()> {
+    let n = stack.layers.len();
     let mut resulting_branch_tree: Vec<Oid> = Vec::with_capacity(n);
     for i in 0..n {
         if !opts.is_layer_selected(i) && !push[i] {
@@ -931,6 +799,209 @@ pub fn decide(
         };
         resulting_branch_tree.push(b_tree);
     }
+    Ok(())
+}
+
+/// Passes B and C: decide which layers to push.
+pub fn decide(
+    git: &Git,
+    stack: &Stack,
+    prs: &[Option<PullRequest>],
+    trees: &Trees,
+    opts: &SyncOptions,
+) -> Result<Decision> {
+    let n = stack.layers.len();
+    let mut patch_changed = vec![false; n];
+    let mut message_changed = vec![false; n];
+    let mut author_changed = vec![false; n];
+    let mut github_message_edited = vec![false; n];
+    let mut rewrite_history = vec![false; n];
+    let mut push = vec![false; n];
+
+    let mut current_anchor: Vec<Option<Oid>> = vec![None; n];
+
+    // Pass B: compare what each pull request displays *right now* against what
+    // it ought to display. Both sides are computed from local state on the
+    // right and remote state on the left, which is the whole point: the target
+    // is `dep_tree(i)`, the dependency's local effective tree, never the
+    // dependency's remote tip, which may be several amends out of date.
+    for i in 0..n {
+        if !opts.is_layer_selected(i) {
+            continue;
+        }
+        let Some(pr) = &prs[i] else {
+            push[i] = true; // Nothing exists yet; it must be created.
+            continue;
+        };
+
+        let is_multi_dep = stack.layers[i].has_multiple_layer_deps();
+        let syn_base = crate::stack::synthetic_base_branch(&pr.head);
+        let remote_base_tip = if is_multi_dep {
+            if pr.base == syn_base
+                && pr.base_oid != Oid::ZERO_SHA1
+                && git.repo().find_commit(pr.base_oid).is_ok()
+            {
+                Some(pr.base_oid)
+            } else {
+                Some(stack.base)
+            }
+        } else {
+            match stack.layers[i].dep {
+                Dep::Main | Dep::ExternalPr(..) => Some(stack.base),
+                Dep::Layer(j) => prs[j].as_ref().map(|p| p.head_oid),
+            }
+        };
+        let base_branch_changed = if is_multi_dep {
+            pr.base != syn_base
+        } else {
+            match stack.layers[i].dep {
+                Dep::Main | Dep::ExternalPr(..) => pr.base != stack.trunk,
+                Dep::Layer(j) => {
+                    prs[j].as_ref().is_some_and(|p| p.head != pr.base)
+                }
+            }
+        };
+        if base_branch_changed {
+            rewrite_history[i] = true;
+        }
+
+        let mut needs_conflict_refresh = false;
+        patch_changed[i] = match remote_base_tip {
+            // The dependency has no pull request yet, so there is nothing
+            // meaningful to compare against.
+            None => true,
+            Some(base_tip) => {
+                let has_base_oid = pr.base_oid != Oid::ZERO_SHA1
+                    && git.repo().find_commit(pr.base_oid).is_ok();
+                let fallback_base_tip =
+                    if has_base_oid { pr.base_oid } else { base_tip };
+                let first_oid = find_root_commit(git, pr, fallback_base_tip);
+                current_anchor[i] =
+                    first_oid.and_then(|r| git.parent_of(r).ok());
+                let current_pr_base_tip = if has_base_oid {
+                    pr.base_oid
+                } else {
+                    current_anchor[i].unwrap_or(base_tip)
+                };
+                let meta = inspect_layer_metadata(
+                    git,
+                    &stack.layers[i],
+                    pr,
+                    first_oid,
+                    opts.preserve_commit_history,
+                )?;
+                message_changed[i] = meta.message_changed;
+                author_changed[i] = meta.author_changed;
+                github_message_edited[i] = meta.github_message_edited;
+                if meta.rewrite_history {
+                    rewrite_history[i] = true;
+                }
+
+                let shown = displayed_patch_id(
+                    git.repo(),
+                    current_pr_base_tip,
+                    pr.head_oid,
+                )?;
+                let desired = tree_patch_id(
+                    git.repo(),
+                    trees.dep[i],
+                    trees.effective[i],
+                )?;
+                if is_multi_dep {
+                    if pr.base == syn_base {
+                        if git.tree_of(current_pr_base_tip)? != trees.dep[i]
+                            || would_conflict_or_diverge_on_forge(
+                                git,
+                                current_pr_base_tip,
+                                pr.head_oid,
+                                trees.dep[i],
+                                trees.effective[i],
+                            )?
+                        {
+                            needs_conflict_refresh = true;
+                            rewrite_history[i] = true;
+                        }
+                    } else {
+                        needs_conflict_refresh = true;
+                        rewrite_history[i] = true;
+                    }
+                } else if !matches!(stack.layers[i].dep, Dep::Layer(..)) {
+                    needs_conflict_refresh =
+                        would_conflict_or_diverge_on_forge(
+                            git,
+                            base_tip,
+                            pr.head_oid,
+                            trees.dep[i],
+                            trees.effective[i],
+                        )?;
+                }
+                if is_multi_dep && pr.base != syn_base {
+                    if multi_dep_own_patch_unchanged(
+                        git,
+                        stack,
+                        prs,
+                        trees,
+                        i,
+                        current_pr_base_tip,
+                        pr.head_oid,
+                    )? {
+                        false
+                    } else {
+                        shown != desired
+                    }
+                } else if !stack.layers[i].merged_pr_deps.is_empty()
+                    && pr.base == stack.trunk
+                    && matches!(stack.layers[i].dep, Dep::Layer(_))
+                {
+                    git.tree_of(pr.head_oid)? != trees.effective[i]
+                } else {
+                    shown != desired
+                }
+            }
+        };
+
+        let behind_base = opts.refresh_when_behind
+            && remote_base_tip.is_some_and(|base_tip| {
+                current_anchor[i] != Some(base_tip)
+                    || !git.is_ancestor(base_tip, pr.head_oid).unwrap_or(false)
+            });
+
+        push[i] = patch_changed[i]
+            || author_changed[i]
+            || rewrite_history[i]
+            || base_branch_changed
+            || needs_conflict_refresh
+            || opts.sync_all
+            || pr.needs_refresh(opts.refresh_when_behind)
+            || behind_base;
+    }
+
+    // Pass C: a push is only safe once its dependency's remote tip already
+    // carries the dependency's effective tree.
+    cascade_stale_dependency_pushes(
+        git,
+        stack,
+        prs,
+        trees,
+        opts,
+        &current_anchor,
+        &patch_changed,
+        &mut push,
+        &mut rewrite_history,
+    )?;
+
+    // Keep every pull request branch 1-parent linear (zero merge commits) so
+    // GitHub's native "Merge full stack" and "Rebase stack" buttons work.
+    cascade_branch_rewrites(
+        git,
+        stack,
+        prs,
+        trees,
+        opts,
+        &current_anchor,
+        &mut push,
+        &mut rewrite_history,
+    )?;
 
     Ok(Decision {
         patch_changed,
@@ -1191,15 +1262,7 @@ fn can_keep_anchor_against_base(
 
 fn wanted_base_label(stack: &Stack, config: &Config, i: usize) -> String {
     if stack.layers[i].has_multiple_layer_deps() {
-        let labels: Vec<String> = stack.layers[i]
-            .layer_deps()
-            .into_iter()
-            .map(|j| match stack.layers[j].pr {
-                Some(n) => format!("#{n}"),
-                None => format!("layer {}", j + 1),
-            })
-            .collect();
-        return labels.join(" + ");
+        return stack.multi_dep_labels(i).join(" + ");
     }
     match stack.layers[i].dep {
         Dep::Main => config.trunk.clone(),
@@ -1209,6 +1272,255 @@ fn wanted_base_label(stack: &Stack, config: &Config, i: usize) -> String {
             None => format!("layer {}", j + 1),
         },
     }
+}
+
+async fn allocate_new_branch(
+    forge: &dyn Forge,
+    config: &Config,
+    subject: &str,
+    is_multi_dep: bool,
+    reserved_branches: &mut std::collections::HashSet<String>,
+) -> Result<String> {
+    let preferred = config.branch_name_for(subject);
+    let mut candidate = forge.unused_branch_name(&preferred).await?;
+    let mut suffix = 1usize;
+    while reserved_branches.contains(&candidate)
+        || (is_multi_dep
+            && reserved_branches
+                .contains(&crate::stack::synthetic_base_branch(&candidate)))
+    {
+        candidate = forge
+            .unused_branch_name(&format!("{preferred}-{suffix}"))
+            .await?;
+        suffix += 1;
+    }
+    reserved_branches.insert(candidate.clone());
+    Ok(candidate)
+}
+
+fn format_stage1_push_context(
+    stack: &Stack,
+    config: &Config,
+    prs: &[Option<PullRequest>],
+    base_branches: &[String],
+    retargeted_early: &[bool],
+    push_specs: &[PushSpec],
+) -> String {
+    let n = stack.layers.len();
+    let pushed_retargets: Vec<String> = (0..n)
+        .filter_map(|i| {
+            let pr = prs[i].as_ref()?;
+            if pr.base != base_branches[i]
+                && !retargeted_early[i]
+                && push_specs.iter().any(|s| s.branch == pr.head)
+            {
+                Some(format!(
+                    "#{} → {}",
+                    pr.number,
+                    wanted_base_label(stack, config, i)
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let all_retargets: Vec<String> = if !pushed_retargets.is_empty() {
+        pushed_retargets
+    } else {
+        (0..n)
+            .filter_map(|i| {
+                let pr = prs[i].as_ref()?;
+                if pr.base != base_branches[i] && !retargeted_early[i] {
+                    Some(format!(
+                        "#{} → {}",
+                        pr.number,
+                        wanted_base_label(stack, config, i)
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    if all_retargets.is_empty() {
+        "1/2, staging before retarget".to_string()
+    } else {
+        format!("1/2, before retargeting {}", all_retargets.join(", "))
+    }
+}
+
+fn format_stage2_push_context(
+    stack: &Stack,
+    config: &Config,
+    prs: &[Option<PullRequest>],
+    first_branch: &str,
+) -> String {
+    let base_label = (0..stack.layers.len())
+        .find(|&i| prs[i].as_ref().is_some_and(|pr| first_branch == pr.head))
+        .map(|i| wanted_base_label(stack, config, i));
+    match base_label {
+        Some(b) => format!("2/2, restacking onto {b}"),
+        None => "2/2, restacking after retarget".to_string(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_layer_pr_on_forge(
+    git: &Git,
+    forge: &dyn Forge,
+    config: &Config,
+    stack: &mut Stack,
+    prs: &[Option<PullRequest>],
+    decision: &Decision,
+    opts: &SyncOptions,
+    warn_merge_strategy: bool,
+    i: usize,
+    base_branch: String,
+    tip: Oid,
+    branch: String,
+    new_root: Option<Oid>,
+    retargeted_early: bool,
+    messages: &mut [CommitMessage],
+    retargeted_descriptions: &mut Vec<String>,
+) -> Result<Option<LayerOutcome>> {
+    let subject = stack.layers[i].subject().to_string();
+    let multi_deps = stack.multi_dep_labels(i);
+
+    let outcome = match &prs[i] {
+        None if !decision.push[i] => return Ok(None),
+        None => {
+            let body = crate::pr_body::splice_warning_with_deps(
+                &stack.layers[i].message.clean_body_for_pr(),
+                warn_merge_strategy,
+                &multi_deps,
+                &config.trunk,
+            );
+            let number = forge
+                .create_pull_request(CreatePr {
+                    title: subject,
+                    body,
+                    base: base_branch.clone(),
+                    head: branch.clone(),
+                    draft: opts.draft,
+                })
+                .await?;
+
+            messages[i].set(PULL_REQUEST, &config.pull_request_url(number));
+            stack.layers[i].pr = Some(number);
+            crate::refs::update_root(git, number, tip)?;
+            crate::refs::update_message(
+                git,
+                number,
+                &stack.layers[i].message.clean_for_branch(),
+            )?;
+
+            LayerOutcome {
+                index: i,
+                number,
+                branch,
+                tip,
+                action: LayerAction::Created,
+                base: base_branch,
+                retargeted: false,
+            }
+        }
+        Some(pr) => {
+            let mut action = if !decision.push[i] {
+                LayerAction::Skipped
+            } else if decision.patch_changed[i]
+                || (decision.message_changed[i]
+                    && (opts.update_message
+                        || !decision.github_message_edited[i]
+                        || !opts.preserve_commit_history))
+                || decision.author_changed[i]
+            {
+                LayerAction::Updated
+            } else {
+                LayerAction::Refreshed
+            };
+
+            if let Some(root_commit) = new_root {
+                crate::refs::update_root(git, pr.number, root_commit)?;
+            }
+
+            let retargeted = pr.base != base_branch;
+            let mut update = PullRequestUpdate::default();
+            if retargeted && !retargeted_early {
+                update.base = Some(base_branch.clone());
+            }
+            if retargeted {
+                retargeted_descriptions.push(format!(
+                    "#{} → {}",
+                    pr.number,
+                    wanted_base_label(stack, config, i)
+                ));
+            }
+            if opts.update_message || !decision.github_message_edited[i] {
+                if pr.title != subject {
+                    update.title = Some(subject);
+                }
+                let body = crate::pr_body::splice_warning_with_deps(
+                    &stack.layers[i].message.clean_body_for_pr(),
+                    warn_merge_strategy,
+                    &multi_deps,
+                    &config.trunk,
+                );
+                if pr.body != body {
+                    update.body = Some(body);
+                }
+                crate::refs::update_message(
+                    git,
+                    pr.number,
+                    &stack.layers[i].message.clean_for_branch(),
+                )?;
+            } else {
+                let body = crate::pr_body::splice_warning_with_deps(
+                    &pr.body,
+                    warn_merge_strategy,
+                    &multi_deps,
+                    &config.trunk,
+                );
+                if pr.body != body {
+                    update.body = Some(body);
+                }
+            }
+            if !update.is_empty() {
+                if action == LayerAction::Skipped {
+                    action = LayerAction::Updated;
+                }
+                forge.update_pull_request(pr.number, update).await?;
+            }
+            let old_syn_base = crate::stack::synthetic_base_branch(&pr.head);
+            if retargeted
+                && pr.base == old_syn_base
+                && base_branch != old_syn_base
+                && let Err(e) = forge.delete_branch(&old_syn_base).await
+            {
+                log::debug!(
+                    "failed to delete synthetic base branch {old_syn_base}: {e}"
+                );
+            }
+
+            LayerOutcome {
+                index: i,
+                number: pr.number,
+                branch,
+                tip,
+                action,
+                base: base_branch,
+                retargeted,
+            }
+        }
+    };
+
+    if let Some(value) = canonical_dep(config, stack, i)
+        && messages[i].get(DEPENDS_ON) != Some(value.as_str())
+    {
+        messages[i].set(DEPENDS_ON, &value);
+    }
+
+    crate::refs::update(git, outcome.number, outcome.tip)?;
+    Ok(Some(outcome))
 }
 
 /// Pass D: push bottom-up, so every layer sees its dependency's *new* tip.
@@ -1259,22 +1571,14 @@ async fn execute(
                 branches.push(String::new());
             }
             None => {
-                let preferred = config.branch_name_for(&subject);
-                let mut candidate =
-                    forge.unused_branch_name(&preferred).await?;
-                let mut suffix = 1usize;
-                while reserved_branches.contains(&candidate)
-                    || (is_multi_dep
-                        && reserved_branches.contains(
-                            &crate::stack::synthetic_base_branch(&candidate),
-                        ))
-                {
-                    candidate = forge
-                        .unused_branch_name(&format!("{preferred}-{suffix}"))
-                        .await?;
-                    suffix += 1;
-                }
-                reserved_branches.insert(candidate.clone());
+                let candidate = allocate_new_branch(
+                    forge,
+                    config,
+                    &subject,
+                    is_multi_dep,
+                    &mut reserved_branches,
+                )
+                .await?;
 
                 let (parent_tip, base_branch) = if is_multi_dep {
                     let syn_branch =
@@ -1702,60 +2006,21 @@ async fn execute(
     // Phase 2: push all new and updated branches in a single git push.
     if !push_specs.is_empty() {
         if *staged && !is_stage2 {
-            let pushed_retargets: Vec<String> = (0..n)
-                .filter_map(|i| {
-                    let pr = prs[i].as_ref()?;
-                    if pr.base != base_branches[i]
-                        && !retargeted_early[i]
-                        && push_specs.iter().any(|s| s.branch == pr.head)
-                    {
-                        Some(format!(
-                            "#{} → {}",
-                            pr.number,
-                            wanted_base_label(stack, config, i)
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let all_retargets: Vec<String> = if !pushed_retargets.is_empty() {
-                pushed_retargets
-            } else {
-                (0..n)
-                    .filter_map(|i| {
-                        let pr = prs[i].as_ref()?;
-                        if pr.base != base_branches[i] && !retargeted_early[i] {
-                            Some(format!(
-                                "#{} → {}",
-                                pr.number,
-                                wanted_base_label(stack, config, i)
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            };
-            let ctx = if all_retargets.is_empty() {
-                "1/2, staging before retarget".to_string()
-            } else {
-                format!("1/2, before retargeting {}", all_retargets.join(", "))
-            };
-            push_specs[0].context = Some(ctx);
+            push_specs[0].context = Some(format_stage1_push_context(
+                stack,
+                config,
+                prs,
+                &base_branches,
+                &retargeted_early,
+                &push_specs,
+            ));
         } else if is_stage2 {
-            let base_label = (0..n)
-                .find(|&i| {
-                    prs[i]
-                        .as_ref()
-                        .is_some_and(|pr| push_specs[0].branch == pr.head)
-                })
-                .map(|i| wanted_base_label(stack, config, i));
-            let ctx = match base_label {
-                Some(b) => format!("2/2, restacking onto {b}"),
-                None => "2/2, restacking after retarget".to_string(),
-            };
-            push_specs[0].context = Some(ctx);
+            push_specs[0].context = Some(format_stage2_push_context(
+                stack,
+                config,
+                prs,
+                &push_specs[0].branch,
+            ));
         }
         forge.push(&push_specs).await?;
     }
@@ -1769,160 +2034,28 @@ async fn execute(
         if !opts.is_layer_selected(i) && !decision.push[i] {
             continue;
         }
-        let base_branch = base_branches[i].clone();
-        let tip = tips[i];
-        let branch = branches[i].clone();
-        let subject = stack.layers[i].subject().to_string();
-        let multi_deps: Vec<String> =
-            if stack.layers[i].has_multiple_layer_deps() {
-                stack.layers[i]
-                    .layer_deps()
-                    .into_iter()
-                    .map(|j| match stack.layers[j].pr {
-                        Some(n) => format!("#{n}"),
-                        None => format!("layer {}", j + 1),
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-        let outcome = match &prs[i] {
-            None if !decision.push[i] => continue,
-            None => {
-                let body = crate::pr_body::splice_warning_with_deps(
-                    &stack.layers[i].message.clean_body_for_pr(),
-                    warn_merge_strategy,
-                    &multi_deps,
-                    &config.trunk,
-                );
-                let number = forge
-                    .create_pull_request(CreatePr {
-                        title: subject,
-                        body,
-                        base: base_branch.clone(),
-                        head: branch.clone(),
-                        draft: opts.draft,
-                    })
-                    .await?;
-
-                messages[i].set(PULL_REQUEST, &config.pull_request_url(number));
-                stack.layers[i].pr = Some(number);
-                crate::refs::update_root(git, number, tip)?;
-                crate::refs::update_message(
-                    git,
-                    number,
-                    &stack.layers[i].message.clean_for_branch(),
-                )?;
-
-                LayerOutcome {
-                    index: i,
-                    number,
-                    branch,
-                    tip,
-                    action: LayerAction::Created,
-                    base: base_branch,
-                    retargeted: false,
-                }
-            }
-            Some(pr) => {
-                let mut action = if !decision.push[i] {
-                    LayerAction::Skipped
-                } else if decision.patch_changed[i]
-                    || (decision.message_changed[i]
-                        && (opts.update_message
-                            || !decision.github_message_edited[i]
-                            || !opts.preserve_commit_history))
-                    || decision.author_changed[i]
-                {
-                    LayerAction::Updated
-                } else {
-                    LayerAction::Refreshed
-                };
-
-                if let Some(root_commit) = new_roots[i] {
-                    crate::refs::update_root(git, pr.number, root_commit)?;
-                }
-
-                let retargeted = pr.base != base_branch;
-                let mut update = PullRequestUpdate::default();
-                if retargeted && !retargeted_early[i] {
-                    update.base = Some(base_branch.clone());
-                }
-                if retargeted {
-                    retargeted_descriptions.push(format!(
-                        "#{} → {}",
-                        pr.number,
-                        wanted_base_label(stack, config, i)
-                    ));
-                }
-                if opts.update_message || !decision.github_message_edited[i] {
-                    if pr.title != subject {
-                        update.title = Some(subject);
-                    }
-                    let body = crate::pr_body::splice_warning_with_deps(
-                        &stack.layers[i].message.clean_body_for_pr(),
-                        warn_merge_strategy,
-                        &multi_deps,
-                        &config.trunk,
-                    );
-                    if pr.body != body {
-                        update.body = Some(body);
-                    }
-                    crate::refs::update_message(
-                        git,
-                        pr.number,
-                        &stack.layers[i].message.clean_for_branch(),
-                    )?;
-                } else {
-                    let body = crate::pr_body::splice_warning_with_deps(
-                        &pr.body,
-                        warn_merge_strategy,
-                        &multi_deps,
-                        &config.trunk,
-                    );
-                    if pr.body != body {
-                        update.body = Some(body);
-                    }
-                }
-                if !update.is_empty() {
-                    if action == LayerAction::Skipped {
-                        action = LayerAction::Updated;
-                    }
-                    forge.update_pull_request(pr.number, update).await?;
-                }
-                let old_syn_base =
-                    crate::stack::synthetic_base_branch(&pr.head);
-                if retargeted
-                    && pr.base == old_syn_base
-                    && base_branch != old_syn_base
-                    && let Err(e) = forge.delete_branch(&old_syn_base).await
-                {
-                    log::debug!(
-                        "failed to delete synthetic base branch {old_syn_base}: {e}"
-                    );
-                }
-
-                LayerOutcome {
-                    index: i,
-                    number: pr.number,
-                    branch,
-                    tip,
-                    action,
-                    base: base_branch,
-                    retargeted,
-                }
-            }
-        };
-
-        if let Some(value) = canonical_dep(config, stack, i)
-            && messages[i].get(DEPENDS_ON) != Some(value.as_str())
+        if let Some(outcome) = sync_layer_pr_on_forge(
+            git,
+            forge,
+            config,
+            stack,
+            prs,
+            decision,
+            opts,
+            warn_merge_strategy,
+            i,
+            base_branches[i].clone(),
+            tips[i],
+            branches[i].clone(),
+            new_roots[i],
+            retargeted_early[i],
+            &mut messages,
+            &mut retargeted_descriptions,
+        )
+        .await?
         {
-            messages[i].set(DEPENDS_ON, &value);
+            outcomes.push(outcome);
         }
-
-        crate::refs::update(git, outcome.number, outcome.tip)?;
-        outcomes.push(outcome);
     }
 
     if !retargeted_descriptions.is_empty() && console::Term::stderr().is_term()

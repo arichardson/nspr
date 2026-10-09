@@ -787,6 +787,22 @@ impl Stack {
             .collect()
     }
 
+    /// Labels (`#N` or `layer K`) for all dependencies of layer `i` when it has
+    /// multiple `Depends-On` layer entries, or an empty vector otherwise.
+    pub fn multi_dep_labels(&self, i: usize) -> Vec<String> {
+        if !self.layers[i].has_multiple_layer_deps() {
+            return Vec::new();
+        }
+        self.layers[i]
+            .layer_deps()
+            .into_iter()
+            .map(|j| match self.layers[j].pr {
+                Some(n) => format!("#{n}"),
+                None => format!("layer {}", j + 1),
+            })
+            .collect()
+    }
+
     /// Ordered bottom-to-top pull request number chains (`len >= 2`) suitable
     /// for registering with GitHub's native Stacks API (`/repos/{owner}/{repo}/stacks`).
     pub fn pr_chains(&self) -> Vec<Vec<u64>> {
