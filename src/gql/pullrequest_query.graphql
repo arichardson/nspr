@@ -1,5 +1,6 @@
 query PullRequest($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
+    nameWithOwner
     pullRequest(number: $number) {
       id
       number

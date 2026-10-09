@@ -521,7 +521,9 @@ impl Session {
                 (login, oid)
             }
         };
-        let config = config::detect(&git, login, remote)?;
+        let mut config = config::detect(&git, login, remote)?;
+        config.owner = forge.owner();
+        config.repo = forge.repo();
 
         Ok(Self {
             git,

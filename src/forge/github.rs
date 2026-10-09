@@ -63,8 +63,8 @@ query($query: String!) {
 "#;
 
 pub struct GitHubForge {
-    owner: String,
-    repo: String,
+    owner: RefCell<String>,
+    repo: RefCell<String>,
     api: Octocrab,
     remote: GitRemote,
     /// Filled in on first use: the login is needed to recognise our own
@@ -72,6 +72,8 @@ pub struct GitHubForge {
     /// when it never changes within a run.
     login: RefCell<Option<String>>,
     merge_settings: std::cell::OnceCell<RepoMergeSettings>,
+    repo_verified: std::cell::Cell<bool>,
+    warned_repo_moved: std::cell::Cell<bool>,
 }
 
 impl GitHubForge {
@@ -103,17 +105,130 @@ impl GitHubForge {
     ) -> Result<Self> {
         let api = Octocrab::builder().personal_token(token.clone()).build()?;
         Ok(Self {
-            owner: owner.into(),
-            repo: name.into(),
+            owner: RefCell::new(owner.into()),
+            repo: RefCell::new(name.into()),
             api,
             remote: GitRemote::new(repo, url, token),
             login: RefCell::new(None),
             merge_settings: std::cell::OnceCell::new(),
+            repo_verified: std::cell::Cell::new(false),
+            warned_repo_moved: std::cell::Cell::new(false),
         })
+    }
+
+    pub fn owner(&self) -> String {
+        self.owner.borrow().clone()
+    }
+
+    pub fn repo(&self) -> String {
+        self.repo.borrow().clone()
     }
 
     pub fn remote(&self) -> &GitRemote {
         &self.remote
+    }
+
+    fn record_optional_name_with_owner(&self, name_with_owner: Option<&str>) {
+        if let Some(nwo) = name_with_owner {
+            self.record_canonical_name_with_owner(nwo);
+        }
+    }
+
+    /// Update the cached `owner`/`repo` (and remote URL) if GitHub reports a
+    /// different canonical `nameWithOwner`, emitting a one-time warning when
+    /// the repository was renamed or transferred. Returns `true` if the
+    /// repository owner or name changed.
+    fn record_canonical_name_with_owner(&self, name_with_owner: &str) -> bool {
+        let Ok((new_owner, new_repo)) =
+            crate::config::parse_repo_slug(name_with_owner)
+        else {
+            return false;
+        };
+        self.repo_verified.set(true);
+        let old_owner = self.owner();
+        let old_repo = self.repo();
+        if old_owner == new_owner && old_repo == new_repo {
+            return false;
+        }
+        let moved = !old_owner.eq_ignore_ascii_case(&new_owner)
+            || !old_repo.eq_ignore_ascii_case(&new_repo);
+        debug!(
+            "repository {old_owner}/{old_repo} resolved to canonical {new_owner}/{new_repo}"
+        );
+        *self.owner.borrow_mut() = new_owner.clone();
+        *self.repo.borrow_mut() = new_repo.clone();
+        let new_remote_url =
+            rewrite_remote_url_repo(&self.remote.url(), &new_owner, &new_repo);
+        self.remote.set_url(new_remote_url);
+
+        if moved && !self.warned_repo_moved.replace(true) {
+            let (remote_name, configured_url) =
+                self.find_matching_git_remote(&old_owner, &old_repo);
+            let suggested_url =
+                rewrite_remote_url_repo(&configured_url, &new_owner, &new_repo);
+            let warning = format_moved_repo_warning(
+                &old_owner,
+                &old_repo,
+                &new_owner,
+                &new_repo,
+                &remote_name,
+                &suggested_url,
+            );
+            eprintln!(
+                "{} {warning}",
+                console::style("warning:").yellow().bold()
+            );
+        }
+        true
+    }
+
+    fn find_matching_git_remote(
+        &self,
+        old_owner: &str,
+        old_repo: &str,
+    ) -> (String, String) {
+        if let Ok(cfg) = self.remote.repo().config()
+            && let Ok(remotes) = self.remote.repo().remotes()
+        {
+            for name in remotes.iter().flatten().flatten() {
+                if let Ok(url) = cfg.get_string(&format!("remote.{name}.url"))
+                    && let Ok((o, r)) = crate::config::parse_remote_url(&url)
+                    && o.eq_ignore_ascii_case(old_owner)
+                    && r.eq_ignore_ascii_case(old_repo)
+                {
+                    return (name.to_string(), url);
+                }
+            }
+        }
+        ("origin".to_string(), self.remote.url())
+    }
+
+    async fn resolve_moved_repository(&self) -> bool {
+        let owner = self.owner();
+        let repo = self.repo();
+        debug!("API POST /graphql RepositoryNameWithOwner({owner}/{repo})");
+        let body = serde_json::json!({
+            "query": REPOSITORY_NAME_WITH_OWNER_QUERY,
+            "variables": {
+                "owner": owner,
+                "repo": repo,
+            },
+        });
+        let Ok(response) = self
+            .api
+            .post::<_, GqlResponse<RepoNameQueryData>>("/graphql", Some(&body))
+            .await
+        else {
+            return false;
+        };
+        let Some(nwo) = response
+            .data
+            .and_then(|d| d.repository)
+            .and_then(|r| r.name_with_owner)
+        else {
+            return false;
+        };
+        self.record_canonical_name_with_owner(&nwo)
     }
 
     /// The authenticated user's login.
@@ -157,8 +272,8 @@ impl GitHubForge {
         let body = serde_json::json!({
             "query": VIEWER_AND_BRANCH_OID_QUERY,
             "variables": {
-                "owner": self.owner,
-                "repo": self.repo,
+                "owner": self.owner(),
+                "repo": self.repo(),
                 "qualifiedName": format!("refs/heads/{branch}"),
             },
         });
@@ -187,15 +302,21 @@ impl GitHubForge {
         debug!("  -> viewer login = {login}");
         *self.login.borrow_mut() = Some(login.clone());
 
-        let oid = match data
-            .repository
-            .and_then(|r| r.git_ref)
-            .and_then(|g| g.target)
-            .map(|t| t.oid)
-        {
-            Some(oid_str) => {
-                debug!("  -> branch {branch} = {oid_str}");
-                Some(Oid::from_str(&oid_str)?)
+        let oid = match data.repository {
+            Some(repo_node) => {
+                self.record_optional_name_with_owner(
+                    repo_node.name_with_owner.as_deref(),
+                );
+                match repo_node.git_ref.and_then(|g| g.target).map(|t| t.oid) {
+                    Some(oid_str) => {
+                        debug!("  -> branch {branch} = {oid_str}");
+                        Some(Oid::from_str(&oid_str)?)
+                    }
+                    None => {
+                        debug!("  -> branch {branch} not found");
+                        None
+                    }
+                }
             }
             None => {
                 debug!("  -> branch {branch} not found");
@@ -263,8 +384,8 @@ impl Forge for GitHubForge {
         let body = serde_json::json!({
             "query": PULL_REQUEST_QUERY,
             "variables": {
-                "owner": self.owner,
-                "name": self.repo,
+                "owner": self.owner(),
+                "name": self.repo(),
                 "number": number,
             },
         });
@@ -278,6 +399,13 @@ impl Forge for GitHubForge {
                 || format!("could not read pull request #{number} from GitHub"),
             )?;
 
+        self.record_optional_name_with_owner(
+            response
+                .data
+                .as_ref()
+                .and_then(|d| d.repository.as_ref())
+                .and_then(|r| r.name_with_owner.as_deref()),
+        );
         let pr = pull_request_from(pull_request_node(response, number)?)?;
         debug!(
             "  -> #{number}: state={:?} base={} ({}) head={} ({}) mergeable={:?} merge_state={:?}",
@@ -316,8 +444,8 @@ impl Forge for GitHubForge {
         let body = serde_json::json!({
             "query": query,
             "variables": {
-                "owner": self.owner,
-                "name": self.repo,
+                "owner": self.owner(),
+                "name": self.repo(),
             },
         });
         let response: GqlResponse<BatchQueryData> = self
@@ -326,6 +454,13 @@ impl Forge for GitHubForge {
             .await
             .wrap_err("could not read pull requests from GitHub")?;
 
+        self.record_optional_name_with_owner(
+            response
+                .data
+                .as_ref()
+                .and_then(|d| d.repository.as_ref())
+                .and_then(|r| r.name_with_owner.as_deref()),
+        );
         let nodes = batch_pull_request_nodes(response, numbers)?;
         let mut prs = Vec::with_capacity(nodes.len());
         let mut to_fetch = Vec::with_capacity(nodes.len() * 2);
@@ -358,13 +493,15 @@ impl Forge for GitHubForge {
     }
 
     async fn create_pull_request(&self, req: CreatePr) -> Result<u64> {
+        let owner = self.owner();
+        let repo = self.repo();
         debug!(
-            "API POST /repos/{}/{}/pulls head={} base={} draft={} title={:?}",
-            self.owner, self.repo, req.head, req.base, req.draft, req.title
+            "API POST /repos/{owner}/{repo}/pulls head={} base={} draft={} title={:?}",
+            req.head, req.base, req.draft, req.title
         );
         let pr = self
             .api
-            .pulls(&self.owner, &self.repo)
+            .pulls(&owner, &repo)
             .create(req.title, &req.head, &req.base)
             .body(req.body)
             .draft(Some(req.draft))
@@ -389,17 +526,17 @@ impl Forge for GitHubForge {
         if update.is_empty() {
             return Ok(());
         }
+        let owner = self.owner();
+        let repo = self.repo();
         debug!(
-            "API PATCH /repos/{}/{}/pulls/{number} base={:?} state={:?} title_updated={} body_updated={}",
-            self.owner,
-            self.repo,
+            "API PATCH /repos/{owner}/{repo}/pulls/{number} base={:?} state={:?} title_updated={} body_updated={}",
             update.base,
             update.state,
             update.title.is_some(),
             update.body.is_some()
         );
 
-        let pulls = self.api.pulls(&self.owner, &self.repo);
+        let pulls = self.api.pulls(&owner, &repo);
         let mut request = pulls.update(number);
         if let Some(title) = update.title {
             request = request.title(title);
@@ -463,17 +600,17 @@ impl Forge for GitHubForge {
         ];
         let mut attempt = 0;
         let merge = loop {
+            let owner = self.owner();
+            let repo = self.repo();
             debug!(
-                "API PUT /repos/{}/{}/pulls/{number}/merge (squash, expected_head={}, title={:?}, attempt={})",
-                self.owner,
-                self.repo,
+                "API PUT /repos/{owner}/{repo}/pulls/{number}/merge (squash, expected_head={}, title={:?}, attempt={})",
                 req.expected_head,
                 req.title,
                 attempt + 1
             );
             let result = self
                 .api
-                .pulls(&self.owner, &self.repo)
+                .pulls(&owner, &repo)
                 .merge(number)
                 .title(req.title.clone())
                 .message(req.message.clone())
@@ -689,36 +826,58 @@ impl Forge for GitHubForge {
         &self,
         branch: &str,
     ) -> Result<Option<Protection>> {
-        let route = format!(
-            "/repos/{}/{}/branches/{branch}/protection",
-            self.owner, self.repo
-        );
-        debug!("API GET {route}");
-        match self
-            .api
-            .get::<ProtectionResponse, _, _>(route, None::<&()>)
-            .await
-        {
-            Ok(protection) => Ok(Some(Protection {
-                dismiss_stale_reviews: protection
-                    .required_pull_request_reviews
-                    .is_some_and(|reviews| reviews.dismiss_stale_reviews),
-                require_up_to_date: protection
-                    .required_status_checks
-                    .is_some_and(|checks| checks.strict),
-            })),
-            // 404 is both "not protected" and "you are not an admin here";
-            // 403 is the same story with a different code. Protection only
-            // tunes warnings, so not knowing must never be fatal — most
-            // contributors cannot read this endpoint at all.
-            Err(e) if matches!(status_code(&e), Some(403 | 404)) => {
-                debug!("branch protection for {branch} unreadable: {e}");
-                Ok(None)
+        for attempt in 0..2 {
+            let route = format!(
+                "/repos/{}/{}/branches/{branch}/protection",
+                self.owner(),
+                self.repo()
+            );
+            debug!("API GET {route}");
+            match self
+                .api
+                .get::<ProtectionResponse, _, _>(route, None::<&()>)
+                .await
+            {
+                Ok(protection) => {
+                    return Ok(Some(Protection {
+                        dismiss_stale_reviews: protection
+                            .required_pull_request_reviews
+                            .is_some_and(|reviews| {
+                                reviews.dismiss_stale_reviews
+                            }),
+                        require_up_to_date: protection
+                            .required_status_checks
+                            .is_some_and(|checks| checks.strict),
+                    }));
+                }
+                Err(e)
+                    if attempt == 0
+                        && is_redirect(&e)
+                        && self.resolve_moved_repository().await =>
+                {
+                    continue;
+                }
+                // 404 is both "not protected" and "you are not an admin here";
+                // 403 is the same story with a different code, and an
+                // unresolved 3xx redirect must also degrade gracefully rather
+                // than aborting `nspr`. Protection only tunes warnings, so not
+                // knowing must never be fatal — most contributors cannot read
+                // this endpoint at all.
+                Err(e)
+                    if matches!(status_code(&e), Some(403 | 404))
+                        || is_redirect(&e) =>
+                {
+                    debug!("branch protection for {branch} unreadable: {e}");
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(Error::from(e)).wrap_err(format!(
+                        "could not read branch protection for `{branch}`"
+                    ));
+                }
             }
-            Err(e) => Err(Error::from(e)).wrap_err(format!(
-                "could not read branch protection for `{branch}`"
-            )),
         }
+        Ok(None)
     }
 
     async fn branch_oid(&self, branch: &str) -> Result<Option<Oid>> {
@@ -726,8 +885,8 @@ impl Forge for GitHubForge {
         let body = serde_json::json!({
             "query": BRANCH_OID_QUERY,
             "variables": {
-                "owner": self.owner,
-                "repo": self.repo,
+                "owner": self.owner(),
+                "repo": self.repo(),
                 "qualifiedName": format!("refs/heads/{branch}"),
             },
         });
@@ -735,12 +894,15 @@ impl Forge for GitHubForge {
             self.api.post("/graphql", Some(&body)).await.wrap_err_with(
                 || format!("could not look up branch `{branch}` on GitHub"),
             )?;
-        let Some(oid_str) = response
-            .data
-            .and_then(|d| d.repository)
-            .and_then(|r| r.git_ref)
-            .and_then(|g| g.target)
-            .map(|t| t.oid)
+        let Some(repo_node) = response.data.and_then(|d| d.repository) else {
+            debug!("  -> branch {branch} not found");
+            return Ok(None);
+        };
+        self.record_optional_name_with_owner(
+            repo_node.name_with_owner.as_deref(),
+        );
+        let Some(oid_str) =
+            repo_node.git_ref.and_then(|g| g.target).map(|t| t.oid)
         else {
             debug!("  -> branch {branch} not found");
             return Ok(None);
@@ -750,13 +912,12 @@ impl Forge for GitHubForge {
     }
 
     async fn delete_branch(&self, branch: &str) -> Result<()> {
-        debug!(
-            "API DELETE /repos/{}/{}/git/refs/heads/{branch}",
-            self.owner, self.repo
-        );
+        let owner = self.owner();
+        let repo = self.repo();
+        debug!("API DELETE /repos/{owner}/{repo}/git/refs/heads/{branch}");
         let res = self
             .api
-            .repos(&self.owner, &self.repo)
+            .repos(&owner, &repo)
             .delete_ref(&octocrab::params::repos::Reference::Branch(
                 branch.to_string(),
             ))
@@ -834,13 +995,12 @@ impl Forge for GitHubForge {
 
     async fn list_own_comments(&self, number: u64) -> Result<Vec<Comment>> {
         let login = self.viewer_login().await?;
-        debug!(
-            "API GET /repos/{}/{}/issues/{number}/comments",
-            self.owner, self.repo
-        );
+        let owner = self.owner();
+        let repo = self.repo();
+        debug!("API GET /repos/{owner}/{repo}/issues/{number}/comments");
         let first = self
             .api
-            .issues(&self.owner, &self.repo)
+            .issues(&owner, &repo)
             .list_comments(number)
             .per_page(100)
             .send()
@@ -864,13 +1024,12 @@ impl Forge for GitHubForge {
     }
 
     async fn create_comment(&self, number: u64, body: &str) -> Result<u64> {
-        debug!(
-            "API POST /repos/{}/{}/issues/{number}/comments",
-            self.owner, self.repo
-        );
+        let owner = self.owner();
+        let repo = self.repo();
+        debug!("API POST /repos/{owner}/{repo}/issues/{number}/comments");
         let comment = self
             .api
-            .issues(&self.owner, &self.repo)
+            .issues(&owner, &repo)
             .create_comment(number, body)
             .await
             .wrap_err_with(|| format!("could not comment on #{number}"))?;
@@ -885,8 +1044,9 @@ impl Forge for GitHubForge {
         // and GitHub has been seen answering with an empty body, which
         // octocrab reports as `EOF while parsing a value` even though the
         // edit went through.
-        let route =
-            format!("/repos/{}/{}/issues/comments/{id}", self.owner, self.repo);
+        let owner = self.owner();
+        let repo = self.repo();
+        let route = format!("/repos/{owner}/{repo}/issues/comments/{id}");
         debug!("API PATCH {route}");
         let response = self
             .api
@@ -904,7 +1064,7 @@ impl Forge for GitHubForge {
             // An error status does not prove the edit was lost, so check
             // before failing the whole run over it.
             self.api
-                .issues(&self.owner, &self.repo)
+                .issues(&owner, &repo)
                 .get_comment(octocrab::models::CommentId(id))
                 .await
                 .ok()
@@ -915,12 +1075,11 @@ impl Forge for GitHubForge {
     }
 
     async fn delete_comment(&self, id: u64) -> Result<()> {
-        debug!(
-            "API DELETE /repos/{}/{}/issues/comments/{id}",
-            self.owner, self.repo
-        );
+        let owner = self.owner();
+        let repo = self.repo();
+        debug!("API DELETE /repos/{owner}/{repo}/issues/comments/{id}");
         self.api
-            .issues(&self.owner, &self.repo)
+            .issues(&owner, &repo)
             .delete_comment(octocrab::models::CommentId(id))
             .await
             .wrap_err_with(|| format!("could not delete comment {id}"))?;
@@ -962,15 +1121,16 @@ impl Forge for GitHubForge {
         &self,
         author: Option<&str>,
     ) -> Result<Vec<ListedPr>> {
+        if !self.repo_verified.get() {
+            let _ = self.resolve_moved_repository().await;
+        }
+        let owner = self.owner();
+        let repo = self.repo();
         let query_filter = match author {
             Some(login) => format!(
-                "repo:{}/{} is:pr is:open author:{login} archived:false",
-                self.owner, self.repo
+                "repo:{owner}/{repo} is:pr is:open author:{login} archived:false"
             ),
-            None => format!(
-                "repo:{}/{} is:pr is:open archived:false",
-                self.owner, self.repo
-            ),
+            None => format!("repo:{owner}/{repo} is:pr is:open archived:false"),
         };
         debug!("API POST /graphql SearchPullRequests(query={query_filter:?})");
         let body = serde_json::json!({
@@ -1009,8 +1169,12 @@ impl Forge for GitHubForge {
         &self,
         head: &str,
     ) -> Result<Option<PullRequest>> {
-        let query_filter =
-            format!("repo:{}/{} is:pr head:\"{head}\"", self.owner, self.repo);
+        if !self.repo_verified.get() {
+            let _ = self.resolve_moved_repository().await;
+        }
+        let owner = self.owner();
+        let repo = self.repo();
+        let query_filter = format!("repo:{owner}/{repo} is:pr head:\"{head}\"");
         debug!(
             "API POST /graphql FindPullRequestByHead(query={query_filter:?})"
         );
@@ -1097,7 +1261,9 @@ impl Forge for GitHubForge {
                     let delta = &desired[current.len()..];
                     let route = format!(
                         "/repos/{}/{}/stacks/{}/add",
-                        self.owner, self.repo, matched.number
+                        self.owner(),
+                        self.repo(),
+                        matched.number
                     );
                     debug!("API POST {route} (pull_requests={delta:?})");
                     let body = serde_json::json!({ "pull_requests": delta });
@@ -1139,7 +1305,8 @@ impl Forge for GitHubForge {
                 remote_stacks.retain(|rs| rs.number != s.number);
             }
 
-            let route = format!("/repos/{}/{}/stacks", self.owner, self.repo);
+            let route =
+                format!("/repos/{}/{}/stacks", self.owner(), self.repo());
             debug!("API POST {route} (pull_requests={desired:?})");
             let body = serde_json::json!({ "pull_requests": desired });
             match self.api.post::<_, RemoteStack>(route, Some(&body)).await {
@@ -1173,6 +1340,8 @@ impl Forge for GitHubForge {
 
         #[derive(Deserialize)]
         struct RepoSettingsResponse {
+            #[serde(default)]
+            full_name: Option<String>,
             #[serde(default = "default_true")]
             allow_squash_merge: bool,
             #[serde(default = "default_true")]
@@ -1188,34 +1357,48 @@ impl Forge for GitHubForge {
             true
         }
 
-        let route = format!("/repos/{}/{}", self.owner, self.repo);
-        debug!("API GET {route} (repo merge settings)");
-        let settings = match self
-            .api
-            .get::<RepoSettingsResponse, _, _>(route, None::<&()>)
-            .await
-        {
-            Ok(resp) => {
-                let s = RepoMergeSettings {
-                    allow_squash_merge: resp.allow_squash_merge,
-                    allow_merge_commit: resp.allow_merge_commit,
-                    allow_rebase_merge: resp.allow_rebase_merge,
-                    squash_uses_pr_description: resp.squash_merge_commit_title
-                        == "PR_TITLE"
-                        && resp.squash_merge_commit_message
-                            != "COMMIT_MESSAGES",
-                };
-                debug!("  -> repo merge settings: {s:?}");
-                s
+        let mut settings = RepoMergeSettings::default();
+        for attempt in 0..2 {
+            let route = format!("/repos/{}/{}", self.owner(), self.repo());
+            debug!("API GET {route} (repo merge settings)");
+            match self
+                .api
+                .get::<RepoSettingsResponse, _, _>(route, None::<&()>)
+                .await
+            {
+                Ok(resp) => {
+                    self.record_optional_name_with_owner(
+                        resp.full_name.as_deref(),
+                    );
+                    let s = RepoMergeSettings {
+                        allow_squash_merge: resp.allow_squash_merge,
+                        allow_merge_commit: resp.allow_merge_commit,
+                        allow_rebase_merge: resp.allow_rebase_merge,
+                        squash_uses_pr_description: resp
+                            .squash_merge_commit_title
+                            == "PR_TITLE"
+                            && resp.squash_merge_commit_message
+                                != "COMMIT_MESSAGES",
+                    };
+                    debug!("  -> repo merge settings: {s:?}");
+                    settings = s;
+                    break;
+                }
+                Err(e)
+                    if attempt == 0
+                        && is_redirect(&e)
+                        && self.resolve_moved_repository().await =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    debug!(
+                        "could not query repo merge settings ({e}); falling back to defaults {settings:?}"
+                    );
+                    break;
+                }
             }
-            Err(e) => {
-                let defaults = RepoMergeSettings::default();
-                debug!(
-                    "could not query repo merge settings ({e}); falling back to defaults {defaults:?}"
-                );
-                defaults
-            }
-        };
+        }
 
         let _ = self.merge_settings.set(settings);
         Ok(settings)
@@ -1275,30 +1458,44 @@ impl GitHubForge {
     }
 
     async fn list_remote_stacks(&self) -> Result<Option<Vec<RemoteStack>>> {
-        let route =
-            format!("/repos/{}/{}/stacks?per_page=100", self.owner, self.repo);
-        debug!("API GET {route}");
-        match self
-            .api
-            .get::<Vec<RemoteStack>, _, _>(route, None::<&()>)
-            .await
-        {
-            Ok(stacks) => Ok(Some(stacks)),
-            Err(e) if matches!(status_code(&e), Some(403 | 404)) => {
-                debug!("github stacks API unavailable: {e}");
-                Ok(None)
-            }
-            Err(e) => {
-                debug!("could not list github stacks: {e}");
-                Ok(None)
+        for attempt in 0..2 {
+            let route = format!(
+                "/repos/{}/{}/stacks?per_page=100",
+                self.owner(),
+                self.repo()
+            );
+            debug!("API GET {route}");
+            match self
+                .api
+                .get::<Vec<RemoteStack>, _, _>(route, None::<&()>)
+                .await
+            {
+                Ok(stacks) => return Ok(Some(stacks)),
+                Err(e)
+                    if attempt == 0
+                        && is_redirect(&e)
+                        && self.resolve_moved_repository().await =>
+                {
+                    continue;
+                }
+                Err(e) if matches!(status_code(&e), Some(403 | 404)) => {
+                    debug!("github stacks API unavailable: {e}");
+                    return Ok(None);
+                }
+                Err(e) => {
+                    debug!("could not list github stacks: {e}");
+                    return Ok(None);
+                }
             }
         }
+        Ok(None)
     }
 
     async fn unstack_remote_stack(&self, stack_number: u64) {
         let route = format!(
             "/repos/{}/{}/stacks/{stack_number}/unstack",
-            self.owner, self.repo
+            self.owner(),
+            self.repo()
         );
         debug!("API POST {route}");
         if let Err(e) = self.api._post(route, None::<&()>).await {
@@ -1307,18 +1504,32 @@ impl GitHubForge {
     }
 
     async fn unstack_pr_if_stacked(&self, pr_number: u64) {
-        let route = format!(
-            "/repos/{}/{}/stacks?pull_request={pr_number}",
-            self.owner, self.repo
-        );
-        debug!("API GET {route}");
-        if let Ok(stacks) = self
-            .api
-            .get::<Vec<RemoteStack>, _, _>(route, None::<&()>)
-            .await
-        {
-            for s in stacks {
-                self.unstack_remote_stack(s.number).await;
+        for attempt in 0..2 {
+            let route = format!(
+                "/repos/{}/{}/stacks?pull_request={pr_number}",
+                self.owner(),
+                self.repo()
+            );
+            debug!("API GET {route}");
+            match self
+                .api
+                .get::<Vec<RemoteStack>, _, _>(route, None::<&()>)
+                .await
+            {
+                Ok(stacks) => {
+                    for s in stacks {
+                        self.unstack_remote_stack(s.number).await;
+                    }
+                    return;
+                }
+                Err(e)
+                    if attempt == 0
+                        && is_redirect(&e)
+                        && self.resolve_moved_repository().await =>
+                {
+                    continue;
+                }
+                Err(_) => return,
             }
         }
     }
@@ -1407,6 +1618,46 @@ fn status_code(error: &octocrab::Error) -> Option<u16> {
     }
 }
 
+fn is_redirect(error: &octocrab::Error) -> bool {
+    matches!(status_code(error), Some(301 | 302 | 307 | 308))
+}
+
+fn rewrite_remote_url_repo(
+    url: &str,
+    new_owner: &str,
+    new_repo: &str,
+) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let has_dot_git = trimmed.ends_with(".git");
+    let suffix = if has_dot_git { ".git" } else { "" };
+    for prefix in [
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "https://github.com/",
+        "git://github.com/",
+    ] {
+        if trimmed.starts_with(prefix) {
+            return format!("{prefix}{new_owner}/{new_repo}{suffix}");
+        }
+    }
+    format!("https://github.com/{new_owner}/{new_repo}.git")
+}
+
+fn format_moved_repo_warning(
+    old_owner: &str,
+    old_repo: &str,
+    new_owner: &str,
+    new_repo: &str,
+    remote_name: &str,
+    suggested_url: &str,
+) -> String {
+    format!(
+        "repository `{old_owner}/{old_repo}` has moved to `{new_owner}/{new_repo}` on GitHub.\n\
+         To avoid redirect errors, update your local remote URL:\n  \
+         git remote set-url {remote_name} {suggested_url}"
+    )
+}
+
 fn github_error_message(error: &octocrab::Error) -> Option<&str> {
     match error {
         octocrab::Error::GitHub { source, .. } => Some(source.message.as_str()),
@@ -1454,8 +1705,15 @@ struct QueryData {
 
 #[derive(Debug, Deserialize)]
 struct BatchQueryData {
-    repository:
-        Option<std::collections::HashMap<String, Option<PullRequestNode>>>,
+    repository: Option<BatchRepositoryNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchRepositoryNode {
+    #[serde(default, rename = "nameWithOwner")]
+    name_with_owner: Option<String>,
+    #[serde(flatten)]
+    pull_requests: std::collections::HashMap<String, Option<PullRequestNode>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1465,6 +1723,8 @@ struct RefQueryData {
 
 #[derive(Debug, Deserialize)]
 struct RefRepositoryNode {
+    #[serde(default, rename = "nameWithOwner")]
+    name_with_owner: Option<String>,
     #[serde(rename = "ref")]
     git_ref: Option<RefNode>,
 }
@@ -1490,9 +1750,30 @@ struct ViewerNode {
     login: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RepoNameQueryData {
+    repository: Option<RepoNameNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepoNameNode {
+    #[serde(default)]
+    name_with_owner: Option<String>,
+}
+
+const REPOSITORY_NAME_WITH_OWNER_QUERY: &str = r#"
+query($owner: String!, $repo: String!) {
+  repository(owner: $owner, name: $repo) {
+    nameWithOwner
+  }
+}
+"#;
+
 const BRANCH_OID_QUERY: &str = r#"
 query($owner: String!, $repo: String!, $qualifiedName: String!) {
   repository(owner: $owner, name: $repo) {
+    nameWithOwner
     ref(qualifiedName: $qualifiedName) {
       target {
         oid
@@ -1508,6 +1789,7 @@ query($owner: String!, $repo: String!, $qualifiedName: String!) {
     login
   }
   repository(owner: $owner, name: $repo) {
+    nameWithOwner
     ref(qualifiedName: $qualifiedName) {
       target {
         oid
@@ -1520,6 +1802,8 @@ query($owner: String!, $repo: String!, $qualifiedName: String!) {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RepositoryNode {
+    #[serde(default)]
+    name_with_owner: Option<String>,
     pull_request: Option<PullRequestNode>,
 }
 
@@ -1801,7 +2085,7 @@ const PULL_REQUEST_FIELDS: &str = r#"{
 
 fn build_batch_pull_requests_query(numbers: &[u64]) -> String {
     let mut query = String::from(
-        "query PullRequests($owner: String!, $name: String!) {\n  repository(owner: $owner, name: $name) {\n",
+        "query PullRequests($owner: String!, $name: String!) {\n  repository(owner: $owner, name: $name) {\n    nameWithOwner\n",
     );
     for (idx, number) in numbers.iter().enumerate() {
         query.push_str(&format!(
@@ -1838,7 +2122,7 @@ fn batch_pull_request_nodes(
     let mut out = Vec::with_capacity(numbers.len());
     for (idx, &number) in numbers.iter().enumerate() {
         let key = format!("pr_{idx}");
-        let Some(node) = repository.remove(&key).flatten() else {
+        let Some(node) = repository.pull_requests.remove(&key).flatten() else {
             bail!(
                 "GitHub has no pull request #{number} in this repository{}. \
                  Check the `Pull-Request:` trailer on the commit.",
@@ -2348,5 +2632,111 @@ mod tests {
             comment_edit_result(500, "<html>oops</html>", None, "new"),
             Err("GitHub returned HTTP 500 (<html>oops</html>)".to_string())
         );
+    }
+
+    #[test]
+    fn rewrites_remote_url_preserving_transport_and_dot_git_suffix() {
+        assert_eq!(
+            rewrite_remote_url_repo(
+                "git@github.com:old-org/old-repo.git",
+                "new-org",
+                "new-repo"
+            ),
+            "git@github.com:new-org/new-repo.git"
+        );
+        assert_eq!(
+            rewrite_remote_url_repo(
+                "git@github.com:old-org/old-repo",
+                "new-org",
+                "new-repo"
+            ),
+            "git@github.com:new-org/new-repo"
+        );
+        assert_eq!(
+            rewrite_remote_url_repo(
+                "https://github.com/old-org/old-repo.git",
+                "new-org",
+                "new-repo"
+            ),
+            "https://github.com:new-org/new-repo.git"
+                .replace("github.com:", "github.com/")
+        );
+        assert_eq!(
+            rewrite_remote_url_repo(
+                "https://github.com/old-org/old-repo",
+                "new-org",
+                "new-repo"
+            ),
+            "https://github.com/new-org/new-repo"
+        );
+        assert_eq!(
+            rewrite_remote_url_repo(
+                "ssh://git@github.com/old-org/old-repo.git",
+                "new-org",
+                "new-repo"
+            ),
+            "ssh://git@github.com/new-org/new-repo.git"
+        );
+    }
+
+    #[test]
+    fn formats_moved_repo_warning_with_git_remote_set_url_hint() {
+        let msg = format_moved_repo_warning(
+            "old-org",
+            "old-repo",
+            "new-org",
+            "new-repo",
+            "origin",
+            "git@github.com:new-org/new-repo.git",
+        );
+        assert!(
+            msg.contains("repository `old-org/old-repo` has moved to `new-org/new-repo` on GitHub"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "git remote set-url origin git@github.com:new-org/new-repo.git"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_canonical_name_with_owner_updates_slug_and_remote_url_once()
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let git =
+            crate::git::Git::new(git2::Repository::init(dir.path()).unwrap());
+        git.repo()
+            .remote("origin", "git@github.com:old-org/old-repo.git")
+            .unwrap();
+        let forge = GitHubForge::new(
+            git.repo().clone(),
+            "old-org",
+            "old-repo",
+            "dummy-token".to_string(),
+        )
+        .unwrap();
+
+        assert!(!forge.record_canonical_name_with_owner("old-org/old-repo"));
+        assert!(!forge.warned_repo_moved.get());
+
+        // Case-only difference updates canonical casing without warning.
+        assert!(forge.record_canonical_name_with_owner("Old-Org/Old-Repo"));
+        assert_eq!(forge.owner(), "Old-Org");
+        assert_eq!(forge.repo(), "Old-Repo");
+        assert!(!forge.warned_repo_moved.get());
+
+        // Actual rename/transfer updates owner/repo, remote URL, and warns once.
+        assert!(forge.record_canonical_name_with_owner("new-org/new-repo"));
+        assert_eq!(forge.owner(), "new-org");
+        assert_eq!(forge.repo(), "new-repo");
+        assert_eq!(
+            forge.remote().url(),
+            "https://github.com/new-org/new-repo.git"
+        );
+        assert!(forge.warned_repo_moved.get());
+
+        assert!(!forge.record_canonical_name_with_owner("new-org/new-repo"));
     }
 }

@@ -49,7 +49,7 @@ use crate::ssh_agent::{self, SshAgentStatus};
 #[derive(Clone)]
 pub struct GitRemote {
     repo: Arc<Repository>,
-    url: String,
+    url: RefCell<String>,
     auth_token: String,
     ssh_agent_timeout: Duration,
     ssh_auth_sock_override: Option<PathBuf>,
@@ -59,7 +59,7 @@ impl GitRemote {
     pub fn new(repo: Arc<Repository>, url: String, auth_token: String) -> Self {
         Self {
             repo,
-            url,
+            url: RefCell::new(url),
             auth_token,
             ssh_agent_timeout: ssh_agent::DEFAULT_SSH_AGENT_TIMEOUT,
             ssh_auth_sock_override: None,
@@ -78,8 +78,12 @@ impl GitRemote {
         self
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
+    pub fn url(&self) -> String {
+        self.url.borrow().clone()
+    }
+
+    pub fn set_url(&self, url: String) {
+        *self.url.borrow_mut() = url;
     }
 
     fn check_ssh_agent(&self) -> SshAgentStatus {
@@ -127,10 +131,11 @@ impl GitRemote {
     {
         use std::io::Write as _;
 
+        let url = self.url();
         let config = self.repo.config()?;
         let effective_url = ssh_agent::resolve_effective_url(
             &config,
-            &self.url,
+            &url,
             dir == Direction::Push,
         );
         let is_ssh = ssh_agent::is_ssh_url(&effective_url);
@@ -152,7 +157,7 @@ impl GitRemote {
             let _ = std::io::stderr().flush();
         }
 
-        let mut remote = self.repo.remote_anonymous(&self.url)?;
+        let mut remote = self.repo.remote_anonymous(&url)?;
         let auth = self.authenticator(&ssh_status);
         let mut callbacks = RemoteCallbacks::new();
         callbacks.credentials(auth.credentials(&config));
@@ -166,7 +171,7 @@ impl GitRemote {
             e.wrap_err(if is_ssh {
                 ssh_agent::format_ssh_auth_error(
                     &effective_url,
-                    &self.url,
+                    &url,
                     &ssh_status,
                 )
             } else {
@@ -177,7 +182,7 @@ impl GitRemote {
                      `url.*.pushInsteadOf` in your git config rewrites the \
                      transport, and credentials that work for one transport \
                      do not apply to the other.",
-                    &self.url
+                    &url
                 )
             })
         });
@@ -254,7 +259,7 @@ impl GitRemote {
                 bail!(
                     "{oid} is not reachable on {}. If it was just merged, \
                      wait a moment and run `nspr sync`.",
-                    self.url
+                    self.url()
                 );
             }
         }
