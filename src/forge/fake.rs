@@ -675,13 +675,13 @@ impl Forge for FakeForge {
         &self,
         head: &str,
     ) -> Result<Option<PullRequest>> {
-        let prs = self.prs.borrow();
-        let number = prs
-            .iter()
-            .find(|pr| pr.head == head && pr.state == PrState::Open)
-            .or_else(|| prs.iter().find(|pr| pr.head == head))
-            .map(|pr| pr.number);
-        drop(prs);
+        let number = {
+            let prs = self.prs.borrow();
+            prs.iter()
+                .find(|pr| pr.head == head && pr.state == PrState::Open)
+                .or_else(|| prs.iter().find(|pr| pr.head == head))
+                .map(|pr| pr.number)
+        };
         match number {
             Some(n) => self.get_pull_request(n).await.map(Some),
             None => Ok(None),

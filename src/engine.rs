@@ -276,13 +276,12 @@ pub async fn sync_stack(
     let mut staged = false;
     let mut prompted_messages = std::collections::HashMap::new();
     if opts.preserve_commit_history && opts.message.is_none() {
-        for i in 0..stack.layers.len() {
+        for (i, (layer, pr)) in stack.layers.iter().zip(&prs).enumerate() {
             if decision.push[i]
                 && decision.patch_changed[i]
-                && let Some(pr) = &prs[i]
+                && let Some(pr) = pr
             {
-                let label =
-                    format!("#{} \"{}\"", pr.number, stack.layers[i].subject());
+                let label = format!("#{} \"{}\"", pr.number, layer.subject());
                 let m = prompter.update_message(&label)?;
                 prompted_messages.insert(i, m);
             }
@@ -1352,14 +1351,13 @@ async fn execute(
                 let syn_branch = crate::stack::synthetic_base_branch(&pr.head);
                 let (parent_tip, base_branch) = if is_multi_dep {
                     reserved_branches.insert(syn_branch.clone());
-                    if !decision.push[i] {
-                        (pr.base_oid, syn_branch.clone())
-                    } else if pr.base == syn_branch
-                        && !decision.rewrite_history[i]
-                        && pr.base_oid != Oid::ZERO_SHA1
-                        && git.repo().find_commit(pr.base_oid).is_ok()
-                        && git.tree_of(pr.base_oid)? == trees.dep[i]
-                    {
+                    let reuse_existing_syn = !decision.push[i]
+                        || (pr.base == syn_branch
+                            && !decision.rewrite_history[i]
+                            && pr.base_oid != Oid::ZERO_SHA1
+                            && git.repo().find_commit(pr.base_oid).is_ok()
+                            && git.tree_of(pr.base_oid)? == trees.dep[i]);
+                    if reuse_existing_syn {
                         (pr.base_oid, syn_branch.clone())
                     } else {
                         let syn_tip = git.synthesize_initial_commit(
@@ -1915,12 +1913,11 @@ async fn execute(
                 if retargeted
                     && pr.base == old_syn_base
                     && base_branch != old_syn_base
+                    && let Err(e) = forge.delete_branch(&old_syn_base).await
                 {
-                    if let Err(e) = forge.delete_branch(&old_syn_base).await {
-                        log::debug!(
-                            "failed to delete synthetic base branch {old_syn_base}: {e}"
-                        );
-                    }
+                    log::debug!(
+                        "failed to delete synthetic base branch {old_syn_base}: {e}"
+                    );
                 }
 
                 LayerOutcome {
@@ -2009,8 +2006,8 @@ pub async fn resolve_external_deps(
             }
         }
     }
-    for i in 0..n {
-        if !needed[i] {
+    for (i, &is_needed) in needed.iter().enumerate() {
+        if !is_needed {
             continue;
         }
         let external_prs = stack.layers[i].external_pr_deps();

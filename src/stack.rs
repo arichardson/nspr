@@ -647,8 +647,8 @@ impl Stack {
         let mut cache = HashMap::new();
         let mut effective = Vec::with_capacity(n);
         let mut dep = Vec::with_capacity(n);
-        for i in 0..n {
-            if needed[i] {
+        for (i, &is_needed) in needed.iter().enumerate() {
+            if is_needed {
                 dep.push(self.base_tree_cached(git, i, &mut cache)?);
                 effective.push(self.effective_tree_cached(git, i, &mut cache)?);
             } else {
