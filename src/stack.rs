@@ -89,9 +89,6 @@ pub struct Layer {
     pub parent: Oid,
     pub message: CommitMessage,
     pub pr: Option<u64>,
-    /// As written in the commit message, if present (first entry when multiple
-    /// dependencies are declared).
-    pub dep_spec: Option<DepSpec>,
     /// All `Depends-On:` entries as written in the commit message.
     pub dep_specs: Vec<DepSpec>,
     /// Effective single dependency for the GitHub `base` branch. Defaults to
@@ -107,8 +104,41 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// Construct an in-memory layer with a single resolved dependency, for unit tests.
+    pub fn stub(subject: &str, pr: Option<u64>, dep: Dep) -> Self {
+        Self::with_deps(subject, pr, vec![dep])
+    }
+
+    /// Construct an in-memory layer with multiple resolved dependencies, for unit tests.
+    pub fn with_deps(subject: &str, pr: Option<u64>, deps: Vec<Dep>) -> Self {
+        let dep = Self::compute_effective_dep(&deps);
+        Self {
+            commit: Oid::ZERO_SHA1,
+            parent: Oid::ZERO_SHA1,
+            message: CommitMessage::parse(subject),
+            pr,
+            dep_specs: Vec::new(),
+            dep,
+            deps,
+            merged_pr_deps: Vec::new(),
+        }
+    }
+
     pub fn subject(&self) -> &str {
         &self.message.subject
+    }
+
+    /// First `Depends-On:` entry as written in the commit message, if present.
+    pub fn dep_spec(&self) -> Option<&DepSpec> {
+        self.dep_specs.first()
+    }
+
+    /// Point this layer directly at `trunk` (`Depends-On: <trunk>`) in memory.
+    pub fn set_dep_main(&mut self, trunk: &str) {
+        self.message.set(DEPENDS_ON, trunk);
+        self.dep_specs = vec![DepSpec::Main];
+        self.dep = Dep::Main;
+        self.deps = vec![Dep::Main];
     }
 
     /// Indices of all layers in `stack.layers` that this layer directly depends on.
@@ -332,13 +362,11 @@ impl Stack {
             for raw in message.get_all(DEPENDS_ON) {
                 dep_specs.extend(parse_dep_specs(raw, trunk)?);
             }
-            let dep_spec = dep_specs.first().cloned();
             layers.push(Layer {
                 commit: oid,
                 parent: git.parent_of(oid)?,
                 message,
                 pr,
-                dep_spec,
                 dep_specs,
                 dep: Dep::Main, // placeholder; set by resolve_deps
                 deps: Vec::new(),
@@ -1054,7 +1082,7 @@ impl Stack {
             let dep_was_removed =
                 matches!(layer.dep, Dep::Layer(p) if removed.contains(&p));
 
-            let needs_rewrite = match &layer.dep_spec {
+            let needs_rewrite = match layer.dep_spec() {
                 None => inherited != implicit,
                 Some(DepSpec::Commit(_)) => dep_was_removed,
                 Some(DepSpec::Pr(_)) => {

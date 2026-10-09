@@ -487,7 +487,7 @@ pub async fn upgrade_stack_with_options(
         // Normalize `Pull Request:` -> `Pull-Request:` in local commit message.
         messages[i].set(PULL_REQUEST, &config.pull_request_url(pr.number));
         if let Dep::Layer(j) = stack.layers[i].dep
-            && stack.layers[i].dep_spec.is_some()
+            && stack.layers[i].dep_spec().is_some()
             && let Some(dep_pr) = stack.layers[j].pr
         {
             messages[i].set(DEPENDS_ON, &format!("#{dep_pr}"));

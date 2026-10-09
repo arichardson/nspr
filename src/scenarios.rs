@@ -1969,8 +1969,8 @@ fn close_rewrites_trailers_that_named_the_closed_pull_request() {
     let stack = w.discover();
     let three = stack.layers.iter().find(|l| l.pr == Some(prs[2])).unwrap();
     assert_eq!(
-        three.dep_spec,
-        Some(crate::stack::DepSpec::Pr(prs[0])),
+        three.dep_spec(),
+        Some(&crate::stack::DepSpec::Pr(prs[0])),
         "the trailer should now name layer one"
     );
 

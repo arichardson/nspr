@@ -552,15 +552,7 @@ impl Session {
             let head_idx = stack.layers.len() - 1;
             if !stack.layers[head_idx].is_root_landable() {
                 if args.dry_run {
-                    stack.layers[head_idx]
-                        .message
-                        .set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
-                    stack.layers[head_idx].dep_spec =
-                        Some(nspr::stack::DepSpec::Main);
-                    stack.layers[head_idx].dep_specs =
-                        vec![nspr::stack::DepSpec::Main];
-                    stack.layers[head_idx].dep = nspr::stack::Dep::Main;
-                    stack.layers[head_idx].deps = vec![nspr::stack::Dep::Main];
+                    stack.layers[head_idx].set_dep_main(&self.config.trunk);
                 } else {
                     let mut msg = stack.layers[head_idx].message.clone();
                     msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
@@ -589,16 +581,7 @@ impl Session {
                 .unwrap_or(stack.layers.len() - 1);
             if target_idx > 0 && !stack.layers[target_idx].is_root_landable() {
                 if args.dry_run {
-                    stack.layers[target_idx]
-                        .message
-                        .set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
-                    stack.layers[target_idx].dep_spec =
-                        Some(nspr::stack::DepSpec::Main);
-                    stack.layers[target_idx].dep_specs =
-                        vec![nspr::stack::DepSpec::Main];
-                    stack.layers[target_idx].dep = nspr::stack::Dep::Main;
-                    stack.layers[target_idx].deps =
-                        vec![nspr::stack::Dep::Main];
+                    stack.layers[target_idx].set_dep_main(&self.config.trunk);
                 } else {
                     let mut msg = stack.layers[target_idx].message.clone();
                     msg.set(nspr::trailers::DEPENDS_ON, &self.config.trunk);
@@ -1521,20 +1504,9 @@ fn resolve_land_target(
 mod tests {
     use super::*;
     use nspr::stack::{Dep, Layer};
-    use nspr::trailers::CommitMessage;
 
     fn dummy_layer(subject: &str, pr: Option<u64>, dep: Dep) -> Layer {
-        Layer {
-            commit: git2::Oid::ZERO_SHA1,
-            parent: git2::Oid::ZERO_SHA1,
-            message: CommitMessage::parse(subject),
-            pr,
-            dep_spec: None,
-            dep_specs: Vec::new(),
-            dep,
-            deps: vec![dep],
-            merged_pr_deps: Vec::new(),
-        }
+        Layer::stub(subject, pr, dep)
     }
 
     #[test]

@@ -727,33 +727,12 @@ mod tests {
             "main".into(),
             "user".into(),
         );
-        let oid = git2::Oid::ZERO_SHA1;
         let stack = Stack {
             trunk: "main".into(),
-            base: oid,
+            base: git2::Oid::ZERO_SHA1,
             layers: vec![
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("Layer 1\n"),
-                    pr: Some(101),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Main,
-                    deps: vec![Dep::Main],
-                    merged_pr_deps: Vec::new(),
-                },
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("Layer 2\n"),
-                    pr: Some(102),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Layer(0),
-                    deps: vec![Dep::Layer(0)],
-                    merged_pr_deps: Vec::new(),
-                },
+                Layer::stub("Layer 1", Some(101), Dep::Main),
+                Layer::stub("Layer 2", Some(102), Dep::Layer(0)),
             ],
         };
 
@@ -773,46 +752,13 @@ mod tests {
             "main".into(),
             "user".into(),
         );
-        let oid = git2::Oid::ZERO_SHA1;
         let stack = Stack {
             trunk: "main".into(),
-            base: oid,
+            base: git2::Oid::ZERO_SHA1,
             layers: vec![
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("Layer 1\n"),
-                    pr: Some(101),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Main,
-                    deps: vec![Dep::Main],
-                    merged_pr_deps: Vec::new(),
-                },
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("Layer 2\n"),
-                    pr: Some(102),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Layer(0),
-                    deps: vec![Dep::Layer(0)],
-                    merged_pr_deps: Vec::new(),
-                },
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse(
-                        "Layer 3 sibling\n",
-                    ),
-                    pr: Some(103),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Layer(0),
-                    deps: vec![Dep::Layer(0)],
-                    merged_pr_deps: Vec::new(),
-                },
+                Layer::stub("Layer 1", Some(101), Dep::Main),
+                Layer::stub("Layer 2", Some(102), Dep::Layer(0)),
+                Layer::stub("Layer 3 sibling", Some(103), Dep::Layer(0)),
             ],
         };
 
@@ -851,55 +797,18 @@ mod tests {
             "main".into(),
             "user".into(),
         );
-        let oid = git2::Oid::ZERO_SHA1;
         let stack_before = Stack {
             trunk: "main".into(),
-            base: oid,
+            base: git2::Oid::ZERO_SHA1,
             layers: vec![
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("A1\n"),
-                    pr: Some(56),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Main,
-                    deps: vec![Dep::Main],
-                    merged_pr_deps: Vec::new(),
-                },
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("A2\n"),
-                    pr: Some(57),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Layer(0),
-                    deps: vec![Dep::Layer(0)],
-                    merged_pr_deps: Vec::new(),
-                },
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("B1\n"),
-                    pr: Some(58),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Main,
-                    deps: vec![Dep::Main],
-                    merged_pr_deps: Vec::new(),
-                },
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("Top\n"),
-                    pr: Some(59),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Main,
-                    deps: vec![Dep::Layer(1), Dep::Layer(2)],
-                    merged_pr_deps: Vec::new(),
-                },
+                Layer::stub("A1", Some(56), Dep::Main),
+                Layer::stub("A2", Some(57), Dep::Layer(0)),
+                Layer::stub("B1", Some(58), Dep::Main),
+                Layer::with_deps(
+                    "Top",
+                    Some(59),
+                    vec![Dep::Layer(1), Dep::Layer(2)],
+                ),
             ],
         };
 
@@ -931,23 +840,16 @@ mod tests {
 
         // After #58 is merged into main, #59 has 1 open layer_dep (#57) and
         // #58 in merged_pr_deps. The rendered DAG stays identical.
+        let mut top_after =
+            Layer::with_deps("Top", Some(59), vec![Dep::Layer(1), Dep::Main]);
+        top_after.merged_pr_deps = vec![58];
         let stack_after = Stack {
             trunk: "main".into(),
-            base: oid,
+            base: git2::Oid::ZERO_SHA1,
             layers: vec![
                 stack_before.layers[0].clone(),
                 stack_before.layers[1].clone(),
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("Top\n"),
-                    pr: Some(59),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Layer(1),
-                    deps: vec![Dep::Layer(1), Dep::Main],
-                    merged_pr_deps: vec![58],
-                },
+                top_after,
             ],
         };
         let after = render_with_merged(
@@ -970,55 +872,14 @@ mod tests {
             "main".into(),
             "user".into(),
         );
-        let oid = git2::Oid::ZERO_SHA1;
         let stack = Stack {
             trunk: "main".into(),
-            base: oid,
+            base: git2::Oid::ZERO_SHA1,
             layers: vec![
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("ToolA 1\n"),
-                    pr: Some(101),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Main,
-                    deps: vec![Dep::Main],
-                    merged_pr_deps: Vec::new(),
-                },
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("ToolA 2\n"),
-                    pr: Some(102),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Layer(0),
-                    deps: vec![Dep::Layer(0)],
-                    merged_pr_deps: Vec::new(),
-                },
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("ToolB 1\n"),
-                    pr: Some(201),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Main,
-                    deps: vec![Dep::Main],
-                    merged_pr_deps: Vec::new(),
-                },
-                Layer {
-                    commit: oid,
-                    parent: oid,
-                    message: crate::trailers::CommitMessage::parse("ToolB 2\n"),
-                    pr: Some(202),
-                    dep_spec: None,
-                    dep_specs: Vec::new(),
-                    dep: Dep::Layer(2),
-                    deps: vec![Dep::Layer(2)],
-                    merged_pr_deps: Vec::new(),
-                },
+                Layer::stub("ToolA 1", Some(101), Dep::Main),
+                Layer::stub("ToolA 2", Some(102), Dep::Layer(0)),
+                Layer::stub("ToolB 1", Some(201), Dep::Main),
+                Layer::stub("ToolB 2", Some(202), Dep::Layer(2)),
             ],
         };
 
@@ -1038,21 +899,7 @@ mod tests {
     }
 
     fn dag_layer(subject: &str, pr: u64, deps: Vec<Dep>) -> Layer {
-        let oid = git2::Oid::ZERO_SHA1;
-        let dep = Layer::compute_effective_dep(&deps);
-        Layer {
-            commit: oid,
-            parent: oid,
-            message: crate::trailers::CommitMessage::parse(&format!(
-                "{subject}\n"
-            )),
-            pr: Some(pr),
-            dep_spec: None,
-            dep_specs: Vec::new(),
-            dep,
-            deps,
-            merged_pr_deps: Vec::new(),
-        }
+        Layer::with_deps(subject, Some(pr), deps)
     }
 
     /// `B`, `C`, `E` on main; `A -> B & C`; `D -> A & E`; `F -> D`.
