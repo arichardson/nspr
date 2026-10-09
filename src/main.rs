@@ -1170,23 +1170,24 @@ impl Session {
         }
         if report.rebased {
             println!("Rebased onto {}.", self.git.short_id(report.trunk)?);
-            if let Ok(remaining) =
-                Stack::discover(&self.git, self.trunk_oid, &self.config.trunk)
-                && !remaining.layers.is_empty()
-            {
-                println!("Restacking...");
-                self.diff(
-                    DiffArgs {
-                        all: true,
-                        no_prompt: true,
-                        ..Default::default()
-                    },
-                    false,
-                )
-                .await?;
-            }
         } else {
             println!("Already up to date with {}.", self.config.trunk);
+        }
+        if report.needs_restack
+            && let Ok(remaining) =
+                Stack::discover(&self.git, self.trunk_oid, &self.config.trunk)
+            && !remaining.layers.is_empty()
+        {
+            println!("Restacking...");
+            self.diff(
+                DiffArgs {
+                    all: true,
+                    no_prompt: true,
+                    ..Default::default()
+                },
+                false,
+            )
+            .await?;
         }
         Ok(())
     }

@@ -271,6 +271,7 @@ impl Git {
             commits.len()
         );
         let mut result = Vec::new();
+        let mut rewrites = Vec::new();
         let hooks = self.hooks();
 
         for oid in commits {
@@ -284,7 +285,45 @@ impl Git {
                 None,
             )?;
             if index.has_conflicts() {
-                bail!("rebase failed due to merge conflicts");
+                let mut paths = Vec::new();
+                if let Ok(conflicts) = index.conflicts() {
+                    for conflict in conflicts.flatten() {
+                        if let Some(entry) = conflict
+                            .our
+                            .as_ref()
+                            .or(conflict.their.as_ref())
+                            .or(conflict.ancestor.as_ref())
+                            && let Ok(path) = std::str::from_utf8(&entry.path)
+                            && !paths.iter().any(|p| p == path)
+                        {
+                            paths.push(path.to_string());
+                        }
+                    }
+                }
+                let raw_msg = String::from_utf8_lossy(commit.message_bytes());
+                let parsed =
+                    crate::trailers::CommitMessage::parse(raw_msg.as_ref());
+                let pr_prefix = parsed
+                    .get(crate::trailers::PULL_REQUEST)
+                    .and_then(crate::stack::parse_pr_ref)
+                    .map(|n| format!("#{n} "))
+                    .unwrap_or_default();
+                let short_oid = self
+                    .short_id(*oid)
+                    .unwrap_or_else(|_| oid.to_string()[..7].to_string());
+                let short_onto =
+                    self.short_id(new_parent).unwrap_or_else(|_| {
+                        new_parent.to_string()[..7].to_string()
+                    });
+                let files_desc = if paths.is_empty() {
+                    String::new()
+                } else {
+                    format!(" in: {}", paths.join(", "))
+                };
+                bail!(
+                    "conflict rebasing {short_oid} ({pr_prefix}\"{}\") onto {short_onto}{files_desc}",
+                    parsed.subject
+                );
             }
 
             let tree_oid = index.write_tree_to(self.repo.as_ref())?;
@@ -293,10 +332,7 @@ impl Git {
                 log::debug!(
                     "commit {oid} became empty during rebase; dropping"
                 );
-                hooks.run_post_rewrite_rebase(
-                    self.repo.as_ref(),
-                    &[(*oid, new_parent)],
-                );
+                rewrites.push((*oid, new_parent));
                 continue;
             }
 
@@ -309,10 +345,7 @@ impl Git {
                 &tree,
                 &[&new_parent_commit],
             )?;
-            hooks.run_post_rewrite_rebase(
-                self.repo.as_ref(),
-                &[(*oid, new_parent)],
-            );
+            rewrites.push((*oid, new_parent));
             result.push(new_parent);
         }
 
@@ -324,6 +357,9 @@ impl Git {
             .map_err(Error::from)
             .wrap_err("could not check out rebased branch; rebase manually")?;
         reference.set_target(new_parent, "nspr rebased")?;
+        if !rewrites.is_empty() {
+            hooks.run_post_rewrite_rebase(self.repo.as_ref(), &rewrites);
+        }
 
         Ok(result)
     }

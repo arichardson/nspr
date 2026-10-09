@@ -46,6 +46,11 @@ pub struct SyncReport {
     pub warnings: Vec<String>,
     /// True if the local stack moved.
     pub rebased: bool,
+    /// True if surviving pull requests in the stack need restacking/updating on
+    /// the remote (either because `rebased` is true, or because the user
+    /// resolved rebase conflicts manually with `git rebase` and then ran
+    /// `nspr sync` again).
+    pub needs_restack: bool,
 }
 
 /// Where the trunk is, according to the remote rather than to local memory.
@@ -128,10 +133,17 @@ pub async fn sync_trunk(
         .await?
         .ok_or_else(|| eyre!("no `{}` branch on the remote", config.trunk))?;
     forge.fetch_commit(trunk).await?;
+    let remote = detect_remote_for_trunk(git, &config.trunk);
+    let _ = git.set_reference(
+        &format!("refs/remotes/{remote}/{}", config.trunk),
+        trunk,
+        "nspr: update trunk tracking ref during sync",
+    );
 
     let mut merged = Vec::new();
     let mut cleanly_merged = std::collections::HashSet::new();
     let mut warnings = Vec::new();
+    let mut open_prs = Vec::new();
     let trunk_tree = git.tree_of(trunk)?;
 
     let mut needed_indices = Vec::new();
@@ -150,9 +162,10 @@ pub async fn sync_trunk(
         match pr.state {
             PrState::Merged => {
                 merged.push(number);
-                if let Ok(idx) = git.cherrypick(layer.commit, trunk)
-                    && !idx.has_conflicts()
-                    && git.write_index(idx).ok() == Some(trunk_tree)
+                if is_layer_cleanly_merged(
+                    git, forge, layer, &pr, trunk, trunk_tree,
+                )
+                .await
                 {
                     cleanly_merged.insert(i);
                 }
@@ -203,19 +216,31 @@ pub async fn sync_trunk(
                             git.short_id(landed_oid)?,
                         ));
                     }
+                } else {
+                    open_prs.push((i, pr));
                 }
             }
         }
     }
 
-    let rebased = trunk != stack.base;
+    let rebased = trunk != stack.base || !cleanly_merged.is_empty();
     if rebased {
-        let commits =
-            stack.rewrite_deps_for_removal(git, &cleanly_merged, false)?;
-        git.rebase_commits(&commits, trunk).wrap_err(
-            "could not rebase the stack onto the trunk. Resolve the conflict \
-             with `git rebase` and run `nspr sync` again.",
-        )?;
+        let prefix_merged = (0..stack.layers.len())
+            .take_while(|i| cleanly_merged.contains(i))
+            .count();
+        stack
+            .rebase_without(git, &cleanly_merged, trunk, false)
+            .wrap_err_with(|| {
+                format_rebase_error(
+                    git,
+                    &remote,
+                    config,
+                    stack,
+                    trunk,
+                    &merged,
+                    prefix_merged,
+                )
+            })?;
     }
 
     // A merged layer whose commit is still here after the rebase was amended
@@ -229,6 +254,11 @@ pub async fn sync_trunk(
         .filter_map(|l| l.pr)
         .filter(|n| merged.contains(n))
         .collect();
+    for number in &merged {
+        if !stranded.contains(number) {
+            let _ = crate::refs::remove(git, *number);
+        }
+    }
     for number in &stranded {
         warnings.push(format!(
             "#{number} was merged, but its commit still has changes that are \
@@ -237,11 +267,213 @@ pub async fn sync_trunk(
         ));
     }
 
+    let needs_restack = if rebased {
+        !survivors.layers.is_empty()
+    } else {
+        check_needs_restack(git, forge, config, stack, &open_prs, trunk_tree)
+            .await
+    };
+
     Ok(SyncReport {
         trunk,
         merged,
         stranded,
         warnings,
         rebased,
+        needs_restack,
     })
+}
+
+fn detect_remote_for_trunk(git: &Git, trunk: &str) -> String {
+    if git
+        .resolve_reference(&format!("refs/remotes/origin/{trunk}"))
+        .is_ok()
+    {
+        return "origin".to_string();
+    }
+    if let Ok(mut refs) = git
+        .repo()
+        .references_glob(&format!("refs/remotes/*/{trunk}"))
+        && let Some(name) = refs.names().flatten().next()
+        && let Some(rest) = name.strip_prefix("refs/remotes/")
+        && let Some(remote) = rest.strip_suffix(&format!("/{trunk}"))
+        && !remote.is_empty()
+    {
+        return remote.to_string();
+    }
+    "origin".to_string()
+}
+
+async fn is_layer_cleanly_merged(
+    git: &Git,
+    forge: &dyn Forge,
+    layer: &crate::stack::Layer,
+    pr: &crate::forge::PullRequest,
+    trunk: Oid,
+    trunk_tree: Oid,
+) -> bool {
+    if let Ok(idx) = git.cherrypick(layer.commit, trunk)
+        && !idx.has_conflicts()
+        && git.write_index(idx).ok() == Some(trunk_tree)
+    {
+        return true;
+    }
+
+    if let Some(mc) = pr.merge_commit
+        && mc != trunk
+        && forge.fetch_commit(mc).await.is_ok()
+        && let Ok(mc_tree) = git.tree_of(mc)
+        && let Ok(idx) = git.cherrypick(layer.commit, mc)
+        && !idx.has_conflicts()
+        && git.write_index(idx).ok() == Some(mc_tree)
+    {
+        return true;
+    }
+
+    let Ok(local_tree) = git.tree_of(layer.commit) else {
+        return false;
+    };
+    let Ok(local_parent_tree) = git.tree_of(layer.parent) else {
+        return false;
+    };
+    if let Some(recorded_head) = crate::refs::get(git, pr.number) {
+        if git.tree_of(recorded_head).ok() == Some(local_tree) {
+            return true;
+        }
+        if let Some(recorded_root) = crate::refs::get_root(git, pr.number)
+            && let Ok(root_commit) = git.repo().find_commit(recorded_root)
+            && root_commit.parent_count() > 0
+            && let Ok(root_parent) = root_commit.parent_id(0)
+            && let Ok(recorded_base_tree) = git.tree_of(root_parent)
+            && let Ok(recorded_head_tree) = git.tree_of(recorded_head)
+            && let Ok(local_patch) = crate::patch_id::tree_patch_id(
+                git.repo(),
+                local_parent_tree,
+                local_tree,
+            )
+            && let Ok(recorded_patch) = crate::patch_id::tree_patch_id(
+                git.repo(),
+                recorded_base_tree,
+                recorded_head_tree,
+            )
+            && local_patch == recorded_patch
+        {
+            return true;
+        }
+    }
+
+    if forge.fetch_commit(pr.head_oid).await.is_ok()
+        && git.tree_of(pr.head_oid).ok() == Some(local_tree)
+    {
+        return true;
+    }
+
+    false
+}
+
+fn format_rebase_error(
+    git: &Git,
+    remote: &str,
+    config: &Config,
+    stack: &Stack,
+    trunk: Oid,
+    merged: &[u64],
+    prefix_merged: usize,
+) -> String {
+    let remote_trunk = format!("{remote}/{}", config.trunk);
+    let trunk_short = git
+        .short_id(trunk)
+        .unwrap_or_else(|_| trunk.to_string()[..7].to_string());
+    let merged_note = if merged.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> =
+            merged.iter().map(|n| format!("#{n}")).collect();
+        format!(" (merged on GitHub: {})", list.join(", "))
+    };
+    let rebase_cmd = if prefix_merged > 0 && prefix_merged < stack.layers.len()
+    {
+        let last_merged = stack.layers[prefix_merged - 1].commit;
+        let last_short = git
+            .short_id(last_merged)
+            .unwrap_or_else(|_| last_merged.to_string()[..7].to_string());
+        format!("git rebase --onto {remote_trunk} {last_short}")
+    } else {
+        format!("git rebase {remote_trunk}")
+    };
+    format!(
+        "could not rebase the stack onto {remote_trunk} ({trunk_short}){merged_note}. \
+         Resolve the conflict with `{rebase_cmd}` and run `nspr sync` again."
+    )
+}
+
+async fn check_needs_restack(
+    git: &Git,
+    forge: &dyn Forge,
+    config: &Config,
+    stack: &Stack,
+    open_prs: &[(usize, crate::forge::PullRequest)],
+    trunk_tree: Oid,
+) -> bool {
+    if open_prs.is_empty() {
+        return false;
+    }
+    let Ok(trees) = stack.all_trees(git) else {
+        return false;
+    };
+    let pr_by_layer: std::collections::HashMap<
+        usize,
+        &crate::forge::PullRequest,
+    > = open_prs.iter().map(|(i, pr)| (*i, pr)).collect();
+
+    for (i, pr) in open_prs {
+        let layer = &stack.layers[*i];
+        let expected_base = if layer.has_multiple_layer_deps() {
+            Some(crate::stack::synthetic_base_branch(&pr.head))
+        } else {
+            match layer.dep {
+                crate::stack::Dep::Main => Some(config.trunk.clone()),
+                crate::stack::Dep::Layer(j) => {
+                    pr_by_layer.get(&j).map(|p| p.head.clone())
+                }
+                crate::stack::Dep::ExternalPr(_) => None,
+            }
+        };
+        if let Some(expected_base) = expected_base
+            && pr.base != expected_base
+        {
+            return true;
+        }
+        if forge.fetch_commit(pr.base_oid).await.is_ok()
+            && forge.fetch_commit(pr.head_oid).await.is_ok()
+        {
+            let local_patch = crate::patch_id::tree_patch_id(
+                git.repo(),
+                trees.dep[*i],
+                trees.effective[*i],
+            )
+            .ok();
+            let remote_patch = crate::review_diff::displayed_patch_id(
+                git.repo(),
+                pr.base_oid,
+                pr.head_oid,
+            )
+            .ok();
+            if local_patch != remote_patch {
+                return true;
+            }
+            if layer.dep == crate::stack::Dep::Main
+                && !layer.has_multiple_layer_deps()
+                && pr.base_oid != stack.base
+                && let Ok(base_tree) = git.tree_of(pr.base_oid)
+                && let Ok(head_tree) = git.tree_of(pr.head_oid)
+                && let Ok(idx) =
+                    git.merge_trees(base_tree, trunk_tree, head_tree)
+                && idx.has_conflicts()
+            {
+                return true;
+            }
+        }
+    }
+    false
 }

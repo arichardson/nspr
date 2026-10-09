@@ -1149,6 +1149,7 @@ impl Stack {
         onto: Oid,
         rewrite_explicit_pr_refs: bool,
     ) -> Result<()> {
+        let original_head = git.head().ok();
         let source_commits = self.rewrite_deps_for_removal(
             git,
             removed,
@@ -1161,7 +1162,16 @@ impl Stack {
             .map(|(_, oid)| oid)
             .collect();
 
-        git.rebase_commits(&unlanded, onto)?;
+        if let Err(err) = git.rebase_commits(&unlanded, onto) {
+            if let Some(head) = original_head
+                && let Ok(mut reference) =
+                    git.repo().head().and_then(|r| r.resolve())
+            {
+                let _ = reference
+                    .set_target(head, "nspr: restore HEAD after failed rebase");
+            }
+            return Err(err);
+        }
         Ok(())
     }
 }

@@ -396,22 +396,18 @@ impl World {
         let report = self.try_sync_trunk().unwrap();
 
         self.base_oid = report.trunk;
-        // Layers whose commit became empty during the rebase have gone.
-        let remaining = self.git.commits_since(self.base_oid).unwrap().len();
-        while self.layers.len() > remaining {
-            let landed = report.merged.first().copied();
-            let i = self
-                .layers
-                .iter()
-                .position(|l| {
-                    l.message
-                        .get(crate::trailers::PULL_REQUEST)
-                        .and_then(crate::stack::parse_pr_ref)
-                        == landed
-                })
-                .unwrap_or(0);
-            self.layers.remove(i);
-        }
+        let dropped: std::collections::HashSet<u64> = report
+            .merged
+            .iter()
+            .copied()
+            .filter(|n| !report.stranded.contains(n))
+            .collect();
+        self.layers.retain(|l| {
+            l.message
+                .get(crate::trailers::PULL_REQUEST)
+                .and_then(crate::stack::parse_pr_ref)
+                .is_none_or(|n| !dropped.contains(&n))
+        });
         self.sync_worktree();
         self.refresh_specs_from_repo();
         report
@@ -1814,12 +1810,156 @@ fn scenario_12_a_conflicting_rebase_fails_without_pushing_anything() {
         text.contains("nspr sync"),
         "the error should say how to recover:\n{text}"
     );
+    assert!(
+        text.contains("git rebase origin/main"),
+        "the error should give the exact git rebase command:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("#{} \"Layer one\"", prs[0])),
+        "the error should identify the conflicting commit and PR:\n{text}"
+    );
+    assert!(
+        text.contains("in: a.txt"),
+        "the error should list the conflicting file path:\n{text}"
+    );
+    assert_eq!(
+        w.git.resolve_reference("refs/remotes/origin/main").unwrap(),
+        w.forge.trunk_oid(),
+        "origin/main tracking ref should be updated even when rebase fails"
+    );
 
     assert_eq!(
         w.push_count(),
         before,
         "nothing may be pushed once the repair is known to be impossible"
     );
+}
+
+#[test]
+fn scenario_11c_multiple_merged_layers_touching_same_file_drop_cleanly() {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("a.txt", "a2")]);
+    w.add_layer("Layer three", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+
+    w.forge.external_squash_merge(prs[0]).unwrap();
+    let pr1_squash = w.forge.trunk_oid();
+    let pr2 = block_on(w.forge.get_pull_request(prs[1])).unwrap();
+    let pr2_updated_head = w.t.commit(
+        "Merge branch 'main' into layer-two",
+        &[("root.txt", "root"), ("a.txt", "a2")],
+        &[pr2.head_oid, pr1_squash],
+    );
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        &pr2.head,
+        pr2_updated_head,
+    )]))
+    .unwrap();
+    block_on(w.forge.update_pull_request(
+        prs[1],
+        crate::forge::PullRequestUpdate {
+            base: Some(TRUNK.to_string()),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    w.forge.external_squash_merge(prs[1]).unwrap();
+
+    let report = w.sync_trunk();
+    assert_eq!(report.merged, vec![prs[0], prs[1]]);
+    assert!(report.stranded.is_empty(), "{:?}", report.stranded);
+    assert!(report.rebased);
+    assert!(report.needs_restack);
+
+    let stack = w.discover();
+    assert_eq!(stack.layers.len(), 1);
+    assert_eq!(stack.layers[0].subject(), "Layer three");
+}
+
+#[test]
+fn scenario_12b_conflict_after_merged_bottom_layer_suggests_rebase_onto_and_detects_needs_restack()
+ {
+    let mut w = World::new(&[("root.txt", "root")]);
+    w.add_layer("Layer one", &[("a.txt", "a1")]);
+    w.add_layer("Layer two", &[("b.txt", "b1")]);
+    w.sync();
+    let prs = w.pr_numbers();
+    let layer0_commit = w.discover().layers[0].commit;
+    let layer0_short = w.git.short_id(layer0_commit).unwrap();
+
+    // PR 1 merges on GitHub, and then another upstream commit touches `b.txt`.
+    w.forge.external_squash_merge(prs[0]).unwrap();
+    let after_pr1 = w.forge.trunk_oid();
+    let upstream_conflict = w.t.commit(
+        "upstream b change",
+        &[
+            ("root.txt", "root"),
+            ("a.txt", "a1"),
+            ("b.txt", "b_upstream"),
+        ],
+        &[after_pr1],
+    );
+    block_on(w.forge.push(&[crate::forge::PushSpec::fast_forward(
+        TRUNK,
+        upstream_conflict,
+    )]))
+    .unwrap();
+
+    let err = w
+        .try_sync_trunk()
+        .expect_err("Layer two conflicts on b.txt");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains(&format!("merged on GitHub: #{}", prs[0])),
+        "error should note that PR #1 was merged:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("git rebase --onto origin/main {layer0_short}")),
+        "error should suggest git rebase --onto skipping the merged layer:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("#{} \"Layer two\"", prs[1])),
+        "error should identify Layer two as the conflicting commit:\n{text}"
+    );
+    assert!(
+        text.contains("in: b.txt"),
+        "error should name b.txt as the conflicting file:\n{text}"
+    );
+
+    // Simulate the user running `git rebase --onto origin/main <layer0_short>`
+    // and resolving the conflict in Layer two.
+    w.base_files = owned(&[
+        ("root.txt", "root"),
+        ("a.txt", "a1"),
+        ("b.txt", "b_upstream"),
+    ]);
+    w.base_oid = upstream_conflict;
+    w.layers.remove(0);
+    w.layers[0].changes = owned(&[("b.txt", "b_resolved")]);
+    w.rebuild();
+
+    // Now the user runs `nspr sync` again as instructed. Even though `trunk ==
+    // stack.base` (`rebased == false`), `sync_trunk` detects that PR #2 still
+    // needs restacking onto `main`.
+    let report = w.sync_trunk();
+    assert!(!report.rebased);
+    assert!(
+        report.needs_restack,
+        "sync_trunk must detect that PR #2 needs restacking after manual git rebase"
+    );
+
+    let outcomes = w.sync();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].number, prs[1]);
+    assert_eq!(outcomes[0].base, TRUNK);
+
+    // A subsequent `sync_trunk` when everything is already synced reports
+    // `needs_restack == false`.
+    let second_report = w.sync_trunk();
+    assert!(!second_report.rebased);
+    assert!(!second_report.needs_restack);
 }
 
 // ---------------------------------------------------------------------------
