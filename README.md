@@ -260,6 +260,7 @@ If you have an existing branch with open pull requests created by `spr` (`spaced
 ### Common Flags for `nspr diff`
 - `-n, --dry-run`: Show the preflight stack plan, warnings, and summary without mutating local commits or pushing to GitHub.
 - `-a, --all`: Push all independent stacks on the branch, not just the current stack (at `HEAD`).
+- `--from <PR_OR_COMMIT>` / `--to <PR_OR_COMMIT>`: Create/update only the commits from `--from` through `--to`, both inclusive (either may be omitted to mean the bottom of the branch or `HEAD`). Accepts commits (`abc123`, `HEAD~2`) or pull requests (`#1234`).
 - `--new-stack`: Start a new independent stack targeting trunk (`Depends-On: main`) at the first unsubmitted commit (or `HEAD`).
 - `-c, --cherry-pick`: Mark `HEAD` with `Depends-On: main` and create/update only `HEAD`'s pull request against trunk (ignoring lower unsubmitted commits).
 - `-m, --message <MSG>`: Supply an update message for fast-forward commits without an interactive prompt.

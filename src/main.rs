@@ -244,7 +244,7 @@ struct DiffArgs {
     #[arg(
         long = "pr",
         value_name = "PR_OR_COMMIT",
-        conflicts_with_all = ["all", "cherry_pick", "new_stack"],
+        conflicts_with_all = ["all", "cherry_pick", "new_stack", "from", "to"],
         add = ArgValueCandidates::new(complete_stack_prs)
     )]
     pr: Option<String>,
@@ -252,10 +252,30 @@ struct DiffArgs {
     /// Specific pull request or commit to create or update (positional alias for `--pr`).
     #[arg(
         value_name = "PR_OR_COMMIT",
-        conflicts_with_all = ["pr", "all", "cherry_pick", "new_stack"],
+        conflicts_with_all = ["pr", "all", "cherry_pick", "new_stack", "from", "to"],
         add = ArgValueCandidates::new(complete_stack_prs)
     )]
     target: Option<String>,
+
+    /// First commit (or pull request) of a range to create or update, inclusive.
+    /// Defaults to the bottom of the branch when only `--to` is given.
+    #[arg(
+        long,
+        value_name = "PR_OR_COMMIT",
+        conflicts_with_all = ["all", "cherry_pick", "new_stack"],
+        add = ArgValueCandidates::new(complete_stack_prs)
+    )]
+    from: Option<String>,
+
+    /// Last commit (or pull request) of a range to create or update, inclusive.
+    /// Defaults to `HEAD` when only `--from` is given.
+    #[arg(
+        long,
+        value_name = "PR_OR_COMMIT",
+        conflicts_with_all = ["all", "cherry_pick", "new_stack"],
+        add = ArgValueCandidates::new(complete_stack_prs)
+    )]
+    to: Option<String>,
 
     /// Push all stacks on the branch, not just the current stack.
     #[arg(short, long)]
@@ -317,6 +337,41 @@ fn resolve_diff_target(git: &Git, stack: &Stack, spec: &str) -> Result<usize> {
     bail!(
         "`{spec}` does not match any pull request or commit in the current stack"
     )
+}
+
+/// The layers between `--from` and `--to`, both inclusive. Either end may be
+/// omitted to mean the bottom of the branch or `HEAD`.
+fn resolve_diff_range(
+    git: &Git,
+    stack: &Stack,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<std::collections::HashSet<usize>> {
+    let lo = from
+        .map(|spec| resolve_diff_target(git, stack, spec))
+        .transpose()?;
+    let hi = to
+        .map(|spec| resolve_diff_target(git, stack, spec))
+        .transpose()?;
+    inclusive_layer_range(lo, hi, stack.layers.len())
+}
+
+fn inclusive_layer_range(
+    lo: Option<usize>,
+    hi: Option<usize>,
+    len: usize,
+) -> Result<std::collections::HashSet<usize>> {
+    let lo = lo.unwrap_or(0);
+    let hi = hi.unwrap_or(len.saturating_sub(1));
+    if lo > hi {
+        bail!(
+            "`--from` must be at or below `--to` in the stack (got commit {} \
+             of {len} as `--from` and commit {} as `--to`)",
+            lo + 1,
+            hi + 1
+        );
+    }
+    Ok((lo..=hi).collect())
 }
 
 #[derive(Args, Default)]
@@ -569,11 +624,21 @@ impl Session {
             None
         };
 
+        let range = if args.from.is_some() || args.to.is_some() {
+            Some(resolve_diff_range(
+                &self.git,
+                &stack,
+                args.from.as_deref(),
+                args.to.as_deref(),
+            )?)
+        } else {
+            None
+        };
+
         let components = stack.components();
-        let only_layers = if !args.all
-            && only_layer.is_none()
-            && components.len() > 1
-        {
+        let only_layers = if range.is_some() {
+            range
+        } else if !args.all && only_layer.is_none() && components.len() > 1 {
             let head_idx = stack.layers.len() - 1;
             let current_comp = stack.component_of(head_idx);
             let commit_word = if current_comp.len() == 1 {
@@ -1772,6 +1837,56 @@ mod tests {
             }
             _ => panic!("expected Diff"),
         }
+    }
+
+    #[test]
+    fn cli_diff_accepts_from_and_to_range() {
+        let cli = Cli::try_parse_from([
+            "nspr", "diff", "--from", "abc123", "--to", "#42",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Diff(args)) => {
+                assert_eq!(args.from.as_deref(), Some("abc123"));
+                assert_eq!(args.to.as_deref(), Some("#42"));
+            }
+            _ => panic!("expected Diff"),
+        }
+
+        for conflicting in [
+            vec!["nspr", "diff", "--from", "a", "--all"],
+            vec!["nspr", "diff", "--to", "a", "--pr", "b"],
+            vec!["nspr", "diff", "--from", "a", "HEAD"],
+            vec!["nspr", "diff", "--from", "a", "--cherry-pick"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&conflicting).is_err(),
+                "{conflicting:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_range_is_inclusive_and_defaults_to_the_whole_branch() {
+        let set = |v: &[usize]| v.iter().copied().collect();
+        assert_eq!(
+            inclusive_layer_range(Some(1), Some(3), 5).unwrap(),
+            set(&[1, 2, 3])
+        );
+        assert_eq!(
+            inclusive_layer_range(Some(2), Some(2), 5).unwrap(),
+            set(&[2])
+        );
+        assert_eq!(
+            inclusive_layer_range(Some(3), None, 5).unwrap(),
+            set(&[3, 4])
+        );
+        assert_eq!(
+            inclusive_layer_range(None, Some(1), 5).unwrap(),
+            set(&[0, 1])
+        );
+        let err = inclusive_layer_range(Some(3), Some(1), 5).unwrap_err();
+        assert!(err.to_string().contains("at or below"), "{err}");
     }
 
     #[test]
