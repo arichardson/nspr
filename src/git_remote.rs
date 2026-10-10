@@ -32,7 +32,7 @@
 //!
 //! `auth-git2` handles all of that, and bounds its attempts.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -46,6 +46,35 @@ use log::trace;
 
 use crate::ssh_agent::{self, SshAgentStatus};
 
+unsafe extern "C" {
+    fn git_remote_set_instance_url(
+        remote: *mut std::ffi::c_void,
+        url: *const std::ffi::c_char,
+    ) -> std::ffi::c_int;
+    fn git_remote_set_instance_pushurl(
+        remote: *mut std::ffi::c_void,
+        url: *const std::ffi::c_char,
+    ) -> std::ffi::c_int;
+}
+
+fn set_remote_instance_urls(
+    remote: &mut git2::Remote<'_>,
+    url: &str,
+) -> Result<()> {
+    let c_url = std::ffi::CString::new(url)?;
+    let raw = git2::Binding::raw(remote) as *mut std::ffi::c_void;
+    // SAFETY: `raw` is a valid `git_remote` pointer owned by `remote`, and
+    // `c_url` is a valid NUL-terminated string duplicated by libgit2.
+    unsafe {
+        if git_remote_set_instance_url(raw, c_url.as_ptr()) != 0
+            || git_remote_set_instance_pushurl(raw, c_url.as_ptr()) != 0
+        {
+            bail!("failed to override remote URL to {url}");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct GitRemote {
     repo: Arc<Repository>,
@@ -53,6 +82,8 @@ pub struct GitRemote {
     auth_token: String,
     ssh_agent_timeout: Duration,
     ssh_auth_sock_override: Option<PathBuf>,
+    https_fallback_override: Option<String>,
+    use_https_fallback: Cell<bool>,
 }
 
 impl GitRemote {
@@ -63,6 +94,8 @@ impl GitRemote {
             auth_token,
             ssh_agent_timeout: ssh_agent::DEFAULT_SSH_AGENT_TIMEOUT,
             ssh_auth_sock_override: None,
+            https_fallback_override: None,
+            use_https_fallback: Cell::new(false),
         }
     }
 
@@ -75,6 +108,13 @@ impl GitRemote {
     /// Override the SSH agent socket path (useful for tests).
     pub fn with_ssh_agent_socket(mut self, path: PathBuf) -> Self {
         self.ssh_auth_sock_override = Some(path);
+        self
+    }
+
+    /// Override the fallback URL used when the SSH agent is disconnected or
+    /// SSH authentication fails (useful for tests).
+    pub fn with_https_fallback_url(mut self, url: impl Into<String>) -> Self {
+        self.https_fallback_override = Some(url.into());
         self
     }
 
@@ -92,6 +132,32 @@ impl GitRemote {
         } else {
             ssh_agent::check_ssh_agent(self.ssh_agent_timeout)
         }
+    }
+
+    fn https_fallback_url(
+        &self,
+        original_url: &str,
+        effective_url: &str,
+    ) -> Option<String> {
+        if let Some(url) = &self.https_fallback_override {
+            return Some(url.clone());
+        }
+        if self.auth_token.is_empty() {
+            return None;
+        }
+        ssh_agent::github_https_fallback_url(original_url, effective_url)
+    }
+
+    fn create_remote(
+        &self,
+        url: &str,
+        bypass_insteadof: bool,
+    ) -> Result<git2::Remote<'_>> {
+        let mut remote = self.repo.remote_anonymous(url)?;
+        if bypass_insteadof {
+            set_remote_instance_urls(&mut remote, url)?;
+        }
+        Ok(remote)
     }
 
     /// The credential chain.
@@ -120,14 +186,58 @@ impl GitRemote {
         auth
     }
 
+    fn run_with_https_fallback<F, T>(
+        &self,
+        dir: Direction,
+        action_desc: &str,
+        config: &git2::Config,
+        https_url: &str,
+        effective_ssh_url: &str,
+        mut func: F,
+    ) -> Result<T>
+    where
+        F: FnMut(&mut git2::Remote, RemoteCallbacks) -> Result<T>,
+    {
+        use std::io::Write as _;
+
+        log::debug!("git {action_desc} ({https_url})...");
+        if !log::log_enabled!(log::Level::Debug) && dir == Direction::Push {
+            eprintln!(
+                "{}",
+                console::style(format!("git {action_desc} ({https_url})..."))
+                    .dim()
+            );
+            let _ = std::io::stderr().flush();
+        }
+
+        let mut remote = self.create_remote(https_url, true)?;
+        let auth = self.authenticator(&SshAgentStatus::NotConfigured);
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.credentials(auth.credentials(config));
+
+        let res = func(&mut remote, callbacks).map_err(|e| {
+            if e.downcast_ref::<PushRejected>().is_some() {
+                return e;
+            }
+            e.wrap_err(format!(
+                "could not connect to {https_url} (HTTPS fallback after SSH failure on {effective_ssh_url}). \
+                 Check `gh auth status`, and that you can reach the repository."
+            ))
+        });
+        if res.is_ok() {
+            log::debug!("  -> git {action_desc} finished");
+        }
+        res
+    }
+
     fn with_remote<F, T>(
         &self,
         dir: Direction,
         action_desc: &str,
-        func: F,
+        mut func: F,
     ) -> Result<T>
     where
-        F: FnOnce(&mut git2::Remote, RemoteCallbacks) -> Result<T>,
+        F: FnMut(&mut git2::Remote, RemoteCallbacks) -> Result<T>,
     {
         use std::io::Write as _;
 
@@ -139,11 +249,67 @@ impl GitRemote {
             dir == Direction::Push,
         );
         let is_ssh = ssh_agent::is_ssh_url(&effective_url);
+        let fallback_url = if is_ssh {
+            self.https_fallback_url(&url, &effective_url)
+        } else {
+            None
+        };
+
+        if let Some(https_url) = &fallback_url
+            && self.use_https_fallback.get()
+        {
+            return self.run_with_https_fallback(
+                dir,
+                action_desc,
+                &config,
+                https_url,
+                &effective_url,
+                func,
+            );
+        }
+
         let ssh_status = if is_ssh {
             self.check_ssh_agent()
         } else {
             SshAgentStatus::NotConfigured
         };
+
+        if let Some(https_url) = &fallback_url
+            && matches!(
+                ssh_status,
+                SshAgentStatus::ConnectionFailed { .. }
+                    | SshAgentStatus::TimedOut { .. }
+            )
+        {
+            if !self.use_https_fallback.replace(true) {
+                let reason = match &ssh_status {
+                    SshAgentStatus::ConnectionFailed { path, reason } => {
+                        format!(
+                            "SSH agent socket '{}' is disconnected ({reason})",
+                            path.display()
+                        )
+                    }
+                    SshAgentStatus::TimedOut { path, timeout } => format!(
+                        "SSH agent socket '{}' timed out after {:.1}s",
+                        path.display(),
+                        timeout.as_secs_f64()
+                    ),
+                    _ => "SSH agent is unavailable".to_string(),
+                };
+                eprintln!(
+                    "{} {reason}; falling back to HTTPS ({https_url}) using gh credentials",
+                    console::style("warning:").yellow().bold()
+                );
+            }
+            return self.run_with_https_fallback(
+                dir,
+                action_desc,
+                &config,
+                https_url,
+                &effective_url,
+                func,
+            );
+        }
 
         log::debug!("git {action_desc} ({effective_url})...");
         if !log::log_enabled!(log::Level::Debug) && dir == Direction::Push {
@@ -157,39 +323,57 @@ impl GitRemote {
             let _ = std::io::stderr().flush();
         }
 
-        let mut remote = self.repo.remote_anonymous(&url)?;
+        let mut remote = self.create_remote(&url, false)?;
         let auth = self.authenticator(&ssh_status);
         let mut callbacks = RemoteCallbacks::new();
         callbacks.credentials(auth.credentials(&config));
 
-        // A refused ref update means the connection and credentials worked, so
-        // the transport diagnosis below would only mislead.
-        let res = func(&mut remote, callbacks).map_err(|e| {
-            if e.downcast_ref::<PushRejected>().is_some() {
-                return e;
+        match func(&mut remote, callbacks) {
+            Ok(val) => {
+                log::debug!("  -> git {action_desc} finished");
+                Ok(val)
             }
-            e.wrap_err(if is_ssh {
-                ssh_agent::format_ssh_auth_error(
-                    &effective_url,
-                    &url,
-                    &ssh_status,
-                )
-            } else {
-                format!(
-                    "could not connect to {}. Check `gh auth status`, and \
-                     that you can reach the repository. Note that `git \
-                     remote -v` may show a different push URL: \
-                     `url.*.pushInsteadOf` in your git config rewrites the \
-                     transport, and credentials that work for one transport \
-                     do not apply to the other.",
-                    &url
-                )
-            })
-        });
-        if res.is_ok() {
-            log::debug!("  -> git {action_desc} finished");
+            Err(e) => {
+                // A refused ref update means the connection and credentials worked, so
+                // neither HTTPS fallback nor transport diagnosis should run.
+                if e.downcast_ref::<PushRejected>().is_some() {
+                    return Err(e);
+                }
+                if let Some(https_url) = &fallback_url {
+                    self.use_https_fallback.set(true);
+                    eprintln!(
+                        "{} SSH authentication to {effective_url} failed ({e}); \
+                         falling back to HTTPS ({https_url}) using gh credentials",
+                        console::style("warning:").yellow().bold()
+                    );
+                    return self.run_with_https_fallback(
+                        dir,
+                        action_desc,
+                        &config,
+                        https_url,
+                        &effective_url,
+                        func,
+                    );
+                }
+                Err(e.wrap_err(if is_ssh {
+                    ssh_agent::format_ssh_auth_error(
+                        &effective_url,
+                        &url,
+                        &ssh_status,
+                    )
+                } else {
+                    format!(
+                        "could not connect to {}. Check `gh auth status`, and \
+                         that you can reach the repository. Note that `git \
+                         remote -v` may show a different push URL: \
+                         `url.*.pushInsteadOf` in your git config rewrites the \
+                         transport, and credentials that work for one transport \
+                         do not apply to the other.",
+                        &url
+                    )
+                }))
+            }
         }
-        res
     }
 
     /// Every branch on the remote and the commit it points at.
@@ -333,10 +517,12 @@ impl GitRemote {
             let noun = if count == 1 { "branch" } else { "branches" };
             format!("push: {count} {noun}")
         };
-        let deleted_refs: std::collections::HashSet<String> = refspecs
-            .iter()
-            .filter_map(|s| s.strip_prefix(':').map(str::to_owned))
-            .collect();
+        let deleted_refs = Rc::new(
+            refspecs
+                .iter()
+                .filter_map(|s| s.strip_prefix(':').map(str::to_owned))
+                .collect::<std::collections::HashSet<String>>(),
+        );
         self.with_remote(Direction::Push, &desc, |remote, mut callbacks| {
             // Rejections are collected rather than failing the callback, so
             // that every refused branch is reported together with what the
@@ -344,9 +530,10 @@ impl GitRemote {
             let rejected: Rc<RefCell<Vec<(String, String)>>> = Rc::default();
             let sideband: Rc<RefCell<Vec<u8>>> = Rc::default();
             let rejected_cb = Rc::clone(&rejected);
+            let deleted_refs_cb = Rc::clone(&deleted_refs);
             callbacks.push_update_reference(move |reference, status| {
                 match status {
-                    Some(status) if deleted_refs.contains(reference) => {
+                    Some(status) if deleted_refs_cb.contains(reference) => {
                         log::debug!(
                             "delete of {reference} reported `{status}` (already deleted by remote; ignoring)"
                         );
@@ -814,5 +1001,134 @@ Review all repository rules at https://github.com/o/r/rules?ref=refs%2Fheads%2Fu
             ]),
             "3 branches (users/me/a, +users/me/b, delete users/me/old)"
         );
+    }
+
+    #[test]
+    fn create_remote_bypass_insteadof_overrides_url_and_pushurl() {
+        let t = crate::testutil::TestRepo::new();
+        let repo = t.open();
+        let mut config = repo.config().unwrap();
+        config
+            .set_str("url.git@github.com:.insteadOf", "https://github.com/")
+            .unwrap();
+        config
+            .set_str("url.git@github.com:.pushInsteadOf", "https://github.com/")
+            .unwrap();
+        drop(config);
+
+        let remote = GitRemote::new(
+            Arc::new(repo),
+            "https://github.com/o/r.git".into(),
+            "fake-token".into(),
+        );
+
+        let default_remote = remote
+            .create_remote("https://github.com/o/r.git", false)
+            .unwrap();
+        assert_eq!(default_remote.url().ok(), Some("git@github.com:o/r.git"));
+        assert_eq!(
+            default_remote.pushurl().ok().flatten(),
+            Some("git@github.com:o/r.git")
+        );
+
+        let bypassed_remote = remote
+            .create_remote("https://github.com/o/r.git", true)
+            .unwrap();
+        assert_eq!(
+            bypassed_remote.url().ok(),
+            Some("https://github.com/o/r.git")
+        );
+        assert_eq!(
+            bypassed_remote.pushurl().ok().flatten(),
+            Some("https://github.com/o/r.git")
+        );
+    }
+
+    #[test]
+    fn disconnected_ssh_agent_falls_back_and_bypasses_push_instead_of() {
+        let t = crate::testutil::TestRepo::new();
+        let commit = t.commit_file("first", "a.txt", "one", &[]);
+        let bare = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(bare.path()).unwrap();
+        let bare_url = bare.path().to_str().unwrap().to_string();
+
+        let repo = t.open();
+        let mut config = repo.config().unwrap();
+        config
+            .set_str(
+                "url.ssh://git@127.0.0.1:1/o/r.git.pushInsteadOf",
+                &bare_url,
+            )
+            .unwrap();
+        drop(config);
+
+        let missing_sock =
+            PathBuf::from("/tmp/nspr-test-nonexistent-fallback.sock");
+        let remote = GitRemote::new(
+            Arc::new(repo),
+            bare_url.clone(),
+            "fake-token".into(),
+        )
+        .with_ssh_agent_socket(missing_sock)
+        .with_ssh_agent_timeout(Duration::from_millis(50))
+        .with_https_fallback_url(&bare_url);
+
+        remote
+            .push(&[format!("{commit}:refs/heads/topic")])
+            .expect("push should succeed via fallback remote");
+        assert!(remote.use_https_fallback.get());
+
+        let branches = remote
+            .branches()
+            .expect("ls-remote should succeed via fallback remote");
+        assert_eq!(branches.get("topic"), Some(&commit));
+    }
+
+    #[test]
+    fn failed_ssh_auth_when_agent_available_falls_back_and_retries() {
+        use std::io::{Read, Write};
+
+        let t = crate::testutil::TestRepo::new();
+        let commit = t.commit_file("first", "a.txt", "one", &[]);
+        let bare = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(bare.path()).unwrap();
+        let bare_url = bare.path().to_str().unwrap().to_string();
+
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock_path = sock_dir.path().join("valid.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Mock SSH agent responds to probe with 1 identity, then SSH connection
+        // to 127.0.0.1:1 fails (simulating security key timeout during sign).
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req = [0u8; 5];
+                if stream.read_exact(&mut req).is_ok() {
+                    let resp = [0, 0, 0, 5, 12, 0, 0, 0, 1];
+                    let _ = stream.write_all(&resp);
+                }
+            }
+        });
+
+        let remote = GitRemote::new(
+            Arc::new(t.open()),
+            "ssh://git@127.0.0.1:1/o/r.git".into(),
+            "fake-token".into(),
+        )
+        .with_ssh_agent_socket(sock_path)
+        .with_ssh_agent_timeout(Duration::from_millis(100))
+        .with_https_fallback_url(&bare_url);
+
+        remote
+            .push(&[format!("{commit}:refs/heads/topic")])
+            .expect("push should fall back and succeed after SSH failure");
+        assert!(remote.use_https_fallback.get());
+
+        let branches = remote
+            .branches()
+            .expect("subsequent ls-remote should use fallback directly");
+        assert_eq!(branches.get("topic"), Some(&commit));
+
+        let _ = handle.join();
     }
 }

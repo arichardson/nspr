@@ -265,6 +265,60 @@ pub fn resolve_effective_url(
     }
 }
 
+/// Convert a GitHub SSH or HTTPS remote URL (`original_url` or `effective_url`)
+/// into its canonical `https://github.com/<owner>/<repo>.git` URL for fallback
+/// over HTTPS using `gh` credentials.
+pub fn github_https_fallback_url(
+    original_url: &str,
+    effective_url: &str,
+) -> Option<String> {
+    ssh_url_to_github_https(original_url)
+        .or_else(|| ssh_url_to_github_https(effective_url))
+}
+
+fn ssh_url_to_github_https(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.starts_with("https://github.com/")
+        && url.len() > "https://github.com/".len()
+    {
+        return Some(url.to_string());
+    }
+
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        let after_host = rest
+            .strip_prefix("github.com")
+            .or_else(|| rest.strip_prefix("ssh.github.com"))?;
+        let path = if let Some(p) = after_host.strip_prefix('/') {
+            p
+        } else if let Some(port_and_path) = after_host.strip_prefix(':') {
+            let (port, p) = port_and_path.split_once('/')?;
+            if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            p
+        } else {
+            return None;
+        };
+        let path = path.trim_start_matches('/');
+        if !path.is_empty() {
+            return Some(format!("https://github.com/{path}"));
+        }
+        return None;
+    }
+
+    let rest = url.strip_prefix("git@").unwrap_or(url);
+    let path = rest
+        .strip_prefix("github.com:")
+        .or_else(|| rest.strip_prefix("ssh.github.com:"))?
+        .trim_start_matches('/');
+    if !path.is_empty() {
+        Some(format!("https://github.com/{path}"))
+    } else {
+        None
+    }
+}
+
 /// Produce a user-facing, actionable error message diagnosing an SSH authentication failure.
 pub fn format_ssh_auth_error(
     effective_url: &str,
@@ -503,5 +557,56 @@ mod tests {
         assert!(is_ssh_url("git@github.com:o/r.git"));
         assert!(is_ssh_url("ssh://git@github.com/o/r.git"));
         assert!(!is_ssh_url("https://github.com/o/r.git"));
+    }
+
+    #[test]
+    fn github_https_fallback_url_converts_all_github_ssh_shapes() {
+        assert_eq!(
+            github_https_fallback_url(
+                "git@github.com:o/r.git",
+                "git@github.com:o/r.git"
+            )
+            .as_deref(),
+            Some("https://github.com/o/r.git")
+        );
+        assert_eq!(
+            github_https_fallback_url(
+                "https://github.com/o/r.git",
+                "git@github.com:o/r.git"
+            )
+            .as_deref(),
+            Some("https://github.com/o/r.git")
+        );
+        assert_eq!(
+            github_https_fallback_url(
+                "ssh://git@github.com/o/r.git",
+                "ssh://git@github.com/o/r.git"
+            )
+            .as_deref(),
+            Some("https://github.com/o/r.git")
+        );
+        assert_eq!(
+            github_https_fallback_url(
+                "ssh://git@ssh.github.com:443/o/r.git",
+                "ssh://git@ssh.github.com:443/o/r.git"
+            )
+            .as_deref(),
+            Some("https://github.com/o/r.git")
+        );
+        assert_eq!(
+            github_https_fallback_url(
+                "github.com:o/r.git",
+                "github.com:o/r.git"
+            )
+            .as_deref(),
+            Some("https://github.com/o/r.git")
+        );
+        assert_eq!(
+            github_https_fallback_url(
+                "ssh://git@127.0.0.1:1/o/r.git",
+                "ssh://git@127.0.0.1:1/o/r.git"
+            ),
+            None
+        );
     }
 }
