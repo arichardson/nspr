@@ -237,6 +237,7 @@ For **branching DAG stacks**, `nspr` automatically switches to hierarchical tree
 |---|---|---|
 | **`nspr diff`** | `nspr diff [OPTIONS]` | Create or update pull requests for commits between `origin/main` and `HEAD`. Pass `-c / --cherry-pick` to submit only `HEAD` targeting `main`. *(Default command when running `nspr`)* |
 | **`nspr status`** | `nspr status` | Show local stack status, sync state (`ok`, `modified`, `restack`, `spr`), and which layers are `landable`. |
+| **`nspr compare`** | `nspr compare [PR_OR_COMMIT \| -a]` | Compare a local commit (`HEAD` by default, or `-a / --all` for the whole stack) against its last version upstream on GitHub, showing a colored diff of the commit message and code diff. *(Aliases: `show`, `interdiff`)* |
 | **`nspr list`** | `nspr list [--all]` | List open pull request stacks on GitHub with review status badges (`--all` shows all repo authors). |
 | **`nspr land`** | `nspr land [--pr=<PR> \| -b \| -c \| --all]` | Squash-merge a landable pull request onto trunk and repair dependent layers. Use `--pr=<PR>` for a specific root PR, `-b / --bottom` for the lowest ready PR, `-c / --cherry-pick` for an independent `HEAD` PR, or `--all` to land all ready layers bottom-up. |
 | **`nspr sync`** | `nspr sync` | Fetch upstream trunk, rebase local commits, drop PRs merged out-of-band, and restack surviving remote branches. |

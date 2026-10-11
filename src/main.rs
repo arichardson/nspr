@@ -21,8 +21,8 @@ use nspr::forge::github::GitHubForge;
 use nspr::git::Git;
 use nspr::stack::{LayerSelection, Stack};
 use nspr::{
-    amend, auth, close, forge, guardrails, land, list, patch, stack_comment,
-    status, sync,
+    amend, auth, close, compare, forge, guardrails, land, list, patch,
+    stack_comment, status, sync,
 };
 
 #[derive(Parser)]
@@ -50,6 +50,10 @@ struct Cli {
     #[arg(short, long, global = true)]
     verbose: bool,
 
+    /// Do not pipe output into a pager.
+    #[arg(short = 'P', long, global = true)]
+    no_pager: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -60,6 +64,9 @@ enum Command {
     Diff(DiffArgs),
     /// Show the stack and what `nspr diff` would do, without touching GitHub.
     Status,
+    /// Compare a local commit (HEAD by default) against its pull request on GitHub.
+    #[command(visible_aliases = ["show", "interdiff"])]
+    Compare(CompareArgs),
     /// Rebase onto the trunk and reconcile pull requests merged elsewhere.
     Sync,
     /// Squash-merge a pull request and repair the layers above it.
@@ -76,6 +83,36 @@ enum Command {
     Upgrade(UpgradeArgs),
     /// Generate shell completion scripts for bash, zsh, fish, elvish, or powershell.
     Completions(CompletionsArgs),
+}
+
+#[derive(Args, Default)]
+struct CompareArgs {
+    /// Specific pull request or commit to compare (e.g. `1234`, `#1234`, URL, or `HEAD~1`). Defaults to `HEAD`.
+    #[arg(
+        value_name = "PR_OR_COMMIT",
+        conflicts_with_all = ["pr", "all"],
+        add = ArgValueCandidates::new(complete_stack_prs)
+    )]
+    target: Option<String>,
+
+    /// Specific pull request or commit to compare (flag alias for positional `PR_OR_COMMIT`).
+    #[arg(
+        long = "pr",
+        value_name = "PR_OR_COMMIT",
+        conflicts_with_all = ["target", "all"],
+        add = ArgValueCandidates::new(complete_stack_prs)
+    )]
+    pr: Option<String>,
+
+    /// Compare every commit in the current stack against its pull request.
+    #[arg(short, long)]
+    all: bool,
+}
+
+impl CompareArgs {
+    fn target_spec(&self) -> Option<&str> {
+        self.pr.as_deref().or(self.target.as_deref())
+    }
 }
 
 #[derive(Args)]
@@ -446,12 +483,15 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let fetch_remote_trunk =
-        !matches!(cli.command, Some(Command::Status | Command::List(_)));
+    let fetch_remote_trunk = !matches!(
+        cli.command,
+        Some(Command::Status | Command::Compare(_) | Command::List(_))
+    );
     let mut session = Session::open(&cli.remote, fetch_remote_trunk).await?;
     match cli.command.unwrap_or(Command::Diff(DiffArgs::default())) {
         Command::Diff(args) => session.diff(args, cli.verbose).await,
         Command::Status => session.status(cli.verbose).await,
+        Command::Compare(args) => session.compare(args, cli.no_pager).await,
         Command::Sync => session.sync().await,
         Command::Land(args) => session.land(args).await,
         Command::Amend => session.amend().await,
@@ -1122,6 +1162,30 @@ impl Session {
                 .await?;
         print!("{}", report.render_verbose(verbose));
         Ok(())
+    }
+
+    async fn compare(&self, args: CompareArgs, no_pager: bool) -> Result<()> {
+        let stack = self.discover()?;
+        let selection = if args.all {
+            LayerSelection::All
+        } else if let Some(spec) = args.target_spec() {
+            LayerSelection::one(resolve_diff_target(&self.git, &stack, spec)?)
+        } else {
+            LayerSelection::one(stack.layers.len() - 1)
+        };
+        let comparisons = compare::compare_selection(
+            &self.git,
+            &self.forge,
+            &stack,
+            &selection,
+        )
+        .await?;
+        compare::print_comparisons(
+            &self.git,
+            &self.config,
+            &comparisons,
+            no_pager,
+        )
     }
 
     async fn upgrade(&self, args: UpgradeArgs) -> Result<()> {
@@ -1938,6 +2002,7 @@ mod tests {
         for expected in [
             "diff",
             "status",
+            "compare",
             "sync",
             "land",
             "amend",
@@ -1970,11 +2035,48 @@ mod tests {
             "--update-message",
             "--dry-run",
             "--draft",
+            "--no-pager",
         ] {
             assert!(
                 flag_names.contains(&expected.to_string()),
                 "expected flag `{expected}` in {flag_names:?}"
             );
+        }
+    }
+
+    #[test]
+    fn cli_compare_and_no_pager_parsing() {
+        for sub in ["compare", "show", "interdiff"] {
+            let cli = Cli::try_parse_from(["nspr", sub]).unwrap();
+            assert!(!cli.no_pager);
+            match cli.command {
+                Some(Command::Compare(args)) => {
+                    assert_eq!(args.target_spec(), None);
+                    assert!(!args.all);
+                }
+                _ => panic!("expected Compare for `{sub}`"),
+            }
+        }
+
+        let cli =
+            Cli::try_parse_from(["nspr", "--no-pager", "compare", "#123"])
+                .unwrap();
+        assert!(cli.no_pager);
+        match cli.command {
+            Some(Command::Compare(args)) => {
+                assert_eq!(args.target_spec(), Some("#123"));
+            }
+            _ => panic!("expected Compare"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["nspr", "compare", "-P", "--all"]).unwrap();
+        assert!(cli.no_pager);
+        match cli.command {
+            Some(Command::Compare(args)) => {
+                assert!(args.all);
+            }
+            _ => panic!("expected Compare"),
         }
     }
 }

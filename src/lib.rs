@@ -18,6 +18,7 @@
 pub mod amend;
 pub mod auth;
 pub mod close;
+pub mod compare;
 pub mod config;
 pub mod engine;
 pub mod forge;
