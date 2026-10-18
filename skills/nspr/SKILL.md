@@ -102,8 +102,8 @@ Global flags (accepted before or after any subcommand):
 | Command | Purpose |
 |---|---|
 | `nspr status [-v]` | Show the stack, CI check counts (`N/M checks`), review counts (`N approved`, `M changes requested`), and what `nspr diff` would do (`ok`, `modified`, `restack`, `new`, `spr (run nspr upgrade)`, `landable`). Pass `-v` / `--verbose` to list reviewer logins and failed CI check names on indented lines under each PR. |
-| `nspr compare [PR_OR_COMMIT \| -a]` | *(Aliases: `show`, `interdiff`)* Compare a local commit (`HEAD` by default, `<PR_OR_COMMIT>` / `--pr <PR_OR_COMMIT>`, or `-a`/`--all` for the whole stack) against its last version upstream on GitHub. Prints a colored `git diff` of both the commit message (`COMMIT_EDITMSG`) and code changes (projecting upstream onto the local base tree so rebasing onto newer `main` does not add noise). |
-| `nspr diff [PR_OR_COMMIT]` (default) | Create/update PRs. Updates append an incremental commit to the PR branch (preserving review history on squash-only repos) unless a base change or merge conflict requires `restacked` (force-push).<br>**Targeting flags:**<br>• `<PR_OR_COMMIT>` or `--pr <PR_OR_COMMIT>`: create/update **only** that single PR or commit (`1234`, `#1234`, URL, or git rev like `HEAD~1`).<br>• `--from <PR_OR_COMMIT>` / `--to <PR_OR_COMMIT>`: create/update **only** the inclusive commit range `[--from, --to]` (omit `--from` for bottom of branch through `--to`; omit `--to` for `--from` through `HEAD`).<br>• `-c` / `--cherry-pick`: submit only `HEAD` as an independent PR on trunk (`Depends-On: main`).<br>• `--new-stack`: start a new independent stack on trunk at the first unsubmitted commit (or `HEAD`).<br>• `-a` / `--all`: push all independent stacks on the branch.<br>**Other flags:** `-n`/`--dry-run` preview plan without mutating git or GitHub, `--update-message` overwrite GitHub-edited PR title/body from the local commit, `-m <msg>` update description, `--no-prompt`, `--draft`. |
+| `nspr compare [COMMIT_OR_PR \| -a]` | *(Aliases: `show`, `interdiff`)* Compare a local commit (`HEAD` by default, a commit hash/rev `<COMMIT>` or `#<PR>`, or `-a`/`--all` for the whole stack) against its last version upstream on GitHub. Prints a colored `git diff` of both the commit message (`COMMIT_EDITMSG`) and code changes (projecting upstream onto the local base tree so rebasing onto newer `main` does not add noise). |
+| `nspr diff [COMMIT_OR_PR]` (default) | Create/update PRs. Updates append an incremental commit to the PR branch (preserving review history on squash-only repos) unless a base change or merge conflict requires `restacked` (force-push).<br>**Targeting flags:**<br>• `<COMMIT_OR_PR>` or `--pr <COMMIT_OR_PR>`: create/update **only** that single commit or PR (pass a git commit hash/rev like `a1b2c3d` or `HEAD~1`, or `#1234` / URL).<br>• `--from <COMMIT_OR_PR>` / `--to <COMMIT_OR_PR>`: create/update **only** the inclusive commit range `[--from, --to]` (omit `--from` for bottom of branch through `--to`; omit `--to` for `--from` through `HEAD`). Accepts git commit hashes/revs (preferred, works for unsubmitted commits too) or PR numbers.<br>• `-c` / `--cherry-pick`: submit only `HEAD` as an independent PR on trunk (`Depends-On: main`).<br>• `--new-stack`: start a new independent stack on trunk at the first unsubmitted commit (or `HEAD`).<br>• `-a` / `--all`: push all independent stacks on the branch.<br>**Other flags:** `-n`/`--dry-run` preview plan without mutating git or GitHub, `--update-message` overwrite GitHub-edited PR title/body from the local commit, `-m <msg>` update description, `--no-prompt`, `--draft`. |
 | `nspr upgrade` | Convert legacy `spr` PRs (`[spr]` commits / `Pull Request:` trailers) in the stack to native `nspr` stacked PRs. Pass `--update-message` to also overwrite PR titles/bodies that were edited on GitHub. |
 | `nspr sync` | Rebase onto trunk and reconcile PRs merged elsewhere. Also needed after merging a stack PR via the web UI. |
 | `nspr land [PR]` | Squash-merge a PR (`<PR>` or `--pr <PR>`, `-c`/`--cherry-pick` for independent `HEAD` PR, `-b`/`--bottom` for lowest ready PR, `-a`/`--all` for all ready PRs bottom-up, `-m <msg>` custom squash body). Re-running `nspr land` after an interrupted merge automatically completes post-merge stack repair and local rebase. |
@@ -115,18 +115,20 @@ Global flags (accepted before or after any subcommand):
 
 ## How multi-stack branches, range updates, restacking, and `nspr land` work
 
-* **Updating a single PR or a commit range (`--pr`, `--from`, `--to`)**:
-  * When asked to push/update a specific PR or subset of commits on a branch that
-    also has other modified/unsubmitted commits, **always scope `nspr diff`**
-    rather than running bare `nspr diff` (which updates the entire current stack
-    and can touch or comment on unrelated PRs):
-    * Single PR or commit: `nspr diff #1234` (or `nspr diff --pr 1234`, `nspr diff HEAD~2`).
-    * Inclusive range: `nspr diff --from #1234 --to #1236` (or commit refs like `nspr diff --from HEAD~3 --to HEAD~1`).
-    * Bottom of branch up to a commit/PR: `nspr diff --to HEAD~1` (useful when `HEAD` is a local WIP commit you don't want to open a PR for yet).
-    * From a commit/PR up to `HEAD`: `nspr diff --from #1234`.
+* **Updating a single commit/PR or a commit range (`<commit>`, `--from`, `--to`)**:
+  * When asked to push/update a specific commit/PR or subset of commits on a
+    branch that also has other modified/unsubmitted commits, **always scope
+    `nspr diff`** rather than running bare `nspr diff` (which updates the entire
+    current stack and can touch or comment on unrelated PRs). Prefer passing git
+    commit hashes directly (works for both new/unsubmitted commits and existing
+    PRs without looking up trailers; `#<PR>` is also accepted):
+    * Single commit (or PR): `nspr diff <commit-sha>` (or `nspr diff HEAD~2`, `nspr diff #1234`).
+    * Inclusive commit range: `nspr diff --from <start-sha> --to <end-sha>` (or `nspr diff --from HEAD~3 --to HEAD~1`, `nspr diff --from #1234 --to #1236`).
+    * Bottom of branch up to a commit: `nspr diff --to <end-sha>` / `nspr diff --to HEAD~1` (useful when `HEAD` is a local WIP commit you don't want to open a PR for yet).
+    * From a commit up to `HEAD`: `nspr diff --from <start-sha>`.
   * Before pushing, you can preview the exact difference against GitHub with
-    `nspr compare #1234` (or `nspr compare --all`) and dry-run the push plan
-    with `nspr diff -n --from ... --to ...`.
+    `nspr -P compare <commit-sha>` (or `nspr -P compare --all`) and dry-run the
+    push plan with `nspr diff -n --from <start-sha> --to <end-sha>`.
 * **Multiple stacks in one branch**:
   * `nspr status` groups independent stacks (`Depends-On: main`) into separate
     blocks.
