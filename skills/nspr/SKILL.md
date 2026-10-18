@@ -39,8 +39,9 @@ or close stack PRs by hand with `gh pr create` / the web UI.
   `<!-- nspr:stack -->` comment listing the stack.
 * `Depends-On: main` marks the root of an independent stack (created via
   `nspr diff -c` / `--cherry-pick` for a single commit or `nspr diff --new-stack`
-  for a new stack on the same branch). `Depends-On: #<N>` stacks a commit on a
-  non-adjacent PR.
+  for a new stack on the same branch). `Depends-On: #<N>` (or multiple
+  comma-separated PRs `Depends-On: #<A>, #<B>` / multiple `Depends-On:` lines)
+  stacks a commit on non-adjacent PRs via a 3-way tree merge.
 
 ## The #1 pitfall: losing the `Pull-Request:` trailer
 
@@ -87,26 +88,45 @@ Rules:
 
 ## Commands
 
-Run `nspr` commands from the repo root. They talk to GitHub (and push over SSH),
-so run them outside the sandbox. Prefer letting the user run `diff`/`land`/`close`
-unless they asked you to push. If an SSH operation fails because the SSH agent
-(`$SSH_AUTH_SOCK`) is disconnected or has no keys loaded, **pause immediately**
-and ask the user to restart their SSH agent rather than retrying.
+Run `nspr` commands from the repo root. They talk to GitHub (and push over SSH,
+automatically falling back to HTTPS with `gh auth token` credentials if
+`$SSH_AUTH_SOCK` is disconnected or has no keys loaded), so run them outside the
+sandbox. Prefer letting the user run `diff`/`land`/`close` unless they asked you
+to push.
+
+Global flags (accepted before or after any subcommand):
+* `--remote <REMOTE>` (default: `origin`) — Git remote pointing at GitHub.
+* `-v` / `--verbose` — Print detailed decisions (and reviewer/check details in `status`).
+* `-P` / `--no-pager` — Disable paging (by default `nspr compare` pipes to `git --paginate` when stdout is a TTY; agents should pass `-P` / `--no-pager` if running in a PTY).
 
 | Command | Purpose |
 |---|---|
 | `nspr status [-v]` | Show the stack, CI check counts (`N/M checks`), review counts (`N approved`, `M changes requested`), and what `nspr diff` would do (`ok`, `modified`, `restack`, `new`, `spr (run nspr upgrade)`, `landable`). Pass `-v` / `--verbose` to list reviewer logins and failed CI check names on indented lines under each PR. |
-| `nspr diff` (default) | Create/update PRs. Updates append an incremental commit to the PR branch (preserving review history on squash-only repos) unless a base change or merge conflict requires `restacked` (force-push). Flags: `-n`/`--dry-run` preview plan without mutating git or GitHub, `-a`/`--all` push all stacks on the branch, `-c`/`--cherry-pick` submit only `HEAD` as an independent PR on trunk, `--new-stack` start a new independent stack on trunk at the first unsubmitted commit, `--update-message` overwrite GitHub-edited PR title/body from the local commit, `-m <msg>` update description, `--no-prompt`, `--draft`. |
+| `nspr compare [PR_OR_COMMIT \| -a]` | *(Aliases: `show`, `interdiff`)* Compare a local commit (`HEAD` by default, `<PR_OR_COMMIT>` / `--pr <PR_OR_COMMIT>`, or `-a`/`--all` for the whole stack) against its last version upstream on GitHub. Prints a colored `git diff` of both the commit message (`COMMIT_EDITMSG`) and code changes (projecting upstream onto the local base tree so rebasing onto newer `main` does not add noise). |
+| `nspr diff [PR_OR_COMMIT]` (default) | Create/update PRs. Updates append an incremental commit to the PR branch (preserving review history on squash-only repos) unless a base change or merge conflict requires `restacked` (force-push).<br>**Targeting flags:**<br>• `<PR_OR_COMMIT>` or `--pr <PR_OR_COMMIT>`: create/update **only** that single PR or commit (`1234`, `#1234`, URL, or git rev like `HEAD~1`).<br>• `--from <PR_OR_COMMIT>` / `--to <PR_OR_COMMIT>`: create/update **only** the inclusive commit range `[--from, --to]` (omit `--from` for bottom of branch through `--to`; omit `--to` for `--from` through `HEAD`).<br>• `-c` / `--cherry-pick`: submit only `HEAD` as an independent PR on trunk (`Depends-On: main`).<br>• `--new-stack`: start a new independent stack on trunk at the first unsubmitted commit (or `HEAD`).<br>• `-a` / `--all`: push all independent stacks on the branch.<br>**Other flags:** `-n`/`--dry-run` preview plan without mutating git or GitHub, `--update-message` overwrite GitHub-edited PR title/body from the local commit, `-m <msg>` update description, `--no-prompt`, `--draft`. |
 | `nspr upgrade` | Convert legacy `spr` PRs (`[spr]` commits / `Pull Request:` trailers) in the stack to native `nspr` stacked PRs. Pass `--update-message` to also overwrite PR titles/bodies that were edited on GitHub. |
 | `nspr sync` | Rebase onto trunk and reconcile PRs merged elsewhere. Also needed after merging a stack PR via the web UI. |
-| `nspr land [PR]` | Squash-merge a PR (`<PR>` or `--pr <PR>`, `-c`/`--cherry-pick` for independent `HEAD` PR, `-b`/`--bottom` for lowest ready PR, `-a`/`--all` for all ready PRs bottom-up). Re-running `nspr land` after an interrupted merge automatically completes post-merge stack repair and local rebase. |
+| `nspr land [PR]` | Squash-merge a PR (`<PR>` or `--pr <PR>`, `-c`/`--cherry-pick` for independent `HEAD` PR, `-b`/`--bottom` for lowest ready PR, `-a`/`--all` for all ready PRs bottom-up, `-m <msg>` custom squash body). Re-running `nspr land` after an interrupted merge automatically completes post-merge stack repair and local rebase. |
 | `nspr amend` | Copy titles/descriptions edited on GitHub back into local commits. |
 | `nspr close <PR>` | Abandon a PR and restack what depended on it (use this instead of closing on GitHub). Works even if the commit was already dropped locally. |
 | `nspr list [-a]` | List open PR stacks (`-a` includes all authors). |
-| `nspr patch <PR>` | Fetch a PR and its stack dependencies into a local branch (`pr/<number>`, `--branch <name>`, `--no-checkout`). |
+| `nspr patch <PR>` | Fetch a PR and its stack dependencies into a local branch (`pr/<number>`, `-b`/`--branch <name>`, `--no-checkout`). |
+| `nspr completions [--static] <shell>` | Generate shell completion scripts (`bash`, `zsh`, `fish`, `elvish`, `powershell`). |
 
-## How multi-stack branches, restacking, and `nspr land` work
+## How multi-stack branches, range updates, restacking, and `nspr land` work
 
+* **Updating a single PR or a commit range (`--pr`, `--from`, `--to`)**:
+  * When asked to push/update a specific PR or subset of commits on a branch that
+    also has other modified/unsubmitted commits, **always scope `nspr diff`**
+    rather than running bare `nspr diff` (which updates the entire current stack
+    and can touch or comment on unrelated PRs):
+    * Single PR or commit: `nspr diff #1234` (or `nspr diff --pr 1234`, `nspr diff HEAD~2`).
+    * Inclusive range: `nspr diff --from #1234 --to #1236` (or commit refs like `nspr diff --from HEAD~3 --to HEAD~1`).
+    * Bottom of branch up to a commit/PR: `nspr diff --to HEAD~1` (useful when `HEAD` is a local WIP commit you don't want to open a PR for yet).
+    * From a commit/PR up to `HEAD`: `nspr diff --from #1234`.
+  * Before pushing, you can preview the exact difference against GitHub with
+    `nspr compare #1234` (or `nspr compare --all`) and dry-run the push plan
+    with `nspr diff -n --from ... --to ...`.
 * **Multiple stacks in one branch**:
   * `nspr status` groups independent stacks (`Depends-On: main`) into separate
     blocks.
